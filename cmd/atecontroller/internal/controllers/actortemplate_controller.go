@@ -151,8 +151,17 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("while suspending golden actor: %w", err)
 		}
 
-		if resp.GetActor().GetLatestSnapshotInfo().GetType() != ateapipb.SnapshotType_SNAPSHOT_TYPE_EXTERNAL {
-			return ctrl.Result{}, fmt.Errorf("unexpected snapshot type for golden actor: %v", resp.GetActor().GetLatestSnapshotInfo().GetType())
+		snapType := resp.GetActor().GetLatestSnapshotInfo().GetType()
+		if snapType == ateapipb.SnapshotType_SNAPSHOT_TYPE_UNSPECIFIED {
+			// Transient: the external golden snapshot has not been taken-and-committed
+			// yet, so the SnapshotType is still the unspecified zero value. This
+			// self-resolves once the golden snapshot commits as external, so requeue
+			// with backoff rather than wedging the ActorTemplate on a hard error
+			// (the transient-as-fatal bug).
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		if snapType != ateapipb.SnapshotType_SNAPSHOT_TYPE_EXTERNAL {
+			return ctrl.Result{}, fmt.Errorf("unexpected snapshot type for golden actor: %v", snapType)
 		}
 
 		// Transition to PhaseReady
