@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -428,6 +429,21 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 
 	switch req.GetScope() {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
+		// Clean up any stale gVisor gofer filestore left inside a host-backed
+		// external volume by a prior golden take before creating the fresh
+		// restore filestore. A DATA take writes a per-container filestore
+		// (.gvisor.filestore.pause) into the external volume itself; because the
+		// external volume is host-backed it survives the golden round-trip, so
+		// the fresh create below otherwise fails with "repeated submounts are not
+		// supported with overlay optimizations" and the restore never completes.
+		// Mirrors the pre-setup cleanup in setupActorNetwork; the worker runs one
+		// actor at a time, so sweeping stale filestores here is safe.
+		staleFilestores, _ := filepath.Glob(filepath.Join(ateompath.VolumesDir(req.GetActorUid()), "*", ".gvisor.filestore.*"))
+		for _, f := range staleFilestores {
+			if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("while removing stale gVisor filestore %q before DATA restore: %w", f, err)
+			}
+		}
 		// Create and restore pause container
 		if err := rcmd.cmdCreate(ctx, os.Stdout, "pause", []string{"--fs-restore-image-path", checkpointDir}); err != nil {
 			return nil, fmt.Errorf("while creating pause container: %w", err)
