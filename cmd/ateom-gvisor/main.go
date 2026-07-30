@@ -28,6 +28,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/internal/actorlog"
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateomnet"
 	"github.com/agent-substrate/substrate/internal/ateompath"
@@ -291,12 +292,21 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
 		}
 		if err := rcmd.cmdFsCheckpoint(ctx, "pause", checkpointPath, ddv); err != nil {
-			return nil, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err)
+			// runsc.go tagged a terminal (non-retriable) checkpoint failure with
+			// ReasonTerminalFileSystemError; claim it here at the RPC boundary so it
+			// crosses to atelet/control-plane as an actorCrashed directive
+			// (codes.DataLoss) instead of being retried until WaitGoldenActor times
+			// out. Non-terminal errors pass through unwrapped and stay retriable.
+			return nil, ateerrors.CrashIfReason(ctx, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err), ateerrors.ReasonTerminalFileSystemError)
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 		// Checkpoint pause container (root of the sandbox)
 		if err := rcmd.cmdCheckpoint(ctx, "pause", checkpointPath); err != nil {
-			return nil, fmt.Errorf("while checkpointing pause: %w", err)
+			// Same terminal-classification boundary as the DATA leg above: a
+			// "pause"-in-state-stopped / no-checkpointable-filesystems failure is
+			// non-retriable, so surface it as an actorCrashed directive rather than
+			// letting the caller retry a checkpoint that can never succeed.
+			return nil, ateerrors.CrashIfReason(ctx, fmt.Errorf("while checkpointing pause: %w", err), ateerrors.ReasonTerminalFileSystemError)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported snapshot scope: %v", req.GetScope())

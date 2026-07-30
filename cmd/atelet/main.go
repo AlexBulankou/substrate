@@ -380,8 +380,12 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 		ActorUid:               actorUID,
 	})
 	if err != nil {
-		// TODO: Ateom should classify checkpoint failures, and set "should-crash"
-		// in the metadata if the error is not retriable.
+		// Ateom classifies non-retriable checkpoint failures and stamps the
+		// actorCrashed directive (codes.DataLoss + ErrorInfo) at its RPC boundary
+		// via CrashIfReason. A plain %w wrap here preserves that directive across
+		// the gRPC hop: grpc-go's status.FromError unwraps the %w chain to find
+		// ateom's GRPCStatus()-implementing error, so the control plane's
+		// ActorCrashRequested still sees actorCrashed=true. No re-stamp needed.
 		return nil, fmt.Errorf("while calling ateom.CheckpointWorkload: %w", err)
 	}
 

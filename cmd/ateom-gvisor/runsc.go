@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,11 +26,43 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 )
+
+// terminalCheckpointReasons are runsc stderr signatures for a checkpoint that
+// can never succeed on retry: the target container is not in a checkpointable
+// RUNNING state (stopped / gone), or it exposes no checkpointable filesystem.
+// Retrying these never self-converges (#4189: the "in state stopped" cascade
+// retried ~14x over ~82s until the golden-actor wait timed out), so the error
+// is tagged terminal here and converted into an actorCrashed directive at the
+// ateom RPC boundary (see CheckpointWorkload) instead of being retried forever.
+var terminalCheckpointReasons = []string{
+	"no checkpointable filesystems",
+	"in state stopped",
+}
+
+// classifyCheckpointErr tags err with ateerrors.ReasonTerminalFileSystemError
+// when runsc's captured stderr matches a terminal signature, so the RPC
+// boundary's CrashIfReason can claim it. runsc writes the reason only to
+// stderr (the Go error is a bare "exit status N"), so callers must capture
+// stderr for this to classify. Non-matching errors pass through unwrapped and
+// stay retriable.
+func classifyCheckpointErr(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	for _, sig := range terminalCheckpointReasons {
+		if strings.Contains(stderr, sig) {
+			return fmt.Errorf("%w: %w", ateerrors.ReasonTerminalFileSystemError, err)
+		}
+	}
+	return err
+}
 
 type runsc struct {
 	path     string
@@ -166,11 +199,12 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 		"-image-path", checkpointPath,
 		containerName, // Name of the container
 	)
+	var stderr bytes.Buffer
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("while running `runsc checkpoint`: %w", err)
+		return classifyCheckpointErr(fmt.Errorf("while running `runsc checkpoint`: %w", err), stderr.String())
 	}
 	return nil
 }
@@ -205,11 +239,12 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 		r.path,
 		args...,
 	)
+	var stderr bytes.Buffer
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("while running `runsc fscheckpoint`: %w", err)
+		return classifyCheckpointErr(fmt.Errorf("while running `runsc fscheckpoint`: %w", err), stderr.String())
 	}
 	return nil
 }
