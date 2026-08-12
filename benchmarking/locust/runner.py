@@ -254,7 +254,14 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
     return locust_exit
 
 
-def stats_to_jsonl(stats_csv: Path, jsonl_path: Path, timestamp: str, tag: str, test_name: str) -> int:
+def stats_to_jsonl(
+    stats_csv: Path,
+    jsonl_path: Path,
+    timestamp: str,
+    tag: str,
+    test_name: str,
+    users: int | None = None,
+) -> int:
     rows_written = 0
     with open(stats_csv) as f, open(jsonl_path, "w") as out:
         reader = csv.DictReader(f)
@@ -282,6 +289,14 @@ def stats_to_jsonl(stats_csv: Path, jsonl_path: Path, timestamp: str, tag: str, 
                 "metric": f"{type_val}_{name_val}",
                 "measurements": measurements,
             }
+            # Stamp the configured concurrent-user count into every entry so a
+            # downstream SLO-knee ladder correlation (automation/slo_knee.py) can
+            # key each run by its load explicitly, instead of parsing a fragile
+            # `_<N>_users` convention out of test_name (#6595 seam, option (b)).
+            # Additive-only: a new top-level field; the measurements map that the
+            # working p50/p95/RPS path reads is untouched.
+            if users is not None:
+                entry["users"] = users
             out.write(json.dumps(entry) + "\n")
             rows_written += 1
     return rows_written
@@ -341,7 +356,8 @@ def main() -> None:
         if stats_csv.exists():
             try:
                 rows = stats_to_jsonl(
-                    stats_csv, jsonl_path, data_ts, args.tag, args.name
+                    stats_csv, jsonl_path, data_ts, args.tag, args.name,
+                    users=args.users,
                 )
                 if rows == 0:
                     tee(

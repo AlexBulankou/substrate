@@ -83,3 +83,125 @@ tests:
       - "0.5"
       - "--max-wait-time"
       - "1.0"
+
+  # --- substrate SLO-ladder × sandboxClass (#6595) ---------------------------
+  # Ascending-user ladders at a fixed tag; automation/slo_knee.py reads the
+  # per-run stats.jsonl and reports the SLO-knee (max users whose target-op p95
+  # met the SLO) + its throughput. Two axes cross here: LOAD (the user rungs)
+  # and ISOLATION (sandboxClass gvisor vs microvm), so the same knee can be
+  # compared across runtimes. runner.py stamps each run's `users` into the
+  # JSONL, so the post-processor keys rungs explicitly (no name-parse needed).
+  #
+  # `targetCluster: dev` names the existing orchestrator config; the live
+  # substrate ladder fire repoints these to the throwaway benchmark cluster's
+  # target-cluster config (that spend-gated, collision-ack-gated run is a
+  # separate step from these reference entries).
+
+  # Cold-start / TTFE ladder — gVisor. Each user provisions a fresh actor,
+  # measures create->resume-from-golden->first-read once, then StopUser()s, so
+  # a rung is N-concurrent cold activations. Gate the `ttfe/ColdStart`
+  # composite (slo_knee.py --op ColdStart --slo 5s).
+  - name: coldstart_ladder_1_user_gvisor
+    description: "Cold-start TTFE: 1 concurrent fresh-actor activation (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    sandboxClass: gvisor
+  - name: coldstart_ladder_5_users_gvisor
+    description: "Cold-start TTFE: 5 concurrent fresh-actor activations (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 5
+    workerCount: 5
+    sandboxClass: gvisor
+  - name: coldstart_ladder_10_users_gvisor
+    description: "Cold-start TTFE: 10 concurrent fresh-actor activations (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 10
+    workerCount: 10
+    sandboxClass: gvisor
+  - name: coldstart_ladder_20_users_gvisor
+    description: "Cold-start TTFE: 20 concurrent fresh-actor activations (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 20
+    workerCount: 10
+    sandboxClass: gvisor
+
+  # Cold-start / TTFE ladder — microVM. Same rungs, microvm isolation; the
+  # orchestrator runs install-microvm-deps between substrate + workload deploy.
+  - name: coldstart_ladder_1_user_microvm
+    description: "Cold-start TTFE: 1 concurrent fresh-actor activation (microVM)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+  - name: coldstart_ladder_5_users_microvm
+    description: "Cold-start TTFE: 5 concurrent fresh-actor activations (microVM)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 5
+    workerCount: 5
+    sandboxClass: microvm
+  - name: coldstart_ladder_10_users_microvm
+    description: "Cold-start TTFE: 10 concurrent fresh-actor activations (microVM)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 10
+    workerCount: 10
+    sandboxClass: microvm
+  - name: coldstart_ladder_20_users_microvm
+    description: "Cold-start TTFE: 20 concurrent fresh-actor activations (microVM)"
+    targetCluster: dev
+    file: /app/tests/ate_coldstart.py
+    duration: 2m
+    users: 20
+    workerCount: 10
+    sandboxClass: microvm
+
+  # Warm steady-state ResumeActor ladder — gVisor. The warm user holds one
+  # actor and loops Get/Resume/Suspend, so this ladder finds the sustainable
+  # steady-state ResumeActor knee (slo_knee.py --op ResumeActor --slo 1s),
+  # the counterpart to the cold-start knee above.
+  - name: warm_resume_ladder_1_user_gvisor
+    description: "Warm ResumeActor: 1 concurrent user, steady-state (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_api.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    sandboxClass: gvisor
+  - name: warm_resume_ladder_5_users_gvisor
+    description: "Warm ResumeActor: 5 concurrent users, steady-state (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_api.py
+    duration: 1m
+    users: 5
+    workerCount: 5
+    sandboxClass: gvisor
+  - name: warm_resume_ladder_10_users_gvisor
+    description: "Warm ResumeActor: 10 concurrent users, steady-state (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_api.py
+    duration: 1m
+    users: 10
+    workerCount: 10
+    sandboxClass: gvisor
+  - name: warm_resume_ladder_20_users_gvisor
+    description: "Warm ResumeActor: 20 concurrent users, steady-state (gVisor)"
+    targetCluster: dev
+    file: /app/tests/ate_api.py
+    duration: 2m
+    users: 20
+    workerCount: 10
+    sandboxClass: gvisor
