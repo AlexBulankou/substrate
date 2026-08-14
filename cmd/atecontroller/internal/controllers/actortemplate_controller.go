@@ -93,7 +93,10 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Record the generation this reconcile observed so consumers can detect
 	// whether the controller has caught up to the latest spec. The per-phase
-	// Status().Update() calls below persist this value.
+	// transition cases below persist this via their Status().Update() calls;
+	// the terminal PhaseReady case persists it explicitly when stale (see below)
+	// so a template already Ready at controller-upgrade time still catches up.
+	observedGenStale := at.Status.ObservedGeneration != at.Generation
 	at.Status.ObservedGeneration = at.Generation
 
 	switch at.Status.Phase {
@@ -216,6 +219,16 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		return ctrl.Result{}, nil
 	case atev1alpha1.PhaseReady:
+		// Steady-state templates never re-enter a transition case above, so the
+		// in-memory ObservedGeneration set at the top of Reconcile would never be
+		// persisted here. Persist it when it has fallen behind the spec generation
+		// (e.g. the controller was upgraded after the template reached Ready). The
+		// stale guard keeps this a no-op once caught up, avoiding a status hot-loop.
+		if observedGenStale {
+			if err := r.Status().Update(ctx, at); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, nil
 	default:
 		return ctrl.Result{}, fmt.Errorf("unrecognized phase %q", at.Status.Phase)
