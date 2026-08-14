@@ -452,7 +452,22 @@ ensure_crds() {
 
 deploy_crds() {
   log_step "deploy_crds"
-  run_ko apply -f manifests/ate-install/generated
+  # Apply generated CRDs with kubectl, not ko: this dir carries no ko:// image
+  # refs, so ko has nothing to build here -- routing the CRD-schema apply through
+  # run_kubectl keeps it independent of ko build state.
+  run_kubectl apply -f manifests/ate-install/generated
+
+  # Post-apply assertion (#6684): the fork adds status.observedGeneration to the
+  # WorkerPool/ActorTemplate CRD schemas (#1069). If a stale/upstream schema strips
+  # it, the controller's observedGeneration writes are silently dropped by the API
+  # server. Fail loud rather than ship a schema that drops those writes.
+  local crd
+  for crd in workerpools.ate.dev actortemplates.ate.dev; do
+    if [[ -z "$(run_kubectl get crd "${crd}" -o jsonpath='{.spec.versions[*].schema.openAPIV3Schema.properties.status.properties.observedGeneration}')" ]]; then
+      echo "[deploy_crds] ERROR: CRD ${crd} schema is missing status.observedGeneration after apply (#6684)" >&2
+      exit 1
+    fi
+  done
 }
 
 setup_csi() {
