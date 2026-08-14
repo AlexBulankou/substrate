@@ -396,9 +396,9 @@ func TestUpdateActor_RetriesOnConcurrentWrite(t *testing.T) {
 			return
 		}
 		concurrent.WorkerSelector = &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}
-		val, err := protojson.Marshal(concurrent)
+		val, err := proto.Marshal(concurrent)
 		if err != nil {
-			t.Errorf("protojson.Marshal failed: %v", err)
+			t.Errorf("proto.Marshal failed: %v", err)
 			return
 		}
 		if err := otherClient.Set(ctx, actorDBKey(actorRef), val, 0).Err(); err != nil {

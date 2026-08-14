@@ -15,12 +15,20 @@
 // Package ateredis is an ate storage backend built on Redis.
 //
 // Actors are stored in keys of the form
-// `actor:<atespace>:<name>`.  They are
-// stored as DBActor JSON-serialized objects, which lets us manipulate them from
-// Redis lua.
+// `actor:<atespace>:<name>`, holding a binary protobuf-serialized Actor record.
+// Binary protobuf roughly halves per-record memory versus protojson and is ~4x
+// faster to encode; the optimistic-concurrency version check stays in Go
+// (comparing the decoded version field, never the raw bytes), so the encoding is
+// never inspected from Redis lua.
 //
 // Workers are stored in keys of the form
-// `worker:<namespace>:<pool-name>:<pod-name>`, holding a DBWorker JSON object.
+// `worker:<namespace>:<pool-name>:<pod-name>`, holding a binary
+// protobuf-serialized Worker record.
+//
+// Only the resident Actor/Worker records use binary protobuf. Other record
+// types (atespaces, actor-templates, actor-template-versions, actor-snapshots)
+// and the worker-change pub/sub payloads intentionally stay on protojson: they
+// are low-cardinality or ephemeral, so they do not drive RAM at scale.
 //
 // Note that redis lua scripting has a restriction that informed the data design
 // here -- a lua script must predeclare all keys it is going to access.  It
@@ -592,7 +600,7 @@ func (s *Persistence) GetActor(ctx context.Context, actorRef resources.ActorRef)
 	}
 
 	actor := &ateapipb.Actor{}
-	if err := protojson.Unmarshal(dbActorBytes, actor); err != nil {
+	if err := proto.Unmarshal(dbActorBytes, actor); err != nil {
 		return nil, fmt.Errorf("while unmarshaling actor: %w", err)
 	}
 
@@ -619,9 +627,9 @@ func (s *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) (*
 	dbActor := proto.Clone(actor).(*ateapipb.Actor)
 	dbActor.Metadata = newCreateMetadata(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
 
-	dbActorBytes, err := protojson.Marshal(dbActor)
+	dbActorBytes, err := proto.Marshal(dbActor)
 	if err != nil {
-		return nil, fmt.Errorf("in protojson.Marshal: %w", err)
+		return nil, fmt.Errorf("in proto.Marshal: %w", err)
 	}
 
 	ok, err := s.rdb.SetNX(ctx, dbKey, dbActorBytes, 0).Result()
@@ -877,9 +885,9 @@ func (s *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker)
 	dbWorker := proto.Clone(worker).(*ateapipb.Worker)
 	dbWorker.Metadata = newCreateMetadata("", worker.GetMetadata().GetName())
 
-	dbWorkerBytes, err := protojson.Marshal(dbWorker)
+	dbWorkerBytes, err := proto.Marshal(dbWorker)
 	if err != nil {
-		return fmt.Errorf("in protojson.Marshal: %w", err)
+		return fmt.Errorf("in proto.Marshal: %w", err)
 	}
 
 	ok, err := s.rdb.SetNX(ctx, dbKey, dbWorkerBytes, 0).Result()
@@ -906,8 +914,8 @@ func (s *Persistence) GetWorker(ctx context.Context, name string) (*ateapipb.Wor
 	}
 
 	worker := &ateapipb.Worker{}
-	if err := protojson.Unmarshal(dbWorkerBytes, worker); err != nil {
-		return nil, fmt.Errorf("in protojson.Unmarshal: %w", err)
+	if err := proto.Unmarshal(dbWorkerBytes, worker); err != nil {
+		return nil, fmt.Errorf("in proto.Unmarshal: %w", err)
 	}
 
 	if worker.GetMetadata().GetName() != name {
@@ -934,8 +942,8 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		}
 
 		currentWorker := &ateapipb.Worker{}
-		if err := protojson.Unmarshal(currentVal, currentWorker); err != nil {
-			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal(currentVal, currentWorker); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
 		if currentWorker.GetMetadata().GetVersion() != expectedVersion {
@@ -954,9 +962,9 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		if currentWorker.GetIp() != dbWorker.GetIp() {
 			return fmt.Errorf("ip is immutable")
 		}
-		newVal, err := protojson.Marshal(dbWorker)
+		newVal, err := proto.Marshal(dbWorker)
 		if err != nil {
-			return fmt.Errorf("in protojson.Marshal: %w", err)
+			return fmt.Errorf("in proto.Marshal: %w", err)
 		}
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -1004,8 +1012,8 @@ func (s *Persistence) DeleteActor(ctx context.Context, actorRef resources.ActorR
 		}
 
 		currentActor := &ateapipb.Actor{}
-		if err := protojson.Unmarshal(currentVal, currentActor); err != nil {
-			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
 		if currentActor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_DELETING {
@@ -1079,8 +1087,8 @@ func (s *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 			}
 
 			currentActor := &ateapipb.Actor{}
-			if err := protojson.Unmarshal(currentVal, currentActor); err != nil {
-				return fmt.Errorf("in protojson.Unmarshal: %w", err)
+			if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+				return fmt.Errorf("in proto.Unmarshal: %w", err)
 			}
 
 			// A failed precondition is final: a retry would re-read the very state that failed it.
@@ -1104,9 +1112,9 @@ func (s *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 			// from it, discarding whatever mutate made of it.
 			currentActor.Metadata = newUpdateMetadata(actorBeforeMutation.GetMetadata())
 
-			newVal, err := protojson.Marshal(currentActor)
+			newVal, err := proto.Marshal(currentActor)
 			if err != nil {
-				return fmt.Errorf("in protojson.Marshal: %w", err)
+				return fmt.Errorf("in proto.Marshal: %w", err)
 			}
 
 			if _, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -1143,7 +1151,12 @@ func (s *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 func (s *Persistence) ListWorkers(ctx context.Context, opts store.ListOptions) (store.ListResponse[*ateapipb.Worker], error) {
 	var result []*ateapipb.Worker
 	nextToken, err := s.listPage(ctx, "worker:*", opts.PageSize, opts.PageToken, func(ctx context.Context, master *redis.Client, keys []string) (int, error) {
-		workers, err := fetchProtos(ctx, master, keys, func() *ateapipb.Worker { return &ateapipb.Worker{} })
+		workers, err := fetchProtosBinary(ctx, master, keys, func() *ateapipb.Worker { return &ateapipb.Worker{} }, func(key string, w *ateapipb.Worker) error {
+			if workerDBKey(w.GetWorkerNamespace(), w.GetWorkerPool(), w.GetWorkerPod()) != key {
+				return fmt.Errorf("worker record at key %q does not match its key identity", key)
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -1190,7 +1203,14 @@ func hashShardAddr(addr string) string {
 func (s *Persistence) ListActors(ctx context.Context, atespace string, opts store.ListOptions) (store.ListResponse[*ateapipb.Actor], error) {
 	var result []*ateapipb.Actor
 	nextToken, err := s.listPage(ctx, actorScanPattern(atespace), opts.PageSize, opts.PageToken, func(ctx context.Context, master *redis.Client, keys []string) (int, error) {
-		actors, err := fetchProtos(ctx, master, keys, func() *ateapipb.Actor { return &ateapipb.Actor{} })
+		actors, err := fetchProtosBinary(ctx, master, keys, func() *ateapipb.Actor { return &ateapipb.Actor{} }, func(key string, a *ateapipb.Actor) error {
+			// Reconstruct the key the record claims to live at; keeps this correct
+			// for the atespace-scoped key shape and for names containing ':'.
+			if actorDBKey(resources.ActorRefFromActor(a)) != key {
+				return fmt.Errorf("actor record at key %q does not match its key identity", key)
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
 		}
@@ -1295,8 +1315,41 @@ func findStartingShard(masters []*redis.Client, shardHash string) (int, error) {
 	return 0, fmt.Errorf("topology changed: shard with hash %s not found (aborted)", shardHash)
 }
 
-// fetchProtos fetches keys into newMsg-created messages.
+// fetchProtos fetches keys into newMsg-created messages, decoding each value
+// with protojson. Used for the low-cardinality/ephemeral record types that
+// intentionally stay on protojson (atespaces, actor-templates,
+// actor-template-versions).
 func fetchProtos[M proto.Message](ctx context.Context, master *redis.Client, keys []string, newMsg func() M) ([]M, error) {
+	return fetchProtosWith(ctx, master, keys, newMsg, func(b []byte, msg M) error {
+		if err := protojson.Unmarshal(b, msg); err != nil {
+			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		}
+		return nil
+	}, nil)
+}
+
+// fetchProtosBinary is the binary-protobuf sibling of fetchProtos. The resident
+// Actor/Worker records are stored with proto.Marshal (roughly half the
+// per-record memory of protojson and ~4x faster to encode), so their list reads
+// must decode with proto.Unmarshal. Unlike protojson, proto.Unmarshal decodes an
+// empty/corrupt value to a zero-valued message without error, so callers pass a
+// validate func to reject any decoded record whose identity does not match its
+// key (the same check GetActor/GetWorker perform on the single-record path).
+func fetchProtosBinary[M proto.Message](ctx context.Context, master *redis.Client, keys []string, newMsg func() M, validate func(key string, msg M) error) ([]M, error) {
+	return fetchProtosWith(ctx, master, keys, newMsg, func(b []byte, msg M) error {
+		if err := proto.Unmarshal(b, msg); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
+		}
+		return nil
+	}, validate)
+}
+
+// fetchProtosWith pipelines a multi-key GET and decodes each present value with
+// the supplied decode func, skipping keys that are missing (redis.Nil). Pipelined
+// returns one result per queued command, in order, so cmds[i] corresponds to
+// keys[i]; the optional validate func relies on that alignment to check each
+// decoded record against its key.
+func fetchProtosWith[M proto.Message](ctx context.Context, master *redis.Client, keys []string, newMsg func() M, decode func([]byte, M) error, validate func(key string, msg M) error) ([]M, error) {
 	cmds, err := master.Pipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, key := range keys {
 			pipe.Get(ctx, key)
@@ -1307,8 +1360,14 @@ func fetchProtos[M proto.Message](ctx context.Context, master *redis.Client, key
 		return nil, fmt.Errorf("while fetching keys in shard %s: %w", master.Options().Addr, err)
 	}
 
+	// cmds[i] must correspond to keys[i] for the identity validation below; fail
+	// closed if that invariant ever breaks.
+	if len(cmds) != len(keys) {
+		return nil, fmt.Errorf("(impossible) pipeline returned %d results for %d keys in shard %s", len(cmds), len(keys), master.Options().Addr)
+	}
+
 	var out []M
-	for _, cmd := range cmds {
+	for i, cmd := range cmds {
 		getCmd, ok := cmd.(*redis.StringCmd)
 		if !ok {
 			continue
@@ -1321,8 +1380,13 @@ func fetchProtos[M proto.Message](ctx context.Context, master *redis.Client, key
 		}
 
 		msg := newMsg()
-		if err := protojson.Unmarshal([]byte(getCmd.Val()), msg); err != nil {
-			return nil, fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := decode([]byte(getCmd.Val()), msg); err != nil {
+			return nil, err
+		}
+		if validate != nil {
+			if err := validate(keys[i], msg); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, msg)
 	}
