@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +36,11 @@ import (
 )
 
 const workerPoolFieldOwner = "workerpool-controller"
+
+const (
+	workerPoolConditionReady       = "Ready"
+	workerPoolConditionProgressing = "Progressing"
+)
 
 type WorkerPoolReconciler struct {
 	client.Client
@@ -129,10 +135,46 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 		return fmt.Errorf("failed to convert Deployment selector: %w", err)
 	}
 
+	// Copy rather than alias wp.Status.Conditions: meta.SetStatusCondition
+	// mutates the slice in place, and DeepEqual below must compare against
+	// the pre-mutation value to detect real changes.
+	conditions := make([]metav1.Condition, len(wp.Status.Conditions))
+	copy(conditions, wp.Status.Conditions)
+
+	if dep.Status.Replicas == wp.Spec.Replicas && dep.Status.ReadyReplicas == wp.Spec.Replicas {
+		meta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:    workerPoolConditionProgressing,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Converged",
+			Message: "All worker pods are ready",
+		})
+		meta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:    workerPoolConditionReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Converged",
+			Message: "Worker pool matches the desired replica count",
+		})
+	} else {
+		msg := fmt.Sprintf("%d/%d worker pods ready", dep.Status.ReadyReplicas, wp.Spec.Replicas)
+		meta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:    workerPoolConditionProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  "ScalingReplicas",
+			Message: msg,
+		})
+		meta.SetStatusCondition(&conditions, metav1.Condition{
+			Type:    workerPoolConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  "ScalingReplicas",
+			Message: msg,
+		})
+	}
+
 	want := atev1alpha1.WorkerPoolStatus{
 		Replicas:      dep.Status.Replicas,
 		ReadyReplicas: dep.Status.ReadyReplicas,
 		Selector:      selector.String(),
+		Conditions:    conditions,
 	}
 	if equality.Semantic.DeepEqual(wp.Status, want) {
 		return nil

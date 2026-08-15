@@ -104,6 +104,15 @@ type WorkerPoolStatus struct {
 	// Selector is the label selector for the worker pods.
 	// +optional
 	Selector string `json:"selector,omitempty"`
+
+	// Conditions represent the latest available observations of the
+	// WorkerPool's state, following the sig-api-machinery convention.
+	// +optional
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
 // WorkerPool is the Schema for the workerpools API

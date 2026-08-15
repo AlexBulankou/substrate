@@ -687,6 +687,64 @@ func TestSyncStatus_ReadyReplicas(t *testing.T) {
 	})
 }
 
+// findCondition returns the condition of the given type, or nil if absent.
+func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+// TestSyncStatus_Conditions verifies that the controller sets Ready/Progressing
+// conditions based on whether the Deployment has converged on spec.replicas.
+func TestSyncStatus_Conditions(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-sync-conditions", "default", 3, "ateom:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+	eventually(t, func(ctx context.Context) (bool, error) {
+		_, err := getDeployment(ctx, wp)
+		return err == nil, nil
+	})
+
+	// Not yet converged: 3 desired, only 1 ready.
+	updateDeploymentStatus(t, ctx, wp, "patch Deployment status (not converged)", func(dep *appsv1.Deployment) {
+		dep.Status.Replicas = 3
+		dep.Status.ReadyReplicas = 1
+	})
+	eventually(t, func(ctx context.Context) (bool, error) {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, current); err != nil {
+			return false, nil
+		}
+		ready := findCondition(current.Status.Conditions, workerPoolConditionReady)
+		progressing := findCondition(current.Status.Conditions, workerPoolConditionProgressing)
+		return ready != nil && ready.Status == metav1.ConditionFalse &&
+			progressing != nil && progressing.Status == metav1.ConditionTrue, nil
+	})
+
+	// Converged: all 3 desired pods ready.
+	updateDeploymentStatus(t, ctx, wp, "patch Deployment status (converged)", func(dep *appsv1.Deployment) {
+		dep.Status.Replicas = 3
+		dep.Status.ReadyReplicas = 3
+	})
+	eventually(t, func(ctx context.Context) (bool, error) {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, current); err != nil {
+			return false, nil
+		}
+		ready := findCondition(current.Status.Conditions, workerPoolConditionReady)
+		progressing := findCondition(current.Status.Conditions, workerPoolConditionProgressing)
+		return ready != nil && ready.Status == metav1.ConditionTrue &&
+			progressing != nil && progressing.Status == metav1.ConditionFalse, nil
+	})
+}
+
 // TestWorkerPoolMetrics verifies that the registered callback observes
 // spec.replicas and status.readyReplicas per WorkerPool, labeled with the pool
 // namespace and name. A fake client keeps this off the envtest reconciler,
