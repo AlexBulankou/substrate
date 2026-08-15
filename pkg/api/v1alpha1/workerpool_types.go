@@ -179,6 +179,15 @@ type WorkerPoolStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	SandboxClasses []WorkerPoolSandboxClassStatus `json:"sandboxClasses,omitempty"`
+
+	// Conditions represent the latest available observations of the
+	// WorkerPool's state, following the sig-api-machinery convention.
+	// +optional
+	// +patchMergeKey=type
+	// +patchStrategy=merge
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
 // WorkerPoolSandboxClassStatus reports the SandboxConfig and resolution state
