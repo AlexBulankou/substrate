@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -250,6 +251,120 @@ func TestActorTemplateReconciler_Reconcile_PhaseInitial(t *testing.T) {
 		}
 		if reconciledTemplate.Status.Phase != atev1alpha1.PhaseResumeGoldenActor {
 			t.Errorf("status.Phase = %q, want %q", reconciledTemplate.Status.Phase, atev1alpha1.PhaseResumeGoldenActor)
+		}
+	})
+}
+
+func TestActorTemplateReconciler_Reconcile_PhaseWaitGoldenActor(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := atev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add scheme: %v", err)
+	}
+
+	const goldenActorID = "golden-uid-abc"
+
+	newTemplate := func(name string) *atev1alpha1.ActorTemplate {
+		return &atev1alpha1.ActorTemplate{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       name,
+				Namespace:  "default",
+				Finalizers: []string{goldenActorFinalizer},
+			},
+			Status: atev1alpha1.ActorTemplateStatus{
+				Phase:                atev1alpha1.PhaseWaitGoldenActor,
+				GoldenActorID:        goldenActorID,
+				TakeGoldenSnapshotAt: metav1.NewTime(time.Now().Add(-1 * time.Minute)),
+			},
+		}
+	}
+
+	t.Run("requeues when the golden snapshot has not committed yet", func(t *testing.T) {
+		template := newTemplate("wait-pending")
+		fakeK8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
+			WithObjects(template).
+			Build()
+
+		fakeAteClient := &mockControlClient{
+			suspendActorFn: func(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
+				// latest_snapshot not yet populated — snapshot commit is async.
+				return &ateapipb.SuspendActorResponse{Actor: &ateapipb.Actor{}}, nil
+			},
+		}
+
+		reconciler := &ActorTemplateReconciler{
+			Client:    fakeK8sClient,
+			Scheme:    scheme,
+			AteClient: fakeAteClient,
+			Recorder:  record.NewFakeRecorder(10),
+		}
+
+		ctx := context.Background()
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "wait-pending", Namespace: "default"}}
+		res, err := reconciler.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile returned error on uncommitted snapshot: %v", err)
+		}
+		if res.RequeueAfter != goldenSnapshotRetry {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, goldenSnapshotRetry)
+		}
+
+		reconciledTemplate := &atev1alpha1.ActorTemplate{}
+		if err := fakeK8sClient.Get(ctx, req.NamespacedName, reconciledTemplate); err != nil {
+			t.Fatalf("failed to get reconciled ActorTemplate: %v", err)
+		}
+		if reconciledTemplate.Status.Phase != atev1alpha1.PhaseWaitGoldenActor {
+			t.Errorf("status.Phase = %q, want %q (should not advance while snapshot pending)", reconciledTemplate.Status.Phase, atev1alpha1.PhaseWaitGoldenActor)
+		}
+		if reconciledTemplate.Status.GoldenSnapshot != "" {
+			t.Errorf("status.GoldenSnapshot = %q, want empty while snapshot pending", reconciledTemplate.Status.GoldenSnapshot)
+		}
+	})
+
+	t.Run("transitions to Ready once the golden snapshot commits", func(t *testing.T) {
+		template := newTemplate("wait-ready")
+		fakeK8sClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
+			WithObjects(template).
+			Build()
+
+		const snapshotName = "golden-snapshot-1"
+		fakeAteClient := &mockControlClient{
+			suspendActorFn: func(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
+				return &ateapipb.SuspendActorResponse{
+					Actor: &ateapipb.Actor{LatestSnapshot: &ateapipb.ObjectRef{Name: snapshotName}},
+				}, nil
+			},
+		}
+
+		reconciler := &ActorTemplateReconciler{
+			Client:    fakeK8sClient,
+			Scheme:    scheme,
+			AteClient: fakeAteClient,
+			Recorder:  record.NewFakeRecorder(10),
+		}
+
+		ctx := context.Background()
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "wait-ready", Namespace: "default"}}
+		res, err := reconciler.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile returned error on committed snapshot: %v", err)
+		}
+		if !res.IsZero() {
+			t.Errorf("unexpected requeue result: %v", res)
+		}
+
+		reconciledTemplate := &atev1alpha1.ActorTemplate{}
+		if err := fakeK8sClient.Get(ctx, req.NamespacedName, reconciledTemplate); err != nil {
+			t.Fatalf("failed to get reconciled ActorTemplate: %v", err)
+		}
+		if reconciledTemplate.Status.Phase != atev1alpha1.PhaseReady {
+			t.Errorf("status.Phase = %q, want %q", reconciledTemplate.Status.Phase, atev1alpha1.PhaseReady)
+		}
+		if reconciledTemplate.Status.GoldenSnapshot != snapshotName {
+			t.Errorf("status.GoldenSnapshot = %q, want %q", reconciledTemplate.Status.GoldenSnapshot, snapshotName)
 		}
 	})
 }

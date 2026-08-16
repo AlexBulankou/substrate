@@ -54,6 +54,13 @@ const (
 	// finalization.
 	goldenActorDeleteRetry = 5 * time.Second
 
+	// goldenSnapshotRetry is the requeue delay used while waiting for a
+	// suspended golden actor's snapshot to finish committing. SuspendActor can
+	// return before latest_snapshot is populated (the snapshot commit lands
+	// asynchronously); treating that transient nil as fatal wedges the
+	// ActorTemplate, so we requeue instead.
+	goldenSnapshotRetry = 10 * time.Second
+
 	// goldenSnapshotWarmup is the default wall-clock delay between resuming
 	// the golden actor and taking its snapshot, used as a coarse "give the
 	// workload time to finish initializing" fallback for templates without
@@ -233,9 +240,13 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 		snapshot := resp.GetActor().GetStatus().GetLatestSnapshot()
 		if snapshot == nil {
-			r.Recorder.Eventf(at, corev1.EventTypeWarning, "GoldenSnapshotFailed",
-				"Suspending golden actor %q returned no ActorSnapshot", at.Status.GoldenActorID)
-			return ctrl.Result{}, fmt.Errorf("suspending golden actor returned no ActorSnapshot")
+			// The golden actor's snapshot has not committed yet — SuspendActor
+			// can return before latest_snapshot is populated. This is transient
+			// and self-resolves once the snapshot lands, so requeue with backoff
+			// rather than hard-erroring and wedging the ActorTemplate.
+			r.Recorder.Eventf(at, corev1.EventTypeNormal, "GoldenSnapshotPending",
+				"Golden actor %q snapshot not yet committed; requeuing", at.Status.GoldenActorID)
+			return ctrl.Result{RequeueAfter: goldenSnapshotRetry}, nil
 		}
 
 		// Transition to PhaseReady
