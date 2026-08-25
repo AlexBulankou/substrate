@@ -57,6 +57,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -1342,6 +1343,22 @@ func unmarshalResident(b []byte, msg proto.Message) error {
 		if looksLikeJSONObject(b) {
 			proto.Reset(msg)
 			if jerr := protojson.Unmarshal(b, msg); jerr != nil {
+				// Third tier: the protojson fallback itself dies on ancient
+				// flat-string status records (Actor.status stored as a bare
+				// enum STRING "STATUS_SUSPENDED", predating the nested
+				// ActorStatus message schema). Attempt an in-memory migration
+				// of the flat string to the nested {"state": ...} shape and
+				// retry protojson once. Fail-closed and LOUD (#4420): an
+				// unmappable token or non-matching payload leaves migrated
+				// empty, so the original protojson error propagates unchanged.
+				if migrated, ok := migrateLegacyResidentJSON(b, msg); ok {
+					proto.Reset(msg)
+					if merr := protojson.Unmarshal(migrated, msg); merr == nil {
+						return nil
+					} else {
+						return fmt.Errorf("in proto.Unmarshal: %w (protojson fallback failed: %v; legacy-status migration retry also failed: %v)", err, jerr, merr)
+					}
+				}
 				return fmt.Errorf("in proto.Unmarshal: %w (protojson fallback also failed: %v)", err, jerr)
 			}
 			return nil
@@ -1349,6 +1366,77 @@ func unmarshalResident(b []byte, msg proto.Message) error {
 		return fmt.Errorf("in proto.Unmarshal: %w", err)
 	}
 	return nil
+}
+
+// migrateLegacyResidentJSON rewrites an ancient flat-string Actor.status record
+// into the current nested ActorStatus shape so protojson can parse it. The
+// ancient schema (predating the fork) stored status as a bare enum STRING
+// (`"status":"STATUS_SUSPENDED"`); the current proto defines status as a nested
+// message (`ActorStatus{state ActorState}`), so protojson dies parsing the flat
+// string. This is decode-only (Option A): it returns a migrated payload for the
+// caller to re-parse and NEVER re-persists, so it has zero write-path blast
+// radius and preserves the standing store as a regression surface (#7264). It
+// matches ONLY *ateapipb.Actor whose top-level "status" is a JSON string; any
+// other message, a "status" that is already an object, or an unmappable enum
+// token returns ok=false so the caller's original error is preserved (#4420
+// fail-closed). The other ActorStatus sub-fields (worker_assignment, reason,
+// timestamps, latest_snapshot) are legitimately absent in the ancient record —
+// it only ever carried the bare enum — so the reconstruction is faithful, not
+// lossy.
+func migrateLegacyResidentJSON(b []byte, msg proto.Message) ([]byte, bool) {
+	if _, ok := msg.(*ateapipb.Actor); !ok {
+		return nil, false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return nil, false
+	}
+	raw, present := obj["status"]
+	if !present {
+		return nil, false
+	}
+	// Only a JSON string status is the legacy flat form; an object is already
+	// the current nested shape and must not be touched (idempotent by
+	// construction).
+	var flat string
+	if err := json.Unmarshal(raw, &flat); err != nil {
+		return nil, false
+	}
+	stateName, ok := legacyStatusToActorState(flat)
+	if !ok {
+		return nil, false
+	}
+	nested, err := json.Marshal(map[string]string{"state": stateName})
+	if err != nil {
+		return nil, false
+	}
+	obj["status"] = nested
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// legacyStatusToActorState maps an ancient flat Actor.status enum token
+// (`STATUS_<X>`) to the current ActorState enum name (`ACTOR_STATE_<X>`),
+// validated against the generated ateapipb.ActorState_value map so it can never
+// emit an enum name the proto does not define. Returns ok=false for any token
+// lacking the STATUS_ prefix or whose transformed name is not a defined
+// ActorState (fail-closed): the caller then preserves the original parse error
+// rather than fabricating a bogus state.
+func legacyStatusToActorState(flat string) (string, bool) {
+	const legacyPrefix = "STATUS_"
+	if !strings.HasPrefix(flat, legacyPrefix) {
+		return "", false
+	}
+	candidate := "ACTOR_STATE_" + strings.TrimPrefix(flat, legacyPrefix)
+	// ActorState_value["ACTOR_STATE_UNSPECIFIED"] == 0; a non-existent key also
+	// reads 0, so accept a zero value ONLY for the explicit UNSPECIFIED name.
+	if v, present := ateapipb.ActorState_value[candidate]; present && (v != 0 || candidate == "ACTOR_STATE_UNSPECIFIED") {
+		return candidate, true
+	}
+	return "", false
 }
 
 // looksLikeJSONObject reports whether b's first non-whitespace byte is '{', the
