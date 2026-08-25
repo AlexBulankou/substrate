@@ -1152,7 +1152,7 @@ func (s *Persistence) ListWorkers(ctx context.Context, opts store.ListOptions) (
 	var result []*ateapipb.Worker
 	nextToken, err := s.listPage(ctx, "worker:*", opts.PageSize, opts.PageToken, func(ctx context.Context, master *redis.Client, keys []string) (int, error) {
 		workers, err := fetchProtosBinary(ctx, master, keys, func() *ateapipb.Worker { return &ateapipb.Worker{} }, func(key string, w *ateapipb.Worker) error {
-			if workerDBKey(w.GetWorkerNamespace(), w.GetWorkerPool(), w.GetWorkerPod()) != key {
+			if workerDBKey(w.GetMetadata().GetName()) != key {
 				return fmt.Errorf("worker record at key %q does not match its key identity", key)
 			}
 			return nil

@@ -26,6 +26,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
@@ -63,12 +64,12 @@ func TestCreateActor_StoresBinaryProtobuf(t *testing.T) {
 func TestCreateWorker_StoresBinaryProtobuf(t *testing.T) {
 	_, s, ctx := setupTest(t)
 
-	worker := &ateapipb.Worker{WorkerNamespace: "default", WorkerPool: "pool-1", WorkerPod: "pod-1"}
+	worker := &ateapipb.Worker{Metadata: &ateapipb.ResourceMetadata{Name: "pod-uid-1"}}
 	if err := s.CreateWorker(ctx, worker); err != nil {
 		t.Fatalf("CreateWorker failed: %v", err)
 	}
 
-	raw, err := s.rdb.Get(ctx, workerDBKey("default", "pool-1", "pod-1")).Bytes()
+	raw, err := s.rdb.Get(ctx, workerDBKey("pod-uid-1")).Bytes()
 	if err != nil {
 		t.Fatalf("raw Get failed: %v", err)
 	}
@@ -95,10 +96,10 @@ func TestGetActor_RejectsEmptyValue(t *testing.T) {
 func TestGetWorker_RejectsEmptyValue(t *testing.T) {
 	_, s, ctx := setupTest(t)
 
-	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "ghost"), "", 0).Err(); err != nil {
+	if err := s.rdb.Set(ctx, workerDBKey("ghost"), "", 0).Err(); err != nil {
 		t.Fatalf("seeding empty value failed: %v", err)
 	}
-	if _, err := s.GetWorker(ctx, "ns1", "pool1", "ghost"); err == nil {
+	if _, err := s.GetWorker(ctx, "ghost"); err == nil {
 		t.Errorf("expected GetWorker to reject an empty value, got nil")
 	}
 }
@@ -110,7 +111,7 @@ func TestListActors_RejectsEmptyValue(t *testing.T) {
 	if err := s.rdb.Set(ctx, actorDBKey(ref), "", 0).Err(); err != nil {
 		t.Fatalf("seeding empty value failed: %v", err)
 	}
-	if _, _, err := s.ListActors(ctx, "ns1", 1000, ""); err == nil {
+	if _, err := s.ListActors(ctx, "ns1", store.ListOptions{PageSize: 1000}); err == nil {
 		t.Errorf("expected ListActors to reject an empty-value actor key, got nil")
 	}
 }
@@ -130,7 +131,7 @@ func TestListActors_RejectsIdentityMismatch(t *testing.T) {
 	if err := s.rdb.Set(ctx, actorDBKey(resources.ActorRef{Atespace: "ns1", Name: "wrong"}), bytes, 0).Err(); err != nil {
 		t.Fatalf("seeding mismatched actor failed: %v", err)
 	}
-	if _, _, err := s.ListActors(ctx, "ns1", 1000, ""); err == nil {
+	if _, err := s.ListActors(ctx, "ns1", store.ListOptions{PageSize: 1000}); err == nil {
 		t.Errorf("expected ListActors to reject an identity-mismatched actor, got nil")
 	}
 }
@@ -138,10 +139,10 @@ func TestListActors_RejectsIdentityMismatch(t *testing.T) {
 func TestListWorkers_RejectsEmptyValue(t *testing.T) {
 	_, s, ctx := setupTest(t)
 
-	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "ghost"), "", 0).Err(); err != nil {
+	if err := s.rdb.Set(ctx, workerDBKey("ghost"), "", 0).Err(); err != nil {
 		t.Fatalf("seeding empty value failed: %v", err)
 	}
-	if _, _, err := s.ListWorkers(ctx, 1000, ""); err == nil {
+	if _, err := s.ListWorkers(ctx, store.ListOptions{PageSize: 1000}); err == nil {
 		t.Errorf("expected ListWorkers to reject an empty-value worker key, got nil")
 	}
 }
@@ -149,17 +150,17 @@ func TestListWorkers_RejectsEmptyValue(t *testing.T) {
 func TestListWorkers_RejectsIdentityMismatch(t *testing.T) {
 	_, s, ctx := setupTest(t)
 
-	// A valid Worker proto, but stored under a key with a different pod.
+	// A valid Worker proto, but stored under a key with a different name.
 	bytes, err := proto.Marshal(&ateapipb.Worker{
-		WorkerNamespace: "ns1", WorkerPool: "pool1", WorkerPod: "real", Version: 1,
+		Metadata: &ateapipb.ResourceMetadata{Name: "real", Version: 1},
 	})
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "wrong"), bytes, 0).Err(); err != nil {
+	if err := s.rdb.Set(ctx, workerDBKey("wrong"), bytes, 0).Err(); err != nil {
 		t.Fatalf("seeding mismatched worker failed: %v", err)
 	}
-	if _, _, err := s.ListWorkers(ctx, 1000, ""); err == nil {
+	if _, err := s.ListWorkers(ctx, store.ListOptions{PageSize: 1000}); err == nil {
 		t.Errorf("expected ListWorkers to reject an identity-mismatched worker, got nil")
 	}
 }
