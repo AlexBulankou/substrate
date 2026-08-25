@@ -42,7 +42,7 @@ func TestCreateActor_StoresBinaryProtobuf(t *testing.T) {
 		Metadata:               &ateapipb.ResourceMetadata{Name: "session-1", Atespace: "ns1"},
 		ActorTemplateNamespace: "default",
 		ActorTemplateName:      "test-template",
-		Status:                 ateapipb.Actor_STATUS_SUSPENDED,
+		Status:                 &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
 	}
 	if _, err := s.CreateActor(ctx, actor); err != nil {
 		t.Fatalf("CreateActor failed: %v", err)
