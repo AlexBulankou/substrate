@@ -334,7 +334,7 @@ func TestActorTemplateReconciler_Reconcile_PhaseWaitGoldenActor(t *testing.T) {
 		fakeAteClient := &mockControlClient{
 			suspendActorFn: func(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
 				return &ateapipb.SuspendActorResponse{
-					Actor: &ateapipb.Actor{LatestSnapshot: &ateapipb.ObjectRef{Name: snapshotName}},
+					Actor: &ateapipb.Actor{Status: &ateapipb.ActorStatus{LatestSnapshot: &ateapipb.ObjectRef{Name: snapshotName}}},
 				}, nil
 			},
 		}
