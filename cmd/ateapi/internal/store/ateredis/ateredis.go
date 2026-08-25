@@ -600,7 +600,7 @@ func (s *Persistence) GetActor(ctx context.Context, actorRef resources.ActorRef)
 	}
 
 	actor := &ateapipb.Actor{}
-	if err := proto.Unmarshal(dbActorBytes, actor); err != nil {
+	if err := unmarshalResident(dbActorBytes, actor); err != nil {
 		return nil, fmt.Errorf("while unmarshaling actor: %w", err)
 	}
 
@@ -914,7 +914,7 @@ func (s *Persistence) GetWorker(ctx context.Context, name string) (*ateapipb.Wor
 	}
 
 	worker := &ateapipb.Worker{}
-	if err := proto.Unmarshal(dbWorkerBytes, worker); err != nil {
+	if err := unmarshalResident(dbWorkerBytes, worker); err != nil {
 		return nil, fmt.Errorf("in proto.Unmarshal: %w", err)
 	}
 
@@ -942,7 +942,7 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		}
 
 		currentWorker := &ateapipb.Worker{}
-		if err := proto.Unmarshal(currentVal, currentWorker); err != nil {
+		if err := unmarshalResident(currentVal, currentWorker); err != nil {
 			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
@@ -1012,7 +1012,7 @@ func (s *Persistence) DeleteActor(ctx context.Context, actorRef resources.ActorR
 		}
 
 		currentActor := &ateapipb.Actor{}
-		if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+		if err := unmarshalResident(currentVal, currentActor); err != nil {
 			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
@@ -1087,7 +1087,7 @@ func (s *Persistence) UpdateActor(ctx context.Context, actorRef resources.ActorR
 			}
 
 			currentActor := &ateapipb.Actor{}
-			if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+			if err := unmarshalResident(currentVal, currentActor); err != nil {
 				return fmt.Errorf("in proto.Unmarshal: %w", err)
 			}
 
@@ -1328,6 +1328,45 @@ func fetchProtos[M proto.Message](ctx context.Context, master *redis.Client, key
 	}, nil)
 }
 
+// unmarshalResident decodes a resident Actor/Worker record. New records are
+// written with proto.Marshal (binary); records left in the store by a pre-#307
+// deployment are protojson. Decode binary first, and only if that fails AND the
+// value looks like a protojson object fall back to protojson — this lets a
+// freshly upgraded server read legacy records instead of crashlooping on boot
+// while seeding its caches. A valid binary record never reaches the fallback
+// (its first byte is a protobuf tag, not '{'), and a corrupt non-JSON value
+// keeps the binary error and stays rejected, so the fallback does not weaken the
+// empty/corrupt-value rejection the key-identity checks depend on.
+func unmarshalResident(b []byte, msg proto.Message) error {
+	if err := proto.Unmarshal(b, msg); err != nil {
+		if looksLikeJSONObject(b) {
+			proto.Reset(msg)
+			if jerr := protojson.Unmarshal(b, msg); jerr != nil {
+				return fmt.Errorf("in proto.Unmarshal: %w (protojson fallback also failed: %v)", err, jerr)
+			}
+			return nil
+		}
+		return fmt.Errorf("in proto.Unmarshal: %w", err)
+	}
+	return nil
+}
+
+// looksLikeJSONObject reports whether b's first non-whitespace byte is '{', the
+// cheap discriminator between a legacy protojson record and a binary one.
+func looksLikeJSONObject(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // fetchProtosBinary is the binary-protobuf sibling of fetchProtos. The resident
 // Actor/Worker records are stored with proto.Marshal (roughly half the
 // per-record memory of protojson and ~4x faster to encode), so their list reads
@@ -1337,10 +1376,7 @@ func fetchProtos[M proto.Message](ctx context.Context, master *redis.Client, key
 // key (the same check GetActor/GetWorker perform on the single-record path).
 func fetchProtosBinary[M proto.Message](ctx context.Context, master *redis.Client, keys []string, newMsg func() M, validate func(key string, msg M) error) ([]M, error) {
 	return fetchProtosWith(ctx, master, keys, newMsg, func(b []byte, msg M) error {
-		if err := proto.Unmarshal(b, msg); err != nil {
-			return fmt.Errorf("in proto.Unmarshal: %w", err)
-		}
-		return nil
+		return unmarshalResident(b, msg)
 	}, validate)
 }
 
