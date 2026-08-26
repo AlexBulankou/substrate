@@ -33,9 +33,11 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/google"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -112,11 +114,19 @@ func buildFixtureImage(t *testing.T, repo string) string {
 	// tag. The returned reference is digest-pinned, so the tag itself is
 	// throwaway.
 	ref := fmt.Sprintf("%s/e2e-imagevolume-fixture:%d", strings.TrimSuffix(repo, "/"), time.Now().UnixNano())
-	tag, err := name.ParseReference(ref, name.Insecure)
+	// No name.Insecure: let the registry package derive the scheme. It still
+	// picks http automatically for loopback/RFC1918 hosts (a local kind
+	// registry keeps working), but uses https for a real registry such as an
+	// Artifact Registry repo, which serves https only.
+	tag, err := name.ParseReference(ref)
 	if err != nil {
 		t.Fatalf("parsing %q: %v", ref, err)
 	}
-	if err := remote.Write(tag, img); err != nil {
+	// Authenticate against the target registry. MultiKeychain resolves to the
+	// GCP credential for an Artifact Registry / GCR host and falls back to
+	// anonymous for a local unauthenticated registry, so both environments work.
+	keychain := authn.NewMultiKeychain(google.Keychain, authn.DefaultKeychain)
+	if err := remote.Write(tag, img, remote.WithAuthFromKeychain(keychain)); err != nil {
 		t.Fatalf("pushing %q: %v", ref, err)
 	}
 
