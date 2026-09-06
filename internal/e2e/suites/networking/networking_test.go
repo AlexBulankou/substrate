@@ -29,6 +29,8 @@ import (
 	"github.com/agent-substrate/substrate/internal/e2e"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -368,9 +370,11 @@ func createAndResume(t *testing.T, ctx context.Context, prefix string, actor *at
 	actorRef := &ateapipb.ObjectRef{Atespace: networkingAtespace, Name: actorName}
 
 	t.Logf("creating actor %s/%s", networkingAtespace, actorName)
-	_, _ = clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
+	if _, err := clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
 		Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: networkingAtespace}},
-	})
+	}); err != nil && status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("failed to create atespace %q: %v", networkingAtespace, err)
+	}
 	actor.Metadata = &ateapipb.ResourceMetadata{Atespace: networkingAtespace, Name: actorName}
 	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: actor}); err != nil {
 		t.Fatalf("CreateActor from %s: %v (deploy the fixture with %s)", source, err, deployWith)
