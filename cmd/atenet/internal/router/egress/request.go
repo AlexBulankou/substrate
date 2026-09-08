@@ -86,7 +86,6 @@ func (h *Handler) handleRequest(ctx context.Context, md *extproc.RequestMetadata
 		slog.DebugContext(ctx, "egress allowed", attrs()...)
 	}
 	res := allow()
-	// Envoy picked a route before ext_proc ran; the dial picks the real one.
 	// ext_proc only honors the clear when the response also carries a header
 	// mutation, on the assumption that nothing else can move a route, so an
 	// empty one goes along.

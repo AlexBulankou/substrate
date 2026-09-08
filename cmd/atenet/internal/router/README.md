@@ -27,6 +27,11 @@ Router has several responsibilities:
   gateway's ext_proc handler re-verifies the actor's client certificate against
   the actor-identity CA, reads the `ActorIdentity` X.509 extension out of it,
   and checks the certified UID against the ATE API.
+* Authorizes egress against the actor's `EgressPolicy`: every request the
+  gateway can read is decided on its `Host` and the address the actor dialed,
+  rules in order, first match wins; what it cannot read is decided by address
+  at the CONNECT. An actor with no policy gets no tunnel. See
+  [egress legs](#egress-legs).
 * Serves arbitrary-port ingress: a client reaches a port on the actor other
   than its default (80) by sending an HTTP CONNECT to
   `<actor-dns>:<port>` on `--port-connect`/`--port-connect-tls`, rather than
@@ -53,12 +58,64 @@ packages that cannot reach into each other:
   It imports neither handler package.
 * `ingress` — resume, park, and route to the actor's worker.
 * `egress` — certificate-based actor-identity authentication for outbound
-  CONNECTs.
+  CONNECTs, and `EgressPolicy` enforcement on the legs inside the tunnel.
 
 Direction is decided by the filter chain the dataplane says accepted the
 request (`xds.filter_chain_name`, an Envoy attribute the egress gateway is
 configured to send), never by anything in the request itself, so a client
 cannot pick the egress path by crafting one. `router` itself does the wiring.
+
+## egress legs
+
+The egress gateway calls the same ext_proc sidecar from two Envoy filter
+chains on the plain gateway and three on the sdsmint gateway, and the chain
+name (`xds.filter_chain_name`) tells the handler which leg it is on:
+
+| Leg (filter chain) | Where | Sees | Decides |
+| --- | --- | --- | --- |
+| `egress` | outer CONNECT, both gateways | actor certificate, the `IP:port` the actor dialed | per TCP connection: identity, and the address rules for what the inner listener cannot read |
+| `egress_cleartext` | HTTP the actor sent in the clear, both gateways | `Host`, method, headers, the dialed `IP:port` | **every request**, all rules |
+| `egress_tls_mitm` | TLS the sdsmint gateway terminated | same as cleartext | **every request**, all rules |
+
+A request leg evaluates the policy the way the API describes: the rules in
+order, over the request's `Host` and the address the actor dialed, and the
+first match decides. Its answer (`dev.ate.egress:dial`) also picks the route,
+so the bytes go to what the matching rule checked: a `hostnames` match is
+resolved and dialed by name through `dynamic_forward_proxy`, a `cidrs` or
+`all` match goes to the dialed address through an `ORIGINAL_DST` cluster. On
+the sdsmint gateway both routes re-originate TLS with the `Host` as SNI and
+verify the origin's certificate against it. There is no route without an
+answer.
+
+The CONNECT leg answers with `dev.ate.egress:passthrough_destination`, the
+dialed address when an address rule allows it. The outer chain copies it into
+the `ORIGINAL_DST` filter state shared with the inner listener, which is what
+the by-address routes and the passthrough chains (TLS the plain gateway does
+not terminate, and anything neither inspector could classify) dial; with no
+address the passthrough chains close the connection before a byte is relayed.
+A CONNECT no address rule allows still opens when the policy has `hostnames`
+rules, because a request inside may be allowed by name; it is refused outright
+when the policy has none, and on a dataplane that calls out for the CONNECT
+alone (no chain name), which has no request leg to defer to.
+
+Identity on the request legs is `dev.ate.actor.identity`, the actor's SPIFFE
+ID that the outer chain set from the verified peer certificate and shares with
+the inner listener. Because Envoy keys its connection pools without string
+filter-state objects, the outer chain also sets
+`envoy.network.upstream_server_name` from the same certificate — not shared
+upstream — so the inner hop's pool is per actor and two actors dialing the same
+address never inherit each other's identity. Nothing inside the tunnel can
+write any of this; a callout without an identity is refused.
+
+Policies are read through a per-actor cache (`--egress-policy-cache-ttl`, 10s
+by default; 0 disables it). The TTL is exactly how stale a decision can be: a
+create, update or delete is visible to new requests within one TTL, and a
+deleted policy becomes a deny. Every policy denial answers a fixed
+`egress denied` body; the reason is in the sidecar's log.
+
+Credential injection (`inject_static_headers`) is not implemented yet: a
+matched rule that declares one is denied with 501 rather than forwarded
+without the credential the policy promised.
 
 ## adding a dataplane attribute
 
@@ -70,7 +127,9 @@ a request are declared once, in `extproc/attributes.go`.
 | `dev.ate.actor.name` | ingress | carries the actor name across CONNECT re-entry |
 | `dev.ate.actor.atespace` | ingress | carries the atespace across CONNECT re-entry |
 | `dev.ate.connect.authority` | ingress | carries the outer CONNECT authority across re-entry for target-port selection |
-| `dev.ate.actor.identity` | egress | carries the authenticated actor identity for logs and additional ext_proc services |
+| `dev.ate.actor.identity` | egress | carries the authenticated actor identity to the policy ext_proc, the logs and additional ext_proc services |
+| `dev.ate.egress:passthrough_destination` | egress | dynamic metadata: the CONNECT leg's answer, the dialed address an address rule allowed, copied into the ORIGINAL_DST filter state |
+| `dev.ate.egress:dial` | egress | dynamic metadata: a request leg's answer, `name` or `address`, which picks the route |
 | `dev.ate.extproc.direction` | egress | selects the egress handler for dataplanes without Envoy filter chains |
 
 ### name it
