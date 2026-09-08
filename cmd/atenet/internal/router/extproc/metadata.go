@@ -15,6 +15,7 @@
 package extproc
 
 import (
+	"strconv"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -86,10 +87,14 @@ func (m *RequestMetadata) Header(name string) string {
 
 // Attribute returns the named CEL request_attributes value, scanning every
 // filter's entries so callers don't need to hardcode which one reported it,
-// or "" if none did.
+// or "" if none did. A number (Envoy sends int fields as one) renders as its
+// decimal digits.
 func (m *RequestMetadata) Attribute(name string) string {
 	for _, attrs := range m.Attributes {
 		if v, ok := attrs.GetFields()[name]; ok {
+			if n, isNumber := v.GetKind().(*structpb.Value_NumberValue); isNumber {
+				return strconv.FormatFloat(n.NumberValue, 'f', -1, 64)
+			}
 			return v.GetStringValue()
 		}
 	}

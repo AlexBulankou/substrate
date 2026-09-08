@@ -42,6 +42,31 @@ const (
 	// The outer CONNECT chain sets it from %DOWNSTREAM_PEER_URI_SAN% and
 	// shares it with the inner legs, which have no certificate of their own.
 	ActorIdentityFilterStateKey = "dev.ate.actor.identity"
+	// ActorIdentityFilterStateAttribute is the CEL expression ext_proc
+	// evaluates to read ActorIdentityFilterStateKey back out.
+	ActorIdentityFilterStateAttribute = "filter_state['" + ActorIdentityFilterStateKey + "']"
+
+	// EgressMetadataNamespace is the dynamic-metadata namespace the CONNECT
+	// leg answers in. Envoy only keeps it when the outer ext_proc filter lists
+	// it under metadata_options.receiving_namespaces; the manifest tests check.
+	EgressMetadataNamespace = "dev.ate.egress"
+	// EgressPassthroughDestinationKey, under EgressMetadataNamespace, is the
+	// original destination as IP:port, present only when an address rule
+	// allowed it. The outer chain copies it into the ORIGINAL_DST filter state;
+	// absent, a TLS or opaque connection has no upstream and is closed.
+	EgressPassthroughDestinationKey = "passthrough_destination"
+	// EgressDialKey, under EgressMetadataNamespace, is a request leg's answer
+	// for an allowed request: where it goes. The manifests' routes match on
+	// it, one route per value and none without, so a request with no answer
+	// has no route.
+	EgressDialKey = "dial"
+	// EgressDialName: a hostname rule matched, so the forward proxy resolves
+	// the Host and dials that.
+	EgressDialName = "name"
+	// EgressDialAddress: an address or all rule matched, so the request goes
+	// to the address the actor dialed, read from the ORIGINAL_DST filter state
+	// the CONNECT leg's answer set.
+	EgressDialAddress = "address"
 
 	// directionAttribute carries the Direction outright, for dataplanes that
 	// have no Envoy filter chain to name. It is set from a dataplane expression,
@@ -63,3 +88,28 @@ const (
 // ingress here, so every egress CONNECT would silently take the ingress path and
 // 404 on the actor DNS name parse.
 const FilterChainNameAttribute = "xds.filter_chain_name"
+
+// EgressPassthroughDestinationFormat is the access-log and set_filter_state
+// format string that reads EgressPassthroughDestinationKey back out.
+const EgressPassthroughDestinationFormat = "%DYNAMIC_METADATA(" + EgressMetadataNamespace + ":" + EgressPassthroughDestinationKey + ")%"
+
+// OriginalDstFilterStateKey is Envoy's filter-state key for the address an
+// ORIGINAL_DST cluster dials. The outer CONNECT chain sets it from
+// EgressPassthroughDestinationKey; the request legs read it as the address the
+// actor dialed, and their by-address routes dial it.
+const OriginalDstFilterStateKey = "envoy.network.transport_socket.original_dst_address"
+
+// OriginalDstIPAttribute and OriginalDstPortAttribute are the CEL expressions
+// that read OriginalDstFilterStateKey, one field each. The object as a whole
+// is not readable: Envoy's CEL presents an object with field support as a
+// map, which ext_proc renders as the literal "CelMap value". The field names
+// are Envoy's (the same ones %FILTER_STATE(key:FIELD:ip)% takes); the port
+// arrives as a number.
+const (
+	OriginalDstIPAttribute   = "filter_state['" + OriginalDstFilterStateKey + "'].ip"
+	OriginalDstPortAttribute = "filter_state['" + OriginalDstFilterStateKey + "'].port"
+)
+
+// RequestedServerNameAttribute is the SNI of the connection a request arrived
+// on. The handler logs it next to the Host it authorized.
+const RequestedServerNameAttribute = "connection.requested_server_name"

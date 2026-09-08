@@ -157,3 +157,14 @@ func TestRequestMetadataHeaderIsCaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestMetadataAttributeNumber(t *testing.T) {
+	md := NewRequestMetadata(nil, map[string]*structpb.Struct{
+		"envoy.filters.http.ext_proc": {Fields: map[string]*structpb.Value{
+			OriginalDstPortAttribute: structpb.NewNumberValue(8443),
+		}},
+	})
+	if got, want := md.Attribute(OriginalDstPortAttribute), "8443"; got != want {
+		t.Errorf("Attribute() for a number = %q, want %q", got, want)
+	}
+}
