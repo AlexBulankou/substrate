@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"path"
 	"slices"
 	"time"
 
@@ -672,17 +671,10 @@ func (s *RPCService) MintActorCertificate(ctx context.Context, req *ateapipb.Min
 	switch req.GetPurpose() {
 	case ateapipb.ActorCertificatePurpose_ACTOR_CERTIFICATE_PURPOSE_ATUNNEL:
 		template = &x509.Certificate{
-			URIs: []*url.URL{
-				{
-					Scheme: "spiffe",
-					// TODO(identity): Must be configurable per-install, so that each install can set it to a unique value.
-					Host: "substrate-actor.local",
-					// TODO(identity): Prefix with "atunnel" to prevent
-					// confusion between atunnel and an actor pretending to be
-					// an atunnel.
-					Path: path.Join("atespace", dbActor.GetMetadata().GetAtespace(), "actor", dbActor.GetMetadata().GetName()),
-				},
-			},
+			URIs: []*url.URL{resources.ActorSPIFFEID(resources.ActorRef{
+				Atespace: dbActor.GetMetadata().GetAtespace(),
+				Name:     dbActor.GetMetadata().GetName(),
+			})},
 			NotBefore:             time.Now().Add(-5 * time.Minute),
 			NotAfter:              time.Now().Add(time.Hour),
 			KeyUsage:              x509.KeyUsageDigitalSignature,
