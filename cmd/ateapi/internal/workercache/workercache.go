@@ -164,17 +164,25 @@ func (c *Cache) watchEvents(ctx context.Context, watch *store.WorkerWatch) {
 		select {
 		case event, ok := <-watch.Events:
 			if !ok {
-				c.ready.Store(false)
 				watch.Close()
 				if ctx.Err() != nil {
+					c.ready.Store(false)
 					return
 				}
+				// Deliberately do NOT flip ready to false here: the cache
+				// already tolerates staleness on the periodic-relist path
+				// (below) by continuing to serve the last-known-good
+				// snapshot on a transient failure. A watch disconnect is
+				// the same kind of staleness window — resync() can take
+				// up to ~31s (its backoff cap), and hard-failing Workers()/
+				// Worker() for that whole window turns a brief cache lag
+				// into an unretried scheduling failure for every caller.
 				slog.WarnContext(ctx, "worker cache: watch channel closed, resyncing")
 				watch = c.resync(ctx)
 				if watch == nil {
+					c.ready.Store(false)
 					return // context cancelled
 				}
-				c.ready.Store(true)
 			} else {
 				c.applyEvent(event)
 			}

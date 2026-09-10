@@ -209,6 +209,55 @@ func TestCache_Disconnect_ResyncsWithFreshSnapshot(t *testing.T) {
 	}
 }
 
+// TestCache_StaysReadyDuringResync guards against a watch-disconnect turning
+// a brief cache lag into a hard failure for every in-flight caller. Workers()
+// must keep serving the last-known-good snapshot for the whole resync window,
+// not just after it completes — the same tolerance the periodic-relist path
+// already gives a transient ListWorkers failure (see
+// TestCache_Relist_FailureIsNonFatal).
+func TestCache_StaysReadyDuringResync(t *testing.T) {
+	w1 := makeWorker("ns", "pod1", 1)
+	fs := newFakeStore(w1)
+	c := workercache.New(fs, time.Hour)
+	ctx := t.Context()
+
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	startListCalls := fs.getListCalls()
+
+	// Arm the gate, then disconnect. watchEvents observes the closed watch
+	// channel and calls resync(), which blocks inside ListWorkers on the
+	// gate below -- simulating a slow relist during reconnect.
+	block := make(chan struct{})
+	fs.setBlockList(block)
+	fs.disconnect()
+
+	// Wait for resync's ListWorkers call to actually be in flight (blocked)
+	// before asserting anything about Workers() -- otherwise the assertion
+	// below would race the watchEvents goroutine noticing the disconnect.
+	eventually(t, func() bool {
+		return fs.getListCalls() > startListCalls
+	}, 2*time.Second)
+
+	// While resync is still blocked, Workers() must keep returning the
+	// stale-but-valid snapshot rather than an error.
+	got, err := c.Workers()
+	if err != nil {
+		t.Fatalf("Workers() during resync: got error %v, want the last-known-good snapshot", err)
+	}
+	if diff := cmp.Diff([]*ateapipb.Worker{w1}, got, protocmp.Transform(), workerSortOpt); diff != "" {
+		t.Errorf("workers during resync (-want +got):\n%s", diff)
+	}
+
+	// Release the gate and confirm the cache converges normally afterward.
+	close(block)
+	eventually(t, func() bool {
+		workers, err := c.Workers()
+		return err == nil && len(workers) == 1
+	}, 2*time.Second)
+}
+
 func TestCache_MultipleDisconnects(t *testing.T) {
 	fs := newFakeStore()
 	c := workercache.New(fs, time.Hour)
@@ -377,11 +426,13 @@ func TestCache_Relist_FailureIsNonFatal(t *testing.T) {
 type fakeStore struct {
 	store.Interface
 
-	mu      sync.Mutex
-	workers []*ateapipb.Worker
-	watchCh chan store.WorkerEvent
-	listErr error // if set, ListWorkers returns it
-	closes  int   // number of times a returned watch was Closed
+	mu        sync.Mutex
+	workers   []*ateapipb.Worker
+	watchCh   chan store.WorkerEvent
+	listErr   error // if set, ListWorkers returns it
+	closes    int   // number of times a returned watch was Closed
+	listCalls int
+	blockList chan struct{} // if set, ListWorkers blocks until this is closed
 }
 
 func newFakeStore(workers ...*ateapipb.Worker) *fakeStore {
@@ -403,6 +454,15 @@ func (f *fakeStore) WatchWorkers(_ context.Context) (*store.WorkerWatch, error) 
 
 func (f *fakeStore) ListWorkers(_ context.Context, _ store.ListOptions) (store.ListResponse[*ateapipb.Worker], error) {
 	f.mu.Lock()
+	f.listCalls++
+	block := f.blockList
+	f.mu.Unlock()
+
+	if block != nil {
+		<-block
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return store.ListResponse[*ateapipb.Worker]{}, f.listErr
@@ -410,6 +470,21 @@ func (f *fakeStore) ListWorkers(_ context.Context, _ store.ListOptions) (store.L
 	out := make([]*ateapipb.Worker, len(f.workers))
 	copy(out, f.workers)
 	return store.ListResponse[*ateapipb.Worker]{Items: out}, nil
+}
+
+// setBlockList arms a gate that the next ListWorkers call (i.e. the one
+// resync() issues) blocks on until it is closed. Must be set after Start()
+// has completed its own initial ListWorkers call.
+func (f *fakeStore) setBlockList(ch chan struct{}) {
+	f.mu.Lock()
+	f.blockList = ch
+	f.mu.Unlock()
+}
+
+func (f *fakeStore) getListCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listCalls
 }
 
 func (f *fakeStore) send(event store.WorkerEvent) {
