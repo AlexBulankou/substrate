@@ -77,6 +77,52 @@ const (
 // Only the components that have a relay to take or miss carry it.
 const OTLPRelayKey = attribute.Key("ate.otlp.relay")
 
+// ActorStateKey is log-only. It is bounded, but it is only ever recorded beside
+// actor identity, which no metric may carry.
+const ActorStateKey = attribute.Key("ate.actor.state")
+
+// Values for ActorStateKey, mirroring ateapipb.ActorState with the
+// ACTOR_STATE_ prefix dropped so the two cannot fork. ActorStateDeleted is the
+// exception and has no enum counterpart: the record is gone, so no stored state
+// can stand for it.
+const (
+	ActorStateResuming   = "resuming"
+	ActorStateRunning    = "running"
+	ActorStateSuspending = "suspending"
+	ActorStateSuspended  = "suspended"
+	ActorStatePausing    = "pausing"
+	ActorStatePaused     = "paused"
+	ActorStateCrashed    = "crashed"
+	ActorStateDeleting   = "deleting"
+	ActorStateDeleted    = "deleted"
+	ActorStateUnknown    = "unknown"
+)
+
+// ActorStateValue maps the committed state onto its label value, so a producer
+// reports the state the store holds rather than one it names by hand.
+func ActorStateValue(state ateapipb.ActorState) string {
+	switch state {
+	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
+		return ActorStateResuming
+	case ateapipb.ActorState_ACTOR_STATE_RUNNING:
+		return ActorStateRunning
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		return ActorStateSuspending
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+		return ActorStateSuspended
+	case ateapipb.ActorState_ACTOR_STATE_PAUSING:
+		return ActorStatePausing
+	case ateapipb.ActorState_ACTOR_STATE_PAUSED:
+		return ActorStatePaused
+	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		return ActorStateCrashed
+	case ateapipb.ActorState_ACTOR_STATE_DELETING:
+		return ActorStateDeleting
+	default:
+		return ActorStateUnknown
+	}
+}
+
 // Metric-label keys: the only ate.* attributes allowed on metric datapoints,
 // each with a small bounded value set. High-cardinality identity (actor
 // name/uid, atespace) is absent by design; it belongs on spans and logs.

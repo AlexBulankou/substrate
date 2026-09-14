@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -158,6 +159,7 @@ func TestKeySpellings(t *testing.T) {
 		{TemplateNameKey, "ate.template.name"},
 		{TemplateAtespaceKey, "ate.template.atespace"},
 		{ActorVersionKey, "ate.actor.version"},
+		{ActorStateKey, "ate.actor.state"},
 		{ActorOperationNameKey, "ate.actor.operation.name"},
 		{WorkerPoolNamespaceKey, "ate.workerpool.namespace"},
 		{WorkerPoolNameKey, "ate.workerpool.name"},
@@ -600,6 +602,105 @@ func TestSnapshotScopeValue(t *testing.T) {
 				t.Errorf("SnapshotScopeValue(%v) = %q, want %q", tt.scope, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestActorStateValues pins the spelling of every state a record can report.
+func TestActorStateValues(t *testing.T) {
+	tests := []struct {
+		got  string
+		want string
+	}{
+		{ActorStateResuming, "resuming"},
+		{ActorStateRunning, "running"},
+		{ActorStateSuspending, "suspending"},
+		{ActorStateSuspended, "suspended"},
+		{ActorStatePausing, "pausing"},
+		{ActorStatePaused, "paused"},
+		{ActorStateCrashed, "crashed"},
+		{ActorStateDeleting, "deleting"},
+		{ActorStateDeleted, "deleted"},
+		{ActorStateUnknown, "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("got %q, want %q", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActorStateValue pins the mapping producers read the state through, so a
+// record reports the state the store holds rather than one named by hand.
+func TestActorStateValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		state ateapipb.ActorState
+		want  string
+	}{
+		{name: "resuming", state: ateapipb.ActorState_ACTOR_STATE_RESUMING, want: ActorStateResuming},
+		{name: "running", state: ateapipb.ActorState_ACTOR_STATE_RUNNING, want: ActorStateRunning},
+		{name: "suspending", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDING, want: ActorStateSuspending},
+		{name: "suspended", state: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, want: ActorStateSuspended},
+		{name: "pausing", state: ateapipb.ActorState_ACTOR_STATE_PAUSING, want: ActorStatePausing},
+		{name: "paused", state: ateapipb.ActorState_ACTOR_STATE_PAUSED, want: ActorStatePaused},
+		{name: "crashed", state: ateapipb.ActorState_ACTOR_STATE_CRASHED, want: ActorStateCrashed},
+		{name: "deleting", state: ateapipb.ActorState_ACTOR_STATE_DELETING, want: ActorStateDeleting},
+		{name: "unspecified", state: ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED, want: ActorStateUnknown},
+		{name: "value outside the enum", state: ateapipb.ActorState(9999), want: ActorStateUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ActorStateValue(tt.state); got != tt.want {
+				t.Errorf("ActorStateValue(%v) = %q, want %q", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActorStateValuesMirrorActorState holds the log vocabulary to the control
+// plane's state machine. A state added to the enum without a value here would
+// leave the stream unable to name the state an actor is in.
+//
+// ActorStateDeleted is excluded on purpose: the actor row is gone by the time it
+// is reported, so no enum value can stand for it. A second such value has to be
+// added to this list deliberately.
+func TestActorStateValuesMirrorActorState(t *testing.T) {
+	// deleted has no enum value because the row is gone; unknown is the
+	// mapper's fallback for UNSPECIFIED and anything off the enum.
+	noEnumCounterpart := map[string]bool{ActorStateDeleted: true, ActorStateUnknown: true}
+
+	got := map[string]bool{
+		ActorStateResuming:   true,
+		ActorStateRunning:    true,
+		ActorStateSuspending: true,
+		ActorStateSuspended:  true,
+		ActorStatePausing:    true,
+		ActorStatePaused:     true,
+		ActorStateCrashed:    true,
+		ActorStateDeleting:   true,
+		ActorStateDeleted:    true,
+		ActorStateUnknown:    true,
+	}
+
+	want := map[string]bool{}
+	for value, name := range ateapipb.ActorState_name {
+		if ateapipb.ActorState(value) == ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED {
+			continue
+		}
+		want[strings.ToLower(strings.TrimPrefix(name, "ACTOR_STATE_"))] = true
+	}
+
+	for state := range want {
+		if !got[state] {
+			t.Errorf("ateapipb.ActorState has %q with no ateattr constant", state)
+		}
+	}
+	for state := range got {
+		if !want[state] && !noEnumCounterpart[state] {
+			t.Errorf("ateattr has state %q that ateapipb.ActorState does not", state)
+		}
 	}
 }
 

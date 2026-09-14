@@ -141,13 +141,35 @@ The duration keys are the [`ate.actor.restore.duration`](#the-metric-registry) i
 
 This is the record to use for a per-actor wake-up distribution. The histogram cannot answer that question at all, because actor identity is barred from metric labels; traces can, but the data plane is head-sampled at 1%.
 
-ateapi's `Actor crashed` is the other one. It is written once per committed transition into `ACTOR_STATE_CRASHED`, beside the [`ate.actor.crashes`](#the-metric-registry) increment and under the same already-crashed guard, so the two can never disagree about how many crashes happened:
+ateapi's `Actor state changed` is written once per committed actor state transition. ateapi owns the state machine, so this is where an actor's state and the time it reached it come from:
+
+```json
+{"time":"…","level":"INFO","msg":"Actor state changed",
+ "ate.atespace":"ate-demo-counter","ate.actor.name":"counter-1","ate.actor.uid":"8f2a…",
+ "ate.template.atespace":"ate-demo-counter","ate.template.name":"counter",
+ "ate.actor.operation.name":"suspend","ate.actor.state":"suspended",
+ "trace_id":"4bf92f…","span_id":"00f067…","trace_flags":"01"}
+```
+
+`ate.actor.state` takes the `ateapipb.ActorState` values lowercased, so the log vocabulary and the state machine cannot fork. The last record for an actor's uid is the state it is in now, and its timestamp is when that state began. Query it per actor, not in aggregate: neither key is a metric label, because both only ever appear beside actor identity, which [the cardinality rules](#the-metric-registry) keep off metrics entirely.
+
+`ate.actor.operation.name` says which operation drove the transition, which the state alone does not: an actor reaches `suspended` from a suspend and `paused` from a pause, and the two differ in whether the worker was released.
+
+The record goes out after the store commit, never before, and the state is read straight off the committed record rather than named by the caller. Every state commit has a version check too, so if two writers race, the one that lost writes nothing. You will never see a state here that the store did not actually hold.
+
+Creating an actor counts as a change. A new actor is born suspended, so it gets a record saying so, with `ate.actor.operation.name` set to `create`. Otherwise an actor that is created and never resumed would have no record at all, no matter how long you keep your logs.
+
+`deleted` is the only state with no `ateapipb.ActorState` behind it. It is written once the actor row is gone, so there is nothing left to read back. It is also the last record an actor ever gets. Without it, `deleting` would be the end of the story, and a delete that finished would look just like one that got stuck.
+
+**What this stream won't tell you.** It only writes when something changes. So an actor that has been sitting in the same state since before your logs roll over has no record, and no state. Ask the control plane what state something is in right now. Use this stream to see how it got there and when. Records can also go missing, like any other log, and a gap looks the same as an actor that just sat still. If you want to count activations, use the router's access log instead.
+
+`Actor crashed` is the exception, and carries the same two keys with `ate.actor.state="crashed"`. It is written once per committed transition into `ACTOR_STATE_CRASHED`, beside the [`ate.actor.crashes`](#the-metric-registry) increment and under the same already-crashed guard, so the two can never disagree about how many crashes happened. A consumer deriving state therefore selects on `ate.actor.state`, not on the message:
 
 ```json
 {"time":"…","level":"ERROR","msg":"Actor crashed",
  "ate.atespace":"ate-demo-counter","ate.actor.name":"counter-1","ate.actor.uid":"8f2a…",
  "ate.template.atespace":"ate-demo-counter","ate.template.name":"counter",
- "ate.actor.operation.name":"resume",
+ "ate.actor.operation.name":"resume","ate.actor.state":"crashed",
  "ate.failure.reason":"WORKER_POD_GONE","ate.failure.domain":"infrastructure",
  "trace_id":"4bf92f…","span_id":"00f067…","trace_flags":"01"}
 ```
