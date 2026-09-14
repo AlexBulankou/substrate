@@ -92,6 +92,29 @@ Every item has to hold. Nothing in the roll stops you if one does not.
   [Create Cluster warning](../tools/setup-gcp/README.md#2-create-cluster)
   requires.
 
+- [ ] The installed ate-api-server serves `DrainWorker`. Draining a
+  worker is one `DrainWorker` RPC, and step 5 calls it with
+  [grpcurl](https://github.com/fullstorydev/grpcurl). Open access to
+  the Control API now and keep the port-forward running; step 5 uses
+  the same `/tmp/ate-ca.pem` and `$TOKEN`.
+
+  ```bash
+  kubectl -n ate-system port-forward svc/api 8443:443 >/dev/null 2>&1 &
+
+  kubectl get clustertrustbundles -l podcert.ate.dev/canarying=live \
+    -o jsonpath='{range .items[?(@.spec.signerName=="servicedns.podcert.ate.dev/identity")]}{.spec.trustBundle}{end}' \
+    > /tmp/ate-ca.pem
+
+  TOKEN=$(kubectl -n ate-system create token ate-client \
+    --audience=api.ate-system.svc --duration=48h)
+
+  # Must print ateapi.Control.DrainWorker. If it does not, the cluster
+  # predates the versioned builds and needs a fresh install.
+  grpcurl -cacert /tmp/ate-ca.pem -authority api.ate-system.svc \
+    -H "authorization: Bearer ${TOKEN}" 127.0.0.1:8443 list ateapi.Control \
+    | grep DrainWorker
+  ```
+
 ### Names used throughout
 
 | name | what it is | how to get it |
@@ -255,21 +278,6 @@ its label yet. `kubectl get nodes -L ate.dev/substrate-version` still
 shows every node at `$OLD_VERSION`. If only one DaemonSet prints, the
 version did not change (see Checkout and environment) and the command
 rolled the running atelet in place.
-
-Then open access to the Control API for draining. Draining a worker
-is one `DrainWorker` RPC on the installed ate-api-server. Step 5 calls
-it with [grpcurl](https://github.com/fullstorydev/grpcurl).
-
-```bash
-kubectl -n ate-system port-forward svc/api 8443:443 >/dev/null 2>&1 &
-
-kubectl get clustertrustbundles -l podcert.ate.dev/canarying=live \
-  -o jsonpath='{range .items[?(@.spec.signerName=="servicedns.podcert.ate.dev/identity")]}{.spec.trustBundle}{end}' \
-  > /tmp/ate-ca.pem
-
-TOKEN=$(kubectl -n ate-system create token ate-client \
-  --audience=api.ate-system.svc --duration=48h)
-```
 
 Last, build and push the new worker images. The refs print together
 at the end. The one for your pool's `sandboxClass` goes into the clone
@@ -448,7 +456,7 @@ go run ./cmd/ate-setup deploy ate-system
 
 The second command rolls atenet and converges the rest of the
 install; it re-resolves and re-applies everything, so it could take a
-while. The step 3 port-forward dies when the API server rolls.
+while. The checklist's port-forward dies when the API server rolls.
 Restart it and mint a fresh token if you still need to drain.
 
 **NOTE**: Until
