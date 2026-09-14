@@ -221,17 +221,16 @@ func TestListWorkerActorAssignments(t *testing.T) {
 	}
 }
 
-// TestUpdateWorker changes the two mutable fields. An update replaces the whole
-// Worker, so the request is the observed one with those fields changed: its
-// metadata carries the uid and version guards, and everything else has to be
-// sent back as-is to avoid being cleared.
+// TestUpdateWorker changes labels, the only mutable field. An update replaces
+// the whole Worker, so the request is the observed one with that field changed:
+// its metadata carries the uid and version guards, and everything else has to
+// be sent back as-is to avoid being cleared.
 func TestUpdateWorker(t *testing.T) {
 	ns := namespaceForTest("ns-worker-update")
 	tc := setupTest(t, ns)
 	defer tc.cleanup()
 
 	worker := registerWorker(t, tc, ns)
-	worker.SandboxClass = "runc"
 	worker.Labels = map[string]string{"tier": "batch"}
 
 	updated, err := tc.client.UpdateWorker(context.Background(), &ateapipb.UpdateWorkerRequest{Worker: worker})
@@ -241,7 +240,6 @@ func TestUpdateWorker(t *testing.T) {
 
 	want := newTestWorker(ns)
 	want.Metadata.Version = 2
-	want.SandboxClass = "runc"
 	want.Labels = map[string]string{"tier": "batch"}
 	want.Status = &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE}
 	if diff := cmp.Diff(want, updated, protocmp.Transform(), ignoreServerMetadata); diff != "" {
