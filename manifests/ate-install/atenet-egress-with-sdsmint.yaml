@@ -265,8 +265,9 @@ data:
       # hack/install-ate.sh is run with
       # --experimental-additional-egress-extproc-service, which replaces each
       # with a generated block for an additional, external processor. The
-      # marker sits above the policy filter so that processor sees the request
-      # before anything is injected into it.
+      # marker sits below the policy filter, so that processor sees only
+      # requests the policy allowed, including any headers the policy added; a
+      # request the policy denies never reaches it.
       #
       # The passthrough chain is a tcp_proxy, so it has no HTTP filters of its
       # own, and it decides nothing: it dials the address the CONNECT leg
@@ -420,7 +421,6 @@ data:
                       cluster: egress_original_dst_tls
                       timeout: 0s
               http_filters:
-              #ATE_MITM_EXTPROC_FILTER -- see the mitm_listener comment above.
               # Every request on this chain is authorized against the actor's
               # EgressPolicy by the same sidecar; the actor comes from the filter
               # state the CONNECT leg set, never from a header.
@@ -461,6 +461,7 @@ data:
                     receiving_namespaces:
                       untyped:
                       - dev.ate.egress
+              #ATE_MITM_EXTPROC_FILTER -- see the mitm_listener comment above.
               # Resolves the Host for the by-name route. It does nothing for a
               # route to any other kind of cluster.
               - name: envoy.filters.http.dynamic_forward_proxy
@@ -582,7 +583,6 @@ data:
                       cluster: egress_original_dst_cleartext
                       timeout: 0s
               http_filters:
-              #ATE_MITM_EXTPROC_FILTER -- Don't modify this line.
               # Every request on this chain is authorized against the actor's
               # EgressPolicy by the same sidecar; the actor comes from the filter
               # state the CONNECT leg set, never from a header.
@@ -623,6 +623,7 @@ data:
                     receiving_namespaces:
                       untyped:
                       - dev.ate.egress
+              #ATE_MITM_EXTPROC_FILTER -- Don't modify this line.
               # Resolves the Host for the by-name route. It does nothing for a
               # route to any other kind of cluster.
               - name: envoy.filters.http.dynamic_forward_proxy

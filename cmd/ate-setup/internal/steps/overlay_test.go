@@ -149,4 +149,76 @@ func TestPatchAtenetEgressManifest(t *testing.T) {
 			t.Errorf("SDS resource %q is missing watched_directory; rotation would be silently broken", key)
 		}
 	}
+
+	// The additional processor is spliced in below the policy ext_proc on
+	// both HTTP chains, so it sees only requests the policy allowed.
+	spliced := 0
+	for _, filters := range httpFilterChains(t, envoyYaml) {
+		policyAt, additionalAt := -1, -1
+		for i, f := range filters {
+			switch extProcCluster(f) {
+			case "ext_proc_server":
+				policyAt = i
+			case additionalEgressExtprocCluster:
+				additionalAt = i
+			}
+		}
+		if additionalAt < 0 {
+			continue
+		}
+		spliced++
+		if policyAt < 0 || policyAt > additionalAt {
+			t.Errorf("additional ext_proc at http_filters[%d] runs before the policy ext_proc at [%d]", additionalAt, policyAt)
+		}
+	}
+	if spliced != 2 {
+		t.Errorf("additional ext_proc spliced into %d HTTP chains, want 2", spliced)
+	}
+}
+
+// httpFilterChains returns the http_filters of every HTTP connection manager
+// in the bootstrap's static listeners.
+func httpFilterChains(t *testing.T, envoyYaml string) [][]map[string]any {
+	t.Helper()
+	var bootstrap struct {
+		StaticResources struct {
+			Listeners []struct {
+				FilterChains []struct {
+					Filters []struct {
+						Name        string `json:"name"`
+						TypedConfig struct {
+							HTTPFilters []map[string]any `json:"http_filters"`
+						} `json:"typed_config"`
+					} `json:"filters"`
+				} `json:"filter_chains"`
+			} `json:"listeners"`
+		} `json:"static_resources"`
+	}
+	if err := yaml.Unmarshal([]byte(envoyYaml), &bootstrap); err != nil {
+		t.Fatalf("patched envoy.yaml does not parse as a bootstrap: %v", err)
+	}
+	var chains [][]map[string]any
+	for _, l := range bootstrap.StaticResources.Listeners {
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				if f.Name == "envoy.filters.network.http_connection_manager" {
+					chains = append(chains, f.TypedConfig.HTTPFilters)
+				}
+			}
+		}
+	}
+	return chains
+}
+
+// extProcCluster returns the cluster an ext_proc filter dials, or "" for any
+// other filter.
+func extProcCluster(filter map[string]any) string {
+	if filter["name"] != "envoy.filters.http.ext_proc" {
+		return ""
+	}
+	typedConfig, _ := filter["typed_config"].(map[string]any)
+	grpcService, _ := typedConfig["grpc_service"].(map[string]any)
+	envoyGRPC, _ := grpcService["envoy_grpc"].(map[string]any)
+	name, _ := envoyGRPC["cluster_name"].(string)
+	return name
 }
