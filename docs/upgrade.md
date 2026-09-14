@@ -1,9 +1,10 @@
 # Rolling upgrade runbook
 
 This runbook upgrades a running Agent Substrate install to a new build
-version, one node at a time. No actor loses state, and at most one
-node's worth of capacity is out of service while the rest of the fleet
-keeps serving. It needs `kubectl`, `kubectl ate`, `go run
+version, one node at a time. No actor loses state. On a cluster with
+more than one node, at most one node's worth of capacity is out of
+service while the rest of the fleet keeps serving; a single-node cluster
+stops fully during step 5. It needs `kubectl`, `kubectl ate`, `go run
 ./cmd/ate-setup`, `jq`, and `grpcurl`. The numbered steps are the same
 on every Kubernetes provider; the provider-specific parts sit in their
 own sections, [before](#on-gke) and [after](#after-the-roll-on-gke)
