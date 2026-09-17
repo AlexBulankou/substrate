@@ -91,6 +91,28 @@ func (s *ServiceImpl) CreateActor(ctx context.Context, inActor *ateapipb.Actor) 
 	// Resolve the explicit tag, or freeze the template's current golden default.
 	tagRef := inActor.GetSourceTag()
 	if tagRef == nil {
+		// The implicit golden tag is a snapshot of mutable ActorTemplate
+		// status that DeleteActorTemplate tears down (golden actor, golden
+		// tag, then the template itself) under
+		// "lease:actortemplate:<atespace>:<name>". Reading it off the
+		// unleased `template` fetched above races: DeleteActorTemplate can
+		// delete the golden tag between that read and resolveTagSource
+		// below, so this Actor is born pointing at a tag that no longer
+		// exists. Acquire the same lease and re-read the template so the
+		// golden tag resolved here is serialized against concurrent
+		// template deletion; held until CreateActor returns, mirroring
+		// DeleteActorTemplate's own hold.
+		templateRef := resources.ActorTemplateRefFromObjectRef(inActor.GetActorTemplate())
+		var lease *store.Lease
+		ctx, lease, err = acquireLease(ctx, s.store, "lease:actortemplate:"+templateRef.Atespace+":"+templateRef.Name, "ActorTemplate "+templateRef.String())
+		if err != nil {
+			return nil, err
+		}
+		defer lease.Close()
+		template, err = resolveActorTemplate(ctx, s.store, inActor)
+		if err != nil {
+			return nil, err
+		}
 		tagRef = template.GetStatus().GetGoldenSnapshotStatus().GetGoldenTag()
 	} else {
 		for _, volume := range template.GetVolumes() {
