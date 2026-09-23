@@ -70,9 +70,8 @@ func TestCreateActor_Success(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Name: "id1", Atespace: testAtespace, Version: 1},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State:                   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
+			State:            ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ActorTemplateUid: tmpl.GetMetadata().GetUid()},
 		},
 		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "free"}},
 	}
@@ -692,9 +691,8 @@ func TestUpdateActor_Success(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Name: "id1", Atespace: testAtespace, Version: 2},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State:                   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
+			State:            ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ActorTemplateUid: tmpl.GetMetadata().GetUid()},
 		},
 		WorkerSelector: &ateapipb.Selector{
 			MatchLabels: map[string]string{"tier": "paid"},
@@ -839,9 +837,8 @@ func TestUpdateActor(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Name: "id1", Atespace: testAtespace, Version: 2},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State:                   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
+			State:            ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ActorTemplateUid: tmpl.GetMetadata().GetUid()},
 		},
 		WorkerSelector: &ateapipb.Selector{
 			MatchLabels: map[string]string{"tier": "paid"},
@@ -1810,9 +1807,8 @@ func TestResumeActor(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Name: name, Atespace: testAtespace},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State:                   ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ActorTemplateUid: tmpl.GetMetadata().GetUid()},
 			WorkerAssignment: &ateapipb.WorkerAssignment{
 				Worker:          &ateapipb.ObjectRef{Name: podUID},
 				WorkerNamespace: ns,
@@ -2312,9 +2308,12 @@ func TestSuspendActor(t *testing.T) {
 		Metadata:      &ateapipb.ResourceMetadata{Name: name, Atespace: testAtespace},
 		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
 		Status: &ateapipb.ActorStatus{
-			State:                   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: snapshotURI, ContentScope: sourceActor.GetStatus().GetExternalSnapshot().GetContentScope()},
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
+			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{
+				SnapshotUri:      snapshotURI,
+				ContentScope:     sourceActor.GetStatus().GetExternalSnapshot().GetContentScope(),
+				ActorTemplateUid: tmpl.GetMetadata().GetUid(),
+			},
 		},
 	}
 
@@ -2474,6 +2473,78 @@ func TestResumeActor_RepointTemplateBeforeResume(t *testing.T) {
 	}
 }
 
+// TestResumeActor_PausedAfterRepointUsesLocalProvenance verifies that an actor
+// paused after a template repoint restores from its pause checkpoint in FULL,
+// not DATA. At that point the actor holds an external snapshot captured on v1
+// and a local checkpoint captured on v2; judging the local restore by the
+// external snapshot's provenance would wrongly discard the v2 memory image.
+func TestResumeActor_PausedAfterRepointUsesLocalProvenance(t *testing.T) {
+	ns := namespaceForTest("ns-repoint-pause")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	ctx := context.Background()
+	tmpl := createTemplate(t, tc, ns)
+	tmpl2 := proto.Clone(tmpl).(*ateapipb.ActorTemplate)
+	tmpl2.Metadata = &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "tmpl2"}
+	tmpl2.Status = nil
+	if _, err := tc.client.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{ActorTemplate: tmpl2}); err != nil {
+		t.Fatalf("CreateActorTemplate(tmpl2) failed: %v", err)
+	}
+	worker := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	const name = "actor-1"
+	actorRef := &ateapipb.ObjectRef{Atespace: testAtespace, Name: name}
+	if _, err := tc.client.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
+	}}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("ResumeActor(v1) failed: %v", err)
+	}
+	suspended, err := tc.client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: actorRef})
+	if err != nil {
+		t.Fatalf("SuspendActor(v1) failed: %v", err)
+	}
+	waitForWorkerAvailable(t, tc, worker)
+
+	// Repoint at v2 while suspended; the external snapshot stays on v1.
+	toUpdate := proto.Clone(suspended.GetActor()).(*ateapipb.Actor)
+	toUpdate.ActorTemplate = &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl2"}
+	if _, err := tc.client.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: toUpdate}); err != nil {
+		t.Fatalf("UpdateActor(tmpl2) failed: %v", err)
+	}
+
+	// Resume on v2 (this restore is DATA, from the v1 external snapshot), then
+	// pause; the pause checkpoint is captured on v2 while the external
+	// snapshot still says v1.
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("ResumeActor(v2 from v1 snapshot) failed: %v", err)
+	}
+	if got := tc.fakeAtelet.lastRestoreRequest().GetScope(); got != ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA {
+		t.Fatalf("first resume on v2 had scope = %v, want DATA", got)
+	}
+	if _, err := tc.client.PauseActor(ctx, &ateapipb.PauseActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("PauseActor failed: %v", err)
+	}
+	waitForWorkerAvailable(t, tc, worker)
+
+	// Resume from PAUSED: the local checkpoint was captured on v2 and the
+	// actor's template is v2, so the restore must be FULL.
+	if _, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: actorRef}); err != nil {
+		t.Fatalf("ResumeActor(from v2 pause) failed: %v", err)
+	}
+	restoreReq := tc.fakeAtelet.lastRestoreRequest()
+	if got := restoreReq.GetType(); got != ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL {
+		t.Errorf("restore request type = %v, want LOCAL", got)
+	}
+	if got := restoreReq.GetScope(); got != ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
+		t.Errorf("restore request scope = %v, want FULL (local checkpoint was captured on v2)", got)
+	}
+}
+
 // TestPauseActor tests the full workflow of pausing a running actor.
 // Workflow:
 // 1. Creates a mock ActorTemplate.
@@ -2537,8 +2608,7 @@ func TestPauseActor(t *testing.T) {
 				NodeVmsWithLocalSnapshots: []string{"node1"},
 				ContentScope:              ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
 			},
-			CurrentActorTemplateUid: tmpl.GetMetadata().GetUid(),
-			ExternalSnapshot:        &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL},
+			ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: goldenSnapshotURI(t), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL, ActorTemplateUid: tmpl.GetMetadata().GetUid()},
 		},
 	}
 

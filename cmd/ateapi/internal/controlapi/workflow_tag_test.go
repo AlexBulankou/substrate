@@ -44,8 +44,11 @@ func seedTagSource(t *testing.T, ctx context.Context, persistence store.Interfac
 	uri := mustActorSnapshotURI(t, template, actor, name+"-snapshot")
 	objects.PutSnapshot(t, uri, objectNames...)
 	actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
-		s.ExternalSnapshot = &ateapipb.ExternalSnapshot{SnapshotUri: uri.String(), ContentScope: ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL}
-		s.CurrentActorTemplateUid = template.GetMetadata().GetUid()
+		s.ExternalSnapshot = &ateapipb.ExternalSnapshot{
+			SnapshotUri:      uri.String(),
+			ContentScope:     ateapipb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
+			ActorTemplateUid: template.GetMetadata().GetUid(),
+		}
 	})
 	return actor, uri
 }
@@ -121,8 +124,9 @@ func TestTagActorSnapshot_ActorRepointedToAnotherTemplate(t *testing.T) {
 	actor, _ := seedTagSource(t, ctx, persistence, objects, builtOn, "actor-1", "manifest.json", "memory.zst")
 	actorRef := resources.ActorRefFromActor(actor)
 
-	// Repoint the suspended actor, the way UpdateActor does. Its recorded
-	// built-on UID stays at tmpl-a: only a resume moves that.
+	// Repoint the suspended actor, the way UpdateActor does. The snapshot on
+	// disk still came from tmpl-a, and the UID recorded alongside it only
+	// moves when a later suspend commits a new snapshot.
 	if _, err := persistence.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.ActorTemplate = &ateapipb.ObjectRef{Atespace: "team-a", Name: "tmpl-b"}
 		return nil
@@ -196,7 +200,7 @@ func TestTagActorSnapshot_Preconditions(t *testing.T) {
 				mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
 					s.ExternalSnapshot = &ateapipb.ExternalSnapshot{SnapshotUri: uri.String()}
 					if tt.builtOnTemplate {
-						s.CurrentActorTemplateUid = template.GetMetadata().GetUid()
+						s.ExternalSnapshot.ActorTemplateUid = template.GetMetadata().GetUid()
 					}
 				})
 			}
