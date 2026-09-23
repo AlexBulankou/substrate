@@ -138,10 +138,16 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 		return fmt.Errorf("failed to convert Deployment selector: %w", err)
 	}
 
+	// Stamped here rather than at the top of Reconcile: this is the only path
+	// where the Deployment has actually been applied and read back, so it is
+	// the only point at which the generation can honestly be called observed.
+	// The NotFound early-return in reconcileWorkerPool deliberately leaves the
+	// old value in place — an incomplete reconcile must not claim otherwise.
 	want := atev1alpha1.WorkerPoolStatus{
-		Replicas:      dep.Status.Replicas,
-		ReadyReplicas: dep.Status.ReadyReplicas,
-		Selector:      selector.String(),
+		ObservedGeneration: wp.Generation,
+		Replicas:           dep.Status.Replicas,
+		ReadyReplicas:      dep.Status.ReadyReplicas,
+		Selector:           selector.String(),
 	}
 	if equality.Semantic.DeepEqual(wp.Status, want) {
 		return nil

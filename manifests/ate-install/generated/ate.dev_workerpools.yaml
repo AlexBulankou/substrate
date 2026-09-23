@@ -447,6 +447,14 @@ spec:
           status:
             description: status is the observed state of WorkerPool
             properties:
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the .metadata.generation the controller last
+                  completed a reconcile for. When it lags .metadata.generation, the spec
+                  change has not been acted on yet.
+                format: int64
+                minimum: 0
+                type: integer
               readyReplicas:
                 description: ReadyReplicas is the number of ready worker pods.
                 format: int32

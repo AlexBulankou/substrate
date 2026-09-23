@@ -686,6 +686,62 @@ func TestSyncStatus_ReadyReplicas(t *testing.T) {
 	})
 }
 
+// TestSyncStatus_ObservedGeneration verifies that status.observedGeneration
+// TRACKS metadata.generation across a spec edit, which is the only property
+// that makes it useful: a client waiting on
+// `.status.observedGeneration == .metadata.generation` needs it to lag on an
+// unreconciled spec and catch up after. Asserting merely that the field is
+// populated would pass against a hardcoded 1.
+//
+// The repo already depends on this signal for core workloads --
+// cmd/ate-setup/internal/kube/wait.go gates Deployment, DaemonSet and
+// StatefulSet readiness on exactly this comparison. WorkerPool was the one
+// thing its own helper could not wait on.
+func TestSyncStatus_ObservedGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-observedgen", "default", 2, "ateom:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+
+	eventually(t, func(ctx context.Context) (bool, error) {
+		_, err := getDeployment(ctx, wp)
+		return err == nil, nil
+	})
+
+	var firstGen int64
+	eventually(t, func(ctx context.Context) (bool, error) {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, current); err != nil {
+			return false, nil
+		}
+		if current.Status.ObservedGeneration != current.Generation {
+			return false, nil
+		}
+		firstGen = current.Generation
+		return true, nil
+	})
+
+	updateWorkerPoolSpec(t, ctx, wp, "update WorkerPool replicas", func(current *atev1alpha1.WorkerPool) {
+		current.Spec.Replicas = 5
+	})
+
+	eventually(t, func(ctx context.Context) (bool, error) {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, current); err != nil {
+			return false, nil
+		}
+		// The edit must actually have bumped the generation, or the assertion
+		// below is vacuous -- it would hold on a controller that never moved.
+		if current.Generation <= firstGen {
+			return false, nil
+		}
+		return current.Status.ObservedGeneration == current.Generation, nil
+	})
+}
+
 // TestWorkerPoolMetrics verifies that the registered callback observes
 // spec.replicas and status.readyReplicas per WorkerPool, labeled with the pool
 // namespace and name. A fake client keeps this off the envtest reconciler,

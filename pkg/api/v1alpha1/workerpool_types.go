@@ -108,6 +108,13 @@ type WorkerPoolSpec struct {
 }
 
 type WorkerPoolStatus struct {
+	// ObservedGeneration is the .metadata.generation the controller last
+	// completed a reconcile for. When it lags .metadata.generation, the spec
+	// change has not been acted on yet.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Replicas is the total number of worker pods.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
