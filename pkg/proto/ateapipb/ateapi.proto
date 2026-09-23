@@ -47,7 +47,8 @@ service Control {
   // Only crashed, running or paused actors can be reverted.
   rpc RevertActor(RevertActorRequest) returns (RevertActorResponse) {}
 
-  // Delete an actor. Only suspended actors can be deleted.
+  // Delete an actor. Only suspended or crashed actors can be deleted unless
+  // any_state is set.
   rpc DeleteActor(DeleteActorRequest) returns (Actor) {}
 
   // Get the egress policy resource nested under an Actor.
