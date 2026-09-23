@@ -534,6 +534,7 @@ type ExternalSnapshot struct {
 	// snapshot_uri addresses the snapshot's prefix in object storage.
 	//
 	// +k8s:required
+	// +k8s:maxLength=2048 # the template's storage_location bound plus the owner prefix and snapshot name
 	SnapshotUri string `protobuf:"bytes,1,opt,name=snapshot_uri,json=snapshotUri,proto3" json:"snapshot_uri,omitempty"`
 	// content_scope is what the snapshot captured.
 	//
@@ -1497,7 +1498,7 @@ type ActorStatus struct {
 	// snapshot the Actor is currently taking.
 	//
 	// +k8s:optional
-	// +k8s:maxLength=2048
+	// +k8s:maxLength=2048 # the template's storage_location bound plus the owner prefix and snapshot name
 	InProgressSnapshotUri string `protobuf:"bytes,3,opt,name=in_progress_snapshot_uri,json=inProgressSnapshotUri,proto3" json:"in_progress_snapshot_uri,omitempty"`
 	// external_snapshot is the Actor's current external snapshot.
 	// If the Actor was created from a Tag this is the tag's snapshot, borrowed
@@ -1771,17 +1772,20 @@ type TagStatus struct {
 	Snapshot *ExternalSnapshot `protobuf:"bytes,1,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	// UID of the ActorTemplate the snapshot was taken under. Actors can only be
 	// seeded from a tag under the same template.
+	//
+	// +k8s:required
+	// +k8s:format=k8s-uuid
 	ActorTemplateUid string `protobuf:"bytes,2,opt,name=actor_template_uid,json=actorTemplateUid,proto3" json:"actor_template_uid,omitempty"`
 	// storage_location is the base object-storage URI for this tag's snapshot.
 	// Set by the server from the source actor's template when the tag is created
 	// and immutable thereafter. The full snapshot URI is available in
 	// snapshot.snapshot_uri once tag creation completes.
+	//
+	// +k8s:required
+	// +k8s:maxLength=1024
 	StorageLocation string `protobuf:"bytes,3,opt,name=storage_location,json=storageLocation,proto3" json:"storage_location,omitempty"`
-	// source_actor_uid is the UID of the Actor this tag's snapshot was copied
-	// from.
-	SourceActorUid string `protobuf:"bytes,4,opt,name=source_actor_uid,json=sourceActorUid,proto3" json:"source_actor_uid,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TagStatus) Reset() {
@@ -1831,13 +1835,6 @@ func (x *TagStatus) GetActorTemplateUid() string {
 func (x *TagStatus) GetStorageLocation() string {
 	if x != nil {
 		return x.StorageLocation
-	}
-	return ""
-}
-
-func (x *TagStatus) GetSourceActorUid() string {
-	if x != nil {
-		return x.SourceActorUid
 	}
 	return ""
 }
@@ -6956,12 +6953,11 @@ const file_ateapi_proto_rawDesc = "" +
 	"worker_pod\x18\x03 \x01(\tR\tworkerPod\x12$\n" +
 	"\x0eworker_pod_uid\x18\x04 \x01(\tR\fworkerPodUid\x12\"\n" +
 	"\rworker_pod_ip\x18\x05 \x01(\tR\vworkerPodIp\x12\x1b\n" +
-	"\tnode_name\x18\a \x01(\tR\bnodeName\"\xc4\x01\n" +
+	"\tnode_name\x18\a \x01(\tR\bnodeName\"\x9a\x01\n" +
 	"\tTagStatus\x124\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x18.ateapi.ExternalSnapshotR\bsnapshot\x12,\n" +
 	"\x12actor_template_uid\x18\x02 \x01(\tR\x10actorTemplateUid\x12)\n" +
-	"\x10storage_location\x18\x03 \x01(\tR\x0fstorageLocation\x12(\n" +
-	"\x10source_actor_uid\x18\x04 \x01(\tR\x0esourceActorUid\"\xc4\x01\n" +
+	"\x10storage_location\x18\x03 \x01(\tR\x0fstorageLocation\"\xc4\x01\n" +
 	"\x03Tag\x124\n" +
 	"\bmetadata\x18\x01 \x01(\v2\x18.ateapi.ResourceMetadataR\bmetadata\x12)\n" +
 	"\x06status\x18\x02 \x01(\v2\x11.ateapi.TagStatusR\x06status\x12&\n" +

@@ -151,6 +151,7 @@ message ExternalSnapshot {
   // snapshot_uri addresses the snapshot's prefix in object storage.
   //
   // +k8s:required
+  // +k8s:maxLength=2048 # the template's storage_location bound plus the owner prefix and snapshot name
   string snapshot_uri = 1;
 
   // content_scope is what the snapshot captured.
@@ -550,7 +551,7 @@ message ActorStatus {
   // snapshot the Actor is currently taking.
   //
   // +k8s:optional
-  // +k8s:maxLength=2048
+  // +k8s:maxLength=2048 # the template's storage_location bound plus the owner prefix and snapshot name
   string in_progress_snapshot_uri = 3;
 
   // external_snapshot is the Actor's current external snapshot.
@@ -665,17 +666,19 @@ message TagStatus {
 
   // UID of the ActorTemplate the snapshot was taken under. Actors can only be
   // seeded from a tag under the same template.
+  //
+  // +k8s:required
+  // +k8s:format=k8s-uuid
   string actor_template_uid = 2;
 
   // storage_location is the base object-storage URI for this tag's snapshot.
   // Set by the server from the source actor's template when the tag is created
   // and immutable thereafter. The full snapshot URI is available in
   // snapshot.snapshot_uri once tag creation completes.
+  //
+  // +k8s:required
+  // +k8s:maxLength=1024
   string storage_location = 3;
-
-  // source_actor_uid is the UID of the Actor this tag's snapshot was copied
-  // from.
-  string source_actor_uid = 4;
 }
 
 // Tag is an Atespace-owned, stable name for one external snapshot. The
