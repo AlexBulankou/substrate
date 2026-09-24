@@ -22,7 +22,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
-	"os"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -47,13 +46,19 @@ func TLSConfig(credentialBundlePath, trustBundlePath, ateletSPIFFEID string) (*t
 	if err != nil || localIdentity == nil {
 		return nil, fmt.Errorf("worker certificate has no valid Pod identity")
 	}
-	trustPEM, err := os.ReadFile(trustBundlePath)
-	if err != nil {
+	// Load the trust bundle per handshake rather than freezing a pool here.
+	// kubelet keeps the projected ClusterTrustBundle in sync with the signer,
+	// so a pool captured at startup stops matching atelet's chain at the next
+	// CA rotation — and this is the connection a worker renews its own
+	// certificate over, so freezing it means a long-lived worker loses its
+	// identity until the pod restarts. PoolLoader caches the parsed pool and
+	// re-reads only when the file changes, so the per-handshake call costs
+	// nothing while the bundle is stable.
+	loadRoots := credbundle.PoolLoader(trustBundlePath)
+	// Read once here anyway, so a missing or malformed projection fails the
+	// caller promptly instead of at the first handshake.
+	if _, err := loadRoots(); err != nil {
 		return nil, fmt.Errorf("read atelet trust bundle: %w", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(trustPEM) {
-		return nil, fmt.Errorf("atelet trust bundle contains no certificates")
 	}
 	return &tls.Config{
 		MinVersion:           tls.VersionTLS13,
@@ -65,6 +70,10 @@ func TLSConfig(credentialBundlePath, trustBundlePath, ateletSPIFFEID string) (*t
 			// incarnation. This is why InsecureSkipVerify is set above.
 			if len(state.PeerCertificates) == 0 {
 				return fmt.Errorf("atelet certificate is required")
+			}
+			roots, err := loadRoots()
+			if err != nil {
+				return fmt.Errorf("reload atelet trust bundle: %w", err)
 			}
 			intermediates := x509.NewCertPool()
 			for _, cert := range state.PeerCertificates[1:] {
