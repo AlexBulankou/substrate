@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -88,8 +90,9 @@ func TestMain(m *testing.M) {
 	}
 
 	if err := (&WorkerPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("workerpool-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "controller setup failed: %v\n", err)
 		os.Exit(1)
@@ -156,13 +159,10 @@ func TestWorkerPoolReplicasUpdate(t *testing.T) {
 		return err == nil, nil
 	})
 
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, wp); err != nil {
-		t.Fatalf("re-fetch WorkerPool: %v", err)
-	}
-	wp.Spec.Replicas = 5
-	if err := k8sClient.Update(testCtx, wp); err != nil {
-		t.Fatalf("update WorkerPool replicas: %v", err)
-	}
+	updateWorkerPool(t, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace},
+		func(current *atev1alpha1.WorkerPool) {
+			current.Spec.Replicas = 5
+		})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -187,13 +187,10 @@ func TestWorkerPoolImageUpdate(t *testing.T) {
 		return err == nil, nil
 	})
 
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, wp); err != nil {
-		t.Fatalf("re-fetch WorkerPool: %v", err)
-	}
-	wp.Spec.AteomImage = "ateom:v2"
-	if err := k8sClient.Update(testCtx, wp); err != nil {
-		t.Fatalf("update WorkerPool image: %v", err)
-	}
+	updateWorkerPool(t, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace},
+		func(current *atev1alpha1.WorkerPool) {
+			current.Spec.AteomImage = "ateom:v2"
+		})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -218,18 +215,12 @@ func TestSSAPreservesUnownedFields(t *testing.T) {
 		return err == nil, nil
 	})
 
-	dep, err := getDeployment(testCtx, wp)
-	if err != nil {
-		t.Fatalf("get Deployment: %v", err)
-	}
-
 	// An external manager sets revisionHistoryLimit — a field the controller
 	// never declares in its apply config.
 	revisionHistoryLimit := int32(7)
-	dep.Spec.RevisionHistoryLimit = &revisionHistoryLimit
-	if err := k8sClient.Update(testCtx, dep); err != nil {
-		t.Fatalf("set revisionHistoryLimit: %v", err)
-	}
+	updateDeployment(t, wp, func(dep *appsv1.Deployment) {
+		dep.Spec.RevisionHistoryLimit = &revisionHistoryLimit
+	})
 
 	// The Deployment update triggers a reconcile via Owns(). Wait until the
 	// reconcile has run (replicas still correct) and the field is still present.
@@ -258,15 +249,10 @@ func TestSSARevertsOwnedFields(t *testing.T) {
 		return err == nil && dep.Spec.Replicas != nil && *dep.Spec.Replicas == 2, nil
 	})
 
-	dep, err := getDeployment(testCtx, wp)
-	if err != nil {
-		t.Fatalf("get Deployment: %v", err)
-	}
 	rogueReplicas := int32(99)
-	dep.Spec.Replicas = &rogueReplicas
-	if err := k8sClient.Update(testCtx, dep); err != nil {
-		t.Fatalf("rogue update: %v", err)
-	}
+	updateDeployment(t, wp, func(dep *appsv1.Deployment) {
+		dep.Spec.Replicas = &rogueReplicas
+	})
 
 	// The controller re-applies with ForceOwnership, reclaiming replicas.
 	eventually(t, func(ctx context.Context) (bool, error) {
@@ -320,16 +306,10 @@ func TestStatusReplicasPropagation(t *testing.T) {
 		return err == nil, nil
 	})
 
-	dep, err := getDeployment(testCtx, wp)
-	if err != nil {
-		t.Fatalf("get Deployment: %v", err)
-	}
-
 	// Simulate the deployment controller reporting 3 running pods.
-	dep.Status.Replicas = 3
-	if err := k8sClient.Status().Update(testCtx, dep); err != nil {
-		t.Fatalf("patch Deployment status: %v", err)
-	}
+	updateDeploymentStatus(t, wp, func(dep *appsv1.Deployment) {
+		dep.Status.Replicas = 3
+	})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		current := &atev1alpha1.WorkerPool{}
@@ -376,14 +356,9 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 	// Change the spec. The API server bumps metadata.generation, which leaves
 	// the rest of status describing the OLD spec until the controller catches
 	// up -- exactly the window this field exists to make visible.
-	current := &atev1alpha1.WorkerPool{}
-	if err := k8sClient.Get(testCtx, key, current); err != nil {
-		t.Fatalf("get WorkerPool: %v", err)
-	}
-	current.Spec.Replicas = 4
-	if err := k8sClient.Update(testCtx, current); err != nil {
-		t.Fatalf("update WorkerPool spec: %v", err)
-	}
+	current := updateWorkerPool(t, key, func(current *atev1alpha1.WorkerPool) {
+		current.Spec.Replicas = 4
+	})
 
 	// Drive the assertion to a second generation on purpose. A controller that
 	// stamped a constant, or that stamped 1, would satisfy an equality check
@@ -400,6 +375,82 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 		}
 		return latest.Status.ObservedGeneration == secondGen, nil
 	})
+}
+
+// TestWorkerPoolEmitsSyncedEvent verifies the controller records a Kubernetes
+// Event against the WorkerPool, readable the way an operator actually reads it.
+//
+// This asserts on real Event objects in the API server rather than on a fake
+// recorder's channel on purpose: the defect in #1147 is that `kubectl describe
+// workerpool` shows nothing, and only an end-to-end assertion can tell the
+// difference between "Eventf was called" and "an Event exists to be described".
+// A fake would stay green if the recorder were wired to a discarding sink.
+func TestWorkerPoolEmitsSyncedEvent(t *testing.T) {
+	wp := makeWorkerPool("test-events", "default", 2, "ateom:v1")
+	if err := k8sClient.Create(testCtx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	t.Cleanup(func() { k8sClient.Delete(testCtx, wp) }) //nolint:errcheck
+
+	var found corev1.Event
+	eventually(t, func(ctx context.Context) (bool, error) {
+		events := &corev1.EventList{}
+		if err := k8sClient.List(ctx, events, client.InNamespace(wp.Namespace)); err != nil {
+			return false, nil
+		}
+		for _, e := range events.Items {
+			// Match on the involved object, not just the reason: an Event
+			// naming some other resource would otherwise satisfy this.
+			if e.InvolvedObject.Kind == "WorkerPool" &&
+				e.InvolvedObject.Name == wp.Name &&
+				e.Reason == reasonSynced {
+				found = e
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+
+	if found.Type != corev1.EventTypeNormal {
+		t.Errorf("Synced event type = %q, want %q", found.Type, corev1.EventTypeNormal)
+	}
+	// The message has to carry the generation, because "something synced" with
+	// no generation is not actionable -- it cannot be correlated with a spec
+	// edit, which is the whole reason the event is worth emitting.
+	if !strings.Contains(found.Message, "Observed generation") {
+		t.Errorf("Synced event message = %q, want it to report the observed generation", found.Message)
+	}
+	if found.ReportingController != "workerpool-controller" && found.Source.Component != "workerpool-controller" {
+		t.Errorf("event attributed to %q/%q, want workerpool-controller",
+			found.ReportingController, found.Source.Component)
+	}
+}
+
+// TestSetupWithManagerRefusesNilRecorder pins the fail-closed startup guard.
+//
+// The bug #1147 reports is a controller that reconciles correctly and emits
+// nothing, which is invisible until someone runs `kubectl describe` and finds
+// an empty Events section. Defaulting a missing Recorder to a no-op would
+// reproduce exactly that, so a missing one has to stop the process instead.
+func TestSetupWithManagerRefusesNilRecorder(t *testing.T) {
+	withoutRecorder := newTestManager(t)
+	err := (&WorkerPoolReconciler{
+		Client: withoutRecorder.GetClient(),
+		Scheme: withoutRecorder.GetScheme(),
+	}).SetupWithManager(withoutRecorder)
+	if err == nil {
+		t.Fatal("SetupWithManager accepted a nil Recorder; it must fail closed")
+	}
+	if !strings.Contains(err.Error(), "Recorder") {
+		t.Errorf("error %q does not name the missing field", err)
+	}
+
+	// The positive control is TestMain, not a second registration here:
+	// controller-runtime enforces controller-name uniqueness per PROCESS, not
+	// per manager, so re-registering "workerpool" fails for an unrelated
+	// reason no matter how fresh the manager is. TestMain calls
+	// SetupWithManager with a populated Recorder and exits non-zero on error,
+	// so reaching this test at all proves the populated case is accepted.
 }
 
 func sampleWorkerPoolPodTemplate() *atev1alpha1.WorkerPoolPodTemplate {
@@ -489,13 +540,10 @@ func TestWorkerPoolPodTemplateUpdate(t *testing.T) {
 		return err == nil && dep.Spec.Template.Spec.NodeSelector["workload"] == "substrate", nil
 	})
 
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, wp); err != nil {
-		t.Fatalf("re-fetch WorkerPool: %v", err)
-	}
-	wp.Spec.Template.NodeSelector = map[string]string{"workload": "updated"}
-	if err := k8sClient.Update(testCtx, wp); err != nil {
-		t.Fatalf("update WorkerPool template: %v", err)
-	}
+	updateWorkerPool(t, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace},
+		func(current *atev1alpha1.WorkerPool) {
+			current.Spec.Template.NodeSelector = map[string]string{"workload": "updated"}
+		})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -523,13 +571,10 @@ func TestWorkerPoolPodTemplateClear(t *testing.T) {
 		return err == nil && dep.Spec.Template.Spec.NodeSelector["workload"] == "substrate", nil
 	})
 
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, wp); err != nil {
-		t.Fatalf("re-fetch WorkerPool: %v", err)
-	}
-	wp.Spec.Template.NodeSelector = nil
-	if err := k8sClient.Update(testCtx, wp); err != nil {
-		t.Fatalf("clear WorkerPool nodeSelector: %v", err)
-	}
+	updateWorkerPool(t, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace},
+		func(current *atev1alpha1.WorkerPool) {
+			current.Spec.Template.NodeSelector = nil
+		})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -565,13 +610,10 @@ func TestWorkerPoolPodTemplateClearAll(t *testing.T) {
 			container.Resources.Requests.Cpu().String() == "500m", nil
 	})
 
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, wp); err != nil {
-		t.Fatalf("re-fetch WorkerPool: %v", err)
-	}
-	wp.Spec.Template = nil
-	if err := k8sClient.Update(testCtx, wp); err != nil {
-		t.Fatalf("clear WorkerPool template: %v", err)
-	}
+	updateWorkerPool(t, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace},
+		func(current *atev1alpha1.WorkerPool) {
+			current.Spec.Template = nil
+		})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -605,14 +647,9 @@ func TestSSARevertsOwnedPodTemplateFields(t *testing.T) {
 		return err == nil && dep.Spec.Template.Spec.NodeSelector["workload"] == "substrate", nil
 	})
 
-	dep, err := getDeployment(testCtx, wp)
-	if err != nil {
-		t.Fatalf("get Deployment: %v", err)
-	}
-	dep.Spec.Template.Spec.NodeSelector = map[string]string{"workload": "rogue"}
-	if err := k8sClient.Update(testCtx, dep); err != nil {
-		t.Fatalf("rogue update: %v", err)
-	}
+	updateDeployment(t, wp, func(dep *appsv1.Deployment) {
+		dep.Spec.Template.Spec.NodeSelector = map[string]string{"workload": "rogue"}
+	})
 
 	eventually(t, func(ctx context.Context) (bool, error) {
 		dep, err := getDeployment(ctx, wp)
@@ -656,6 +693,87 @@ func getDeployment(ctx context.Context, wp *atev1alpha1.WorkerPool) (*appsv1.Dep
 		Namespace: wp.Namespace,
 	}, dep)
 	return dep, err
+}
+
+// updateWorkerPool applies mutate to the named WorkerPool and returns the
+// object as written, retrying on conflict.
+//
+// A plain get-then-update from a test races the controller: every reconcile
+// writes .status, a status write bumps resourceVersion, and the test's stale
+// copy is then rejected with "the object has been modified". The race predates
+// the event recorder -- wiring one just added enough API traffic to widen the
+// window from "rarely" to "most runs", which is how it was found.
+func updateWorkerPool(t *testing.T, key types.NamespacedName, mutate func(*atev1alpha1.WorkerPool)) *atev1alpha1.WorkerPool {
+	t.Helper()
+	var out *atev1alpha1.WorkerPool
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(testCtx, key, current); err != nil {
+			return err
+		}
+		mutate(current)
+		if err := k8sClient.Update(testCtx, current); err != nil {
+			return err
+		}
+		out = current
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update WorkerPool %s: %v", key.Name, err)
+	}
+	return out
+}
+
+// newTestManager builds an unstarted manager for tests that need to exercise
+// SetupWithManager directly. Each call gets its own manager because
+// controller-runtime rejects a second controller registered under the same
+// name on one manager.
+func newTestManager(t *testing.T) ctrl.Manager {
+	t.Helper()
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:                 k8sClient.Scheme(),
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+	return mgr
+}
+
+// updateDeployment applies mutate to the WorkerPool's managed Deployment,
+// retrying on conflict. Same race as updateWorkerPool, from the other side:
+// the controller re-applies the Deployment on every reconcile, so a test's
+// get-then-update is working from a copy the controller may already have
+// superseded.
+func updateDeployment(t *testing.T, wp *atev1alpha1.WorkerPool, mutate func(*appsv1.Deployment)) {
+	t.Helper()
+	updateDeploymentWith(t, wp, mutate, func(dep *appsv1.Deployment) error {
+		return k8sClient.Update(testCtx, dep)
+	})
+}
+
+// updateDeploymentStatus is updateDeployment against the status subresource.
+func updateDeploymentStatus(t *testing.T, wp *atev1alpha1.WorkerPool, mutate func(*appsv1.Deployment)) {
+	t.Helper()
+	updateDeploymentWith(t, wp, mutate, func(dep *appsv1.Deployment) error {
+		return k8sClient.Status().Update(testCtx, dep)
+	})
+}
+
+func updateDeploymentWith(t *testing.T, wp *atev1alpha1.WorkerPool, mutate func(*appsv1.Deployment), write func(*appsv1.Deployment) error) {
+	t.Helper()
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep, err := getDeployment(testCtx, wp)
+		if err != nil {
+			return err
+		}
+		mutate(dep)
+		return write(dep)
+	})
+	if err != nil {
+		t.Fatalf("update Deployment for %s: %v", wp.Name, err)
+	}
 }
 
 // eventually polls condition every 100ms until it returns true or 15s elapses.

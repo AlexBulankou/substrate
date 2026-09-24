@@ -19,10 +19,12 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -32,15 +34,27 @@ import (
 
 const workerPoolFieldOwner = "workerpool-controller"
 
+// Event reasons emitted on WorkerPool. Reasons are stable identifiers that
+// operators filter on (`--field-selector reason=...`), so treat them as part
+// of the surface: rename with the same care as a status field.
+const (
+	// reasonApplyFailed marks a failed apply of the managed Deployment.
+	reasonApplyFailed = "ApplyFailed"
+	// reasonSynced marks an observed change in the pool's status.
+	reasonSynced = "Synced"
+)
+
 type WorkerPoolReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -75,6 +89,11 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
 	log.Info("Reconciling worker pool")
 
 	if err := r.applyDeployment(ctx, wp); err != nil {
+		// The failure path is the one an operator most needs a breadcrumb for:
+		// without it, a Deployment that never appears is only visible in the
+		// controller's own logs, which assumes cluster-log access.
+		r.Recorder.Eventf(wp, corev1.EventTypeWarning, reasonApplyFailed,
+			"Failed to apply Deployment %s: %v", deploymentName(wp.Name), err)
 		return err
 	}
 
@@ -118,11 +137,24 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 		return fmt.Errorf("failed to update WorkerPool status: %w", err)
 	}
 
+	// Emitted only past the DeepEqual guard above, so this fires on an actual
+	// transition rather than once per resync -- a steady-state pool stays
+	// quiet instead of burying the interesting events.
+	r.Recorder.Eventf(wp, corev1.EventTypeNormal, reasonSynced,
+		"Observed generation %d with %d replica(s)", want.ObservedGeneration, want.Replicas)
+
 	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Refuse to start rather than run with events silently disabled. A nil
+	// Recorder is the exact failure this instrumentation exists to fix -- a
+	// controller that reconciles fine and emits nothing -- so it fails closed
+	// at startup instead of being discovered from an empty `kubectl describe`.
+	if r.Recorder == nil {
+		return fmt.Errorf("WorkerPoolReconciler: Recorder must be set")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&atev1alpha1.WorkerPool{}).
 		Owns(&appsv1.Deployment{}).
