@@ -250,12 +250,28 @@ func TestMakeCertMarksTheRequestIssued(t *testing.T) {
 	}
 }
 
+// The two tests below assert WHICH error comes back, not merely that one does.
+// Both started out asserting only non-nil and both let a mutant through: with
+// the pod-Get error swallowed, the fake returns an empty Pod whose UID is "",
+// so the call still fails -- as a bogus "UID mismatch" rather than as the API
+// error it was. With the public-key error swallowed, the nil key fails later
+// inside x509.CreateCertificate. Each still fails closed, which is the property
+// that matters most, but an operator reading the wrong cause is a real cost and
+// a weak assertion is what hid it.
+
 func TestMakeCertFailsWhenThePodIsGone(t *testing.T) {
 	pcr := testPCR(t, testSAName, testPodUID, ptr.To(int32(3600)))
 	impl, _, _ := newTestImpl(t, pcr) // no pod seeded
 
-	if err := impl.MakeCert(context.Background(), pcr); err == nil {
+	err := impl.MakeCert(context.Background(), pcr)
+	if err == nil {
 		t.Fatal("MakeCert succeeded with no pod present; a missing pod must fail closed")
+	}
+	if !strings.Contains(err.Error(), "while getting pod") {
+		t.Errorf("error = %v, want it to name the failed pod lookup", err)
+	}
+	if strings.Contains(err.Error(), "UID mismatch") {
+		t.Errorf("error = %v; a missing pod is being reported as a UID mismatch", err)
 	}
 }
 
@@ -264,8 +280,21 @@ func TestMakeCertFailsWithoutASubjectPublicKey(t *testing.T) {
 	pcr.Spec.PKIXPublicKey = nil
 	impl, _, _ := newTestImpl(t, testPod(testSAName), pcr)
 
-	if err := impl.MakeCert(context.Background(), pcr); err == nil {
+	err := impl.MakeCert(context.Background(), pcr)
+	if err == nil {
 		t.Fatal("MakeCert succeeded with no subject public key")
+	}
+	// Deliberately not just "public key": if the PublicKey error were swallowed,
+	// the nil key reaches x509.CreateCertificate, which rejects it as an
+	// "unsupported public key type" -- a message that matches that looser
+	// substring just as well. The point of the assertion is that the request is
+	// rejected up front rather than at signing time.
+	if !strings.Contains(err.Error(), "does not contain a public key") {
+		t.Errorf("error = %v, want the up-front missing-public-key rejection", err)
+	}
+	if strings.Contains(err.Error(), "while signing subject cert") {
+		t.Errorf("error = %v; the missing key reached the signing call instead of "+
+			"being rejected when it was read", err)
 	}
 }
 
