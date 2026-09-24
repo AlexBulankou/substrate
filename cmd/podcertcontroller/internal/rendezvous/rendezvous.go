@@ -237,6 +237,9 @@ func (h *Hasher) AssignedToThisReplica(ctx context.Context, item string) bool {
 		// a lease that carries our label --- a half-written object, or one
 		// created by hand.  A replica that has never checked in cannot be
 		// live, and dereferencing the nil would take this controller down.
+		if lease.Spec.RenewTime == nil {
+			continue
+		}
 
 		// If the replica hasn't checked in by the deadline, consider it dead.
 		deadline := lease.Spec.RenewTime.Time.Add(leaseDuration)
