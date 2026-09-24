@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,8 +80,9 @@ func TestMain(m *testing.M) {
 	}
 
 	if err := (&WorkerPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("workerpool-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "controller setup failed: %v\n", err)
 		os.Exit(1)
@@ -398,6 +400,106 @@ func TestStatusObservedGenerationTracksSpec(t *testing.T) {
 		}
 		return latest.Status.ObservedGeneration == secondGen, nil
 	})
+}
+
+// TestWorkerPoolEmitsSyncedEvent verifies the controller records a Kubernetes
+// Event against the WorkerPool, readable the way an operator actually reads it.
+//
+// This asserts on real Event objects in the API server rather than on a fake
+// recorder's channel on purpose: the defect is that `kubectl describe
+// workerpool` shows nothing, and only an end-to-end assertion can tell the
+// difference between "Eventf was called" and "an Event exists to be described".
+// A fake would stay green if the recorder were wired to a discarding sink.
+func TestWorkerPoolEmitsSyncedEvent(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-events", "default", 2, "ateom:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+
+	var found corev1.Event
+	eventually(t, func(ctx context.Context) (bool, error) {
+		events := &corev1.EventList{}
+		if err := k8sClient.List(ctx, events, client.InNamespace(wp.Namespace)); err != nil {
+			return false, nil
+		}
+		for _, e := range events.Items {
+			// Match on the involved object, not just the reason: an Event
+			// naming some other resource would otherwise satisfy this.
+			if e.InvolvedObject.Kind == "WorkerPool" &&
+				e.InvolvedObject.Name == wp.Name &&
+				e.Reason == reasonSynced {
+				found = e
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+
+	if found.Type != corev1.EventTypeNormal {
+		t.Errorf("Synced event type = %q, want %q", found.Type, corev1.EventTypeNormal)
+	}
+	// The message has to carry the generation, because "something synced" with
+	// no generation is not actionable -- it cannot be correlated with a spec
+	// edit, which is the whole reason the event is worth emitting.
+	if !strings.Contains(found.Message, "Observed generation") {
+		t.Errorf("Synced event message = %q, want it to report the observed generation", found.Message)
+	}
+	if found.ReportingController != "workerpool-controller" && found.Source.Component != "workerpool-controller" {
+		t.Errorf("event attributed to %q/%q, want workerpool-controller",
+			found.ReportingController, found.Source.Component)
+	}
+}
+
+// TestSetupWithManagerRefusesNilRecorder pins the fail-closed startup guard.
+//
+// The bug here is a controller that reconciles correctly and emits nothing,
+// which is invisible until someone runs `kubectl describe` and finds an empty
+// Events section. Defaulting a missing Recorder to a no-op would reproduce
+// exactly that, so a missing one has to stop the process instead.
+func TestSetupWithManagerRefusesNilRecorder(t *testing.T) {
+	t.Parallel()
+	withoutRecorder := newTestManager(t)
+	err := (&WorkerPoolReconciler{
+		Client: withoutRecorder.GetClient(),
+		Scheme: withoutRecorder.GetScheme(),
+	}).SetupWithManager(withoutRecorder)
+	if err == nil {
+		t.Fatal("SetupWithManager accepted a nil Recorder; it must fail closed")
+	}
+	if !strings.Contains(err.Error(), "Recorder") {
+		t.Errorf("error %q does not name the missing field", err)
+	}
+
+	// The positive control is TestMain, not a second registration here:
+	// controller-runtime enforces controller-name uniqueness per PROCESS, not
+	// per manager, so re-registering "workerpool" fails for an unrelated
+	// reason no matter how fresh the manager is. TestMain calls
+	// SetupWithManager with a populated Recorder and exits non-zero on error,
+	// so reaching this test at all proves the populated case is accepted.
+}
+
+// newTestManager builds a manager against the shared envtest API server
+// without starting it. Nothing here reconciles; it exists so a test can hand
+// SetupWithManager a real manager rather than a nil interface, which would
+// turn a reordered guard into a panic instead of a verdict.
+func newTestManager(t *testing.T) ctrl.Manager {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(atev1alpha1.AddToScheme(scheme))
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
+	if err != nil {
+		t.Fatalf("manager creation failed: %v", err)
+	}
+	return mgr
 }
 
 func sampleWorkerPoolPodTemplate() *atev1alpha1.WorkerPoolPodTemplate {
