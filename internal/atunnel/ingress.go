@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/atenet"
+	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/resources"
 )
 
@@ -119,13 +120,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if _, err := loadCredentialBundle(cfg.CredentialBundlePath); err != nil {
 		return nil, err
 	}
-	trustPEM, err := os.ReadFile(cfg.TrustBundlePath)
-	if err != nil {
+	loadClientCAs := credbundle.PoolLoader(cfg.TrustBundlePath)
+	if _, err := loadClientCAs(); err != nil {
 		return nil, fmt.Errorf("atunnel: reading trust bundle: %w", err)
-	}
-	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(trustPEM) {
-		return nil, fmt.Errorf("atunnel: trust bundle %q contains no certificates", cfg.TrustBundlePath)
 	}
 
 	s := &Server{
@@ -141,16 +138,40 @@ func NewServer(cfg Config) (*Server, error) {
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return loadCredentialBundle(s.credentialBundlePath)
 		},
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		// TODO(liorlieberman): reload the trust bundle per connection via
-		// GetConfigForClient, mirroring GetCertificate above. kubelet keeps the
-		// projected ClusterTrustBundle in sync with the signer, but this pool is
-		// frozen at process start, so after a CA rotation a long-lived worker
-		// rejects the router until its pod restarts.
-		ClientCAs: clientCAs,
+		// Demand a client certificate but verify the chain below rather than
+		// through ClientCAs. ClientCAs is frozen once the config is in use, and
+		// kubelet keeps the projected ClusterTrustBundle in sync with the
+		// signer, so a pool set at process start makes a long-lived router
+		// reject every worker whose certificate the rotated-in CA signed, until
+		// its pod restarts. Verifying here reloads the bundle per connection,
+		// mirroring what GetCertificate above already does for the router's own
+		// credentials.
+		//
+		// GetConfigForClient is the other way to reach a per-connection pool,
+		// but it returns a whole replacement config, which would have to be
+		// cloned from the one http.Server is actually serving -- and that one is
+		// an internal clone carrying the ALPN protocols ServeTLS appended. Any
+		// snapshot this constructor could take predates that, so returning it
+		// would silently downgrade every connection to HTTP/1.1.
+		ClientAuth: tls.RequireAnyClientCert,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return fmt.Errorf("atunnel: client certificate is required")
+			}
+			clientCAs, err := loadClientCAs()
+			if err != nil {
+				return fmt.Errorf("atunnel: reloading trust bundle: %w", err)
+			}
+			intermediates := x509.NewCertPool()
+			for _, cert := range cs.PeerCertificates[1:] {
+				intermediates.AddCert(cert)
+			}
+			if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+				Roots:         clientCAs,
+				Intermediates: intermediates,
+				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			}); err != nil {
+				return fmt.Errorf("atunnel: verifying client certificate: %w", err)
 			}
 			for _, uri := range cs.PeerCertificates[0].URIs {
 				if uri.String() == cfg.AllowedClientID {
