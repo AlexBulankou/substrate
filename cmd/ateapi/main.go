@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -475,26 +474,50 @@ func newKubeClients() (*kubernetes.Clientset, versioned.Interface, error) {
 // composes gRPC TransportCredentials over the server bundle + optional
 // client-cert verification.
 func buildServerCreds(ctx context.Context) (credentials.TransportCredentials, error) {
-	var clientCAs *x509.CertPool
-	if *podIdentityCACerts != "" {
-		// TODO: Periodically reload these to handle rotations. Consult with Tina to see how she did it for client-go.
-		ca, err := os.ReadFile(*podIdentityCACerts)
-		if err != nil {
-			return nil, fmt.Errorf("read pod-identity CA: %w", err)
-		}
-		clientCAs = x509.NewCertPool()
-		if !clientCAs.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("parse pod-identity CA from %s", *podIdentityCACerts)
-		}
-		slog.InfoContext(ctx, "Using pod-identity CA for client-cert verification", slog.String("path", *podIdentityCACerts))
+	serverCert := credbundle.Loader(*grpcServerCredBundle)
+	if *podIdentityCACerts == "" {
+		// No configured pool means nothing to verify a client certificate
+		// against, so none is asked for. Leaving ClientAuth at
+		// VerifyClientCertIfGiven here would not disable verification the way
+		// the flag help claims -- a nil ClientCAs verifies against the host
+		// system trust store, so a WebPKI-issued certificate would pass the
+		// transport check. Nothing downstream would accept it (a public CA will
+		// not issue a spiffe:// URI SAN, which is what the principal is read
+		// from), but the polarity is fail-open and costs nothing to close.
+		return credentials.NewTLS(&tls.Config{
+			GetCertificate: serverCert,
+			ClientAuth:     tls.NoClientCert,
+		}), nil
 	}
+
+	// Read once here so a missing or malformed bundle fails ateapi at startup
+	// rather than at the first inbound RPC. PoolLoader caches the parse, so the
+	// per-connection reload below costs a stat until the file changes.
+	loadClientCAs := credbundle.PoolLoader(*podIdentityCACerts)
+	if _, err := loadClientCAs(); err != nil {
+		return nil, fmt.Errorf("read pod-identity CA: %w", err)
+	}
+	slog.InfoContext(ctx, "Using pod-identity CA for client-cert verification", slog.String("path", *podIdentityCACerts))
+
+	// Rebuilt per connection: ClientCAs is frozen once a config is in use, so a
+	// pool captured here would keep trusting the retired CA after a rotation
+	// and refuse every caller holding a freshly issued certificate until this
+	// process restarts. The serving half already rotates via credbundle.Loader.
 	return credentials.NewTLS(&tls.Config{
-		GetCertificate: credbundle.Loader(*grpcServerCredBundle),
-		// Client certs stay optional at the transport level: certless
-		// clients such as kubectl-ate authenticate with a Bearer token in the
-		// ateapiauth interceptor.
-		ClientAuth: tls.VerifyClientCertIfGiven,
-		ClientCAs:  clientCAs,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			clientCAs, err := loadClientCAs()
+			if err != nil {
+				return nil, err
+			}
+			return &tls.Config{
+				GetCertificate: serverCert,
+				// Client certs stay optional at the transport level: certless
+				// clients such as kubectl-ate authenticate with a Bearer token
+				// in the ateapiauth interceptor.
+				ClientAuth: tls.VerifyClientCertIfGiven,
+				ClientCAs:  clientCAs,
+			}, nil
+		},
 	}), nil
 }
 
