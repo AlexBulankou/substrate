@@ -166,6 +166,7 @@ message ExternalSnapshot {
   // captured from.
   //
   // +k8s:optional
+  // +k8s:format=k8s-uuid
   string actor_template_uid = 3;
 }
 
@@ -824,8 +825,15 @@ message GoldenSnapshotStatus {
 
   // take_golden_snapshot_at is when the golden-actor warmup ends and the
   // golden snapshot may be taken.
+  //
+  // +k8s:optional
   google.protobuf.Timestamp take_golden_snapshot_at = 2;
 
+  // error_message is set when the golden snapshot build fails and will not be
+  // retried, formatted as "<Reason>: <detail>". A nonempty value is terminal.
+  //
+  // +k8s:optional
+  // +k8s:maxLength=4096
   string error_message = 3;
 }
 
@@ -1128,6 +1136,7 @@ message ExternalVolumeTemplate {
   // form (e.g. "10Gi"). Required.
   //
   // +k8s:required
+  // +k8s:maxLength=32 # matches Limits.quantity's bound
   // +k8s:customValidation # must parse as a resource.Quantity
   string capacity = 1;
 

@@ -546,6 +546,7 @@ type ExternalSnapshot struct {
 	// captured from.
 	//
 	// +k8s:optional
+	// +k8s:format=k8s-uuid
 	ActorTemplateUid string `protobuf:"bytes,3,opt,name=actor_template_uid,json=actorTemplateUid,proto3" json:"actor_template_uid,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
@@ -2284,10 +2285,17 @@ type GoldenSnapshotStatus struct {
 	GoldenTag *ObjectRef `protobuf:"bytes,1,opt,name=golden_tag,json=goldenTag,proto3" json:"golden_tag,omitempty"`
 	// take_golden_snapshot_at is when the golden-actor warmup ends and the
 	// golden snapshot may be taken.
+	//
+	// +k8s:optional
 	TakeGoldenSnapshotAt *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=take_golden_snapshot_at,json=takeGoldenSnapshotAt,proto3" json:"take_golden_snapshot_at,omitempty"`
-	ErrorMessage         string                 `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// error_message is set when the golden snapshot build fails and will not be
+	// retried, formatted as "<Reason>: <detail>". A nonempty value is terminal.
+	//
+	// +k8s:optional
+	// +k8s:maxLength=4096
+	ErrorMessage  string `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GoldenSnapshotStatus) Reset() {
@@ -3262,6 +3270,7 @@ type ExternalVolumeTemplate struct {
 	// form (e.g. "10Gi"). Required.
 	//
 	// +k8s:required
+	// +k8s:maxLength=32 # matches Limits.quantity's bound
 	// +k8s:customValidation # must parse as a resource.Quantity
 	Capacity string `protobuf:"bytes,1,opt,name=capacity,proto3" json:"capacity,omitempty"`
 	// storage_class_name names the cluster-scoped Kubernetes StorageClass to
