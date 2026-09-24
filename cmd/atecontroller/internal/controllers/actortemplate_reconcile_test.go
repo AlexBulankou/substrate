@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	ateapipb "github.com/agent-substrate/substrate/pkg/proto/ateapipb"
@@ -340,6 +342,14 @@ func TestActorTemplateCreateActorFailureHoldsPhase(t *testing.T) {
 // holding just `at`, wired to its own fake control client and recorder.
 func newDirectReconciler(t *testing.T, at *atev1alpha1.ActorTemplate) (*ActorTemplateReconciler, *fakeControlClient, chan string) {
 	t.Helper()
+	return newDirectReconcilerWithInterceptors(t, at, interceptor.Funcs{})
+}
+
+// newDirectReconcilerWithInterceptors is newDirectReconciler with a hook for
+// making the client itself fail, which is the only way to reach the
+// status-write error paths.
+func newDirectReconcilerWithInterceptors(t *testing.T, at *atev1alpha1.ActorTemplate, funcs interceptor.Funcs) (*ActorTemplateReconciler, *fakeControlClient, chan string) {
+	t.Helper()
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -349,6 +359,7 @@ func newDirectReconciler(t *testing.T, at *atev1alpha1.ActorTemplate) (*ActorTem
 		WithScheme(scheme).
 		WithObjects(at).
 		WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
+		WithInterceptorFuncs(funcs).
 		Build()
 
 	ate := newFakeControlClient()
@@ -630,5 +641,83 @@ func TestActorTemplateSetupWithManagerRefusesNilRecorder(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Recorder") {
 		t.Errorf("error %q does not name the missing field", err)
+	}
+}
+
+// TestActorTemplateGetFailureIsNotSwallowed covers the initial fetch: NotFound
+// means the template was deleted and is a clean no-op (TestMissingTemplateIsANoOp),
+// anything else is a real failure that must propagate.
+func TestActorTemplateGetFailureIsNotSwallowed(t *testing.T) {
+	at := makeActorTemplate("direct-get-fail", "default")
+	r, _, events := newDirectReconcilerWithInterceptors(t, at, interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*atev1alpha1.ActorTemplate); ok {
+				return k8errors.NewInternalError(errInjected)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	if err := reconcileOnce(t, r, at); err == nil {
+		t.Fatal("expected a non-NotFound fetch failure to propagate")
+	}
+	wantNoEvents(t, events)
+}
+
+// TestStatusUpdateFailureIsSurfaced covers the three status writes, one per
+// phase transition.
+//
+// The property worth pinning is the ORDERING, not just the error return. In
+// every phase the Recorder.Eventf call sits after the Status().Update, so a
+// failed write must return before the event fires. Swallow the write error --
+// or emit first and persist second -- and the controller announces "Created
+// golden actor" / "Resumed golden actor" for a phase that never persisted,
+// while the next reconcile redoes the work from the top and creates a SECOND
+// golden actor. An operator reading the events would have no way to see that.
+func TestStatusUpdateFailureIsSurfaced(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(at *atev1alpha1.ActorTemplate)
+	}{
+		{
+			name:  "initial",
+			setup: func(at *atev1alpha1.ActorTemplate) { at.Status.Phase = atev1alpha1.PhaseInitial },
+		},
+		{
+			name: "resume",
+			setup: func(at *atev1alpha1.ActorTemplate) {
+				at.Status.Phase = atev1alpha1.PhaseResumeGoldenActor
+				at.Status.GoldenActorID = "actor-1"
+			},
+		},
+		{
+			name: "wait",
+			setup: func(at *atev1alpha1.ActorTemplate) {
+				at.Status.Phase = atev1alpha1.PhaseWaitGoldenActor
+				at.Status.GoldenActorID = "actor-1"
+				at.Status.TakeGoldenSnapshotAt = metav1.NewTime(time.Now().Add(-time.Minute))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			at := makeActorTemplate("status-fail-"+tt.name, "default")
+			tt.setup(at)
+
+			r, ate, events := newDirectReconcilerWithInterceptors(t, at, interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					return k8errors.NewInternalError(errInjected)
+				},
+			})
+			ate.snapshotType = ateapipb.SnapshotType_SNAPSHOT_TYPE_EXTERNAL
+			ate.snapshotURI = "gs://test-bucket/golden"
+
+			if err := reconcileOnce(t, r, at); err == nil {
+				t.Fatal("a failed status write must return an error so the request is retried")
+			}
+			// The phase never persisted, so claiming it advanced would be a lie.
+			wantNoEvents(t, events)
+		})
 	}
 }
