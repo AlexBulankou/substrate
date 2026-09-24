@@ -141,15 +141,26 @@ func TestCreateNetNSWithoutSwitchingReplacesALeftover(t *testing.T) {
 // and /proc/sys is left as it was found. Remounting it read-only on the way
 // out would break every later write.
 func TestSetNetSysctlReportsAnUnrelatedError(t *testing.T) {
+	// Sampled before the call, because the invariant is that setNetSysctl
+	// leaves the mount as it found it -- not that it finds it writable. Plenty
+	// of containers mount /proc/sys read-only to begin with, and asserting the
+	// absolute state fails those for behaving correctly.
+	before := procSysReadOnly(t)
+
 	err := setNetSysctl("net/ipv4/ateomnet_no_such_sysctl", "0")
 	if !errors.Is(err, unix.ENOENT) {
 		t.Fatalf("setNetSysctl() on a missing key: got %v, want ENOENT", err)
 	}
+	if after := procSysReadOnly(t); after != before {
+		t.Errorf("setNetSysctl() left /proc/sys read-only = %v, want it as found (%v)", after, before)
+	}
+}
+
+func procSysReadOnly(t *testing.T) bool {
+	t.Helper()
 	var st unix.Statfs_t
 	if err := unix.Statfs("/proc/sys", &st); err != nil {
 		t.Fatalf("statfs /proc/sys: %v", err)
 	}
-	if st.Flags&unix.ST_RDONLY != 0 {
-		t.Error("/proc/sys was left read-only")
-	}
+	return st.Flags&unix.ST_RDONLY != 0
 }
