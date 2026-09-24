@@ -419,6 +419,15 @@ spec:
           status:
             description: status is the observed state of WorkerPool
             properties:
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the .metadata.generation the controller last
+                  reconciled into this status. When it is less than .metadata.generation,
+                  the other values here describe an earlier spec and should not be read as
+                  the result of the current one.
+                format: int64
+                minimum: 0
+                type: integer
               replicas:
                 description: Replicas is the total number of worker pods.
                 format: int32

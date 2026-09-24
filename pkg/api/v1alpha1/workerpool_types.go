@@ -93,6 +93,14 @@ type WorkerPoolStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Replicas int32 `json:"replicas"`
+
+	// ObservedGeneration is the .metadata.generation the controller last
+	// reconciled into this status. When it is less than .metadata.generation,
+	// the other values here describe an earlier spec and should not be read as
+	// the result of the current one.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // WorkerPool is the Schema for the workerpools API
