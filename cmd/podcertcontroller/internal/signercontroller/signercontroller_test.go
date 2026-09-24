@@ -71,9 +71,10 @@ var _ clock.PassiveClock = fixedClock{}
 // recordings are mutex-guarded and only reachable through accessors that hand
 // back a copy.
 type fakeSigner struct {
-	name string
-	ctbs []*certsv1beta1.ClusterTrustBundle
-	err  error
+	name   string
+	ctbs   []*certsv1beta1.ClusterTrustBundle
+	ctbErr error
+	err    error
 
 	mu       sync.Mutex
 	seen     []*certsv1beta1.PodCertificateRequest
@@ -82,11 +83,15 @@ type fakeSigner struct {
 
 func (f *fakeSigner) SignerName() string { return f.name }
 
-func (f *fakeSigner) DesiredClusterTrustBundles() []*certsv1beta1.ClusterTrustBundle {
+func (f *fakeSigner) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ctbCalls++
-	return f.ctbs
+	// Deliberately returns ctbs alongside ctbErr rather than nil.  A fake that
+	// returned nil on error would make "the controller checked the error" and
+	// "the controller ignored the error and found nothing to do" produce
+	// identical observable behaviour, so the test could not tell them apart.
+	return f.ctbs, f.ctbErr
 }
 
 func (f *fakeSigner) MakeCert(_ context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
@@ -437,7 +442,7 @@ func TestRunReturnsWhenTheContextIsAlreadyCancelled(t *testing.T) {
 	// return rather than block a shutting-down process.
 	done := make(chan struct{})
 	go func() {
-		c.Run(ctx)
+		c.Run(ctx, 1)
 		close(done)
 	}()
 
@@ -728,4 +733,56 @@ func writeActions(kc *fake.Clientset) []string {
 		}
 	}
 	return out
+}
+
+// TestEnsureBundlesTouchesNothingWhenTheSignerCannotSayWhatItWants covers the
+// branch that makes DesiredClusterTrustBundles fallible.
+//
+// This is the one error return in ensureBundles where doing nothing is clearly
+// right, and it is worth pinning precisely because the alternative is so
+// damaging: if a failed trust-anchor read were treated as "this signer wants
+// no bundles", the reconcile below would see a live bundle with no desired
+// counterpart.  Today that is harmless -- the loop only creates and updates --
+// but the moment anyone adds deletion of unwanted bundles, a transient CA-read
+// failure would take out the bundle every relying party verifies against.
+func TestEnsureBundlesTouchesNothingWhenTheSignerCannotSayWhatItWants(t *testing.T) {
+	signer := &fakeSigner{
+		name:   testSignerName,
+		ctbErr: errors.New("injected trust-anchor failure"),
+		// Non-empty, so a controller that ignored the error would visibly
+		// reconcile these and fail the assertion below.
+		ctbs: []*certsv1beta1.ClusterTrustBundle{testCTB("bundle-a", "anchor-a")},
+	}
+	hasher := &fakeHasher{assigned: true}
+	c, kc := newTestController(t, signer, hasher)
+
+	c.ensureBundles(context.Background())
+
+	if got := signer.ctbCallCount(); got != 1 {
+		t.Errorf("DesiredClusterTrustBundles called %d times, want 1", got)
+	}
+	for _, action := range kc.Actions() {
+		if action.GetResource().Resource == "clustertrustbundles" {
+			t.Errorf("ensureBundles issued %q against ClusterTrustBundles after the signer failed",
+				action.GetVerb())
+		}
+	}
+}
+
+// The assignment check has to come first: a replica that is not the bundle
+// maintainer should not even ask the signer for its trust anchors, which on a
+// RefreshingPool means a disk read on every replica every five seconds.
+func TestEnsureBundlesDoesNotConsultTheSignerWhenUnassigned(t *testing.T) {
+	signer := &fakeSigner{
+		name: testSignerName,
+		ctbs: []*certsv1beta1.ClusterTrustBundle{testCTB("bundle-a", "anchor-a")},
+	}
+	hasher := &fakeHasher{assigned: false}
+	c, _ := newTestController(t, signer, hasher)
+
+	c.ensureBundles(context.Background())
+
+	if got := signer.ctbCallCount(); got != 0 {
+		t.Errorf("DesiredClusterTrustBundles called %d times on an unassigned replica, want 0", got)
+	}
 }
