@@ -15,6 +15,7 @@
 package csi
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -394,13 +395,28 @@ func resolveTLSConfig(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (*tls.Confi
 	}, nil
 }
 
-// caPoolCache holds the parsed *x509.CertPool and file stat so unchanged CA trust bundles
-// are not re-read from disk on every TLS handshake.
+// caPoolCache holds the parsed *x509.CertPool and the bytes it was parsed from, so an
+// unchanged CA trust bundle is not re-parsed on every TLS handshake.
+//
+// Invalidation compares the file's contents rather than its stat. A stat triple
+// (same-file, mtime, size) cannot distinguish a rotated bundle from an untouched one when
+// the rewrite is in place, the new bundle encodes to the same length, and the write lands
+// in the same filesystem timestamp tick as the write the cache last observed -- mtime
+// granularity is a tick (1ms on a CONFIG_HZ=1000 kernel), not a nanosecond. All three
+// coincide for a realistic rotation: a trust bundle swapped for another CA of the same key
+// type and name lengths is byte-for-byte the same size, and the driver stats the bundle
+// once at startup, immediately after whatever wrote it. The pool is consulted from
+// VerifyPeerCertificate, so the missed rotation is served as the root set a peer is
+// verified against -- the plugin keeps trusting a CA that was rotated out.
+//
+// The bundle is a few KB and the cache is read once per handshake, so re-reading it costs
+// nothing measurable next to the public-key operations that follow; the parse is what the
+// cache exists to avoid. Unchanged contents still return the identical *x509.CertPool.
 type caPoolCache struct {
 	path string
 
 	mu   sync.Mutex
-	fi   os.FileInfo
+	raw  []byte
 	pool *x509.CertPool
 }
 
@@ -408,36 +424,27 @@ func newCAPoolCache(path string) *caPoolCache {
 	return &caPoolCache{path: path}
 }
 
-// isFileUnchanged reports whether newFi is the same file as the stat the cached
-// pool was parsed from.
-func (c *caPoolCache) isFileUnchanged(newFi os.FileInfo) bool {
-	if c.fi == nil || newFi == nil {
-		return false
-	}
-	return os.SameFile(c.fi, newFi) && c.fi.ModTime().Equal(newFi.ModTime()) && c.fi.Size() == newFi.Size()
-}
-
-// getCertPool returns the parsed CA cert pool, re-reading the file only when it has changed
-// on disk (identity, modification time, or size).
+// getCertPool returns the parsed CA cert pool, re-parsing only when the file's contents
+// have changed on disk.
 func (c *caPoolCache) getCertPool() (*x509.CertPool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fi, err := os.Stat(c.path)
+	certBytes, err := os.ReadFile(c.path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stat CA cert file %q: %w", c.path, err)
+		return nil, fmt.Errorf("failed to read CA cert file %q: %w", c.path, err)
 	}
 
-	if c.pool != nil && c.isFileUnchanged(fi) {
+	if c.pool != nil && bytes.Equal(c.raw, certBytes) {
 		return c.pool, nil
 	}
 
-	pool, err := parseCertPool(c.path)
+	pool, err := parseCertPoolFromPEM(certBytes, c.path)
 	if err != nil {
 		return nil, err
 	}
 
-	c.fi, c.pool = fi, pool
+	c.raw, c.pool = certBytes, pool
 	return c.pool, nil
 }
 
@@ -446,7 +453,10 @@ func parseCertPool(path string) (*x509.CertPool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cert file %q: %w", path, err)
 	}
+	return parseCertPoolFromPEM(certBytes, path)
+}
 
+func parseCertPoolFromPEM(certBytes []byte, path string) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	if ok := pool.AppendCertsFromPEM(certBytes); !ok {
 		return nil, fmt.Errorf("failed to parse any certificates from %q", path)

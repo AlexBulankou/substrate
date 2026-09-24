@@ -365,9 +365,17 @@ func TestMTLSPicksUpCARotation(t *testing.T) {
 	plugin2.client.Close()
 }
 
+// A rotation is a CA swap, so the rotated-in bundle is what the assertions are written
+// against -- not a rewrite of the same bytes. Rewriting identical content and demanding a
+// fresh pool would pin the invalidation *mechanism* (a stat that trips on every write)
+// rather than the behaviour, and would reject a strictly-better implementation that
+// noticed the contents had not changed. It is also racy: two CAs from the same template
+// encode to the same length, so a same-tick in-place rewrite is indistinguishable from an
+// untouched file by stat alone.
 func TestCAPoolCache_HitAndFileChange(t *testing.T) {
 	t.Parallel()
 	ca := newTestCA(t)
+	rotated := newTestCA(t)
 
 	dir := t.TempDir()
 	caPath := filepath.Join(dir, "trust-bundle.pem")
@@ -389,15 +397,130 @@ func TestCAPoolCache_HitAndFileChange(t *testing.T) {
 		t.Errorf("expected cached cert pool pointer equality on unchanged file, got %p != %p", pool1, pool2)
 	}
 
-	// Modify the file.
-	writeFile(t, caPath, ca.certPEM())
+	// Rotate the trust bundle to a different CA. The encoded length is unchanged, which is
+	// what a real rotation looks like and what the previous stat-based invalidation missed.
+	rotatedPEM := rotated.certPEM()
+	if len(rotatedPEM) != len(ca.certPEM()) {
+		t.Logf("note: rotated bundle is %d bytes vs %d; the same-size case is the one that regressed", len(rotatedPEM), len(ca.certPEM()))
+	}
+	writeFile(t, caPath, rotatedPEM)
 
-	// 3rd call should detect file change and return a newly parsed pool.
+	// 3rd call should detect the rotation and return a newly parsed pool.
 	pool3, err := cache.getCertPool()
 	if err != nil {
 		t.Fatalf("failed to get cert pool: %v", err)
 	}
 	if pool1 == pool3 {
-		t.Errorf("expected new cert pool after file modification, got same pointer %p", pool3)
+		t.Errorf("expected new cert pool after CA rotation, got same pointer %p", pool3)
+	}
+
+	// Pointer inequality alone would pass for a cache that re-parsed stale bytes, so assert
+	// the pool actually carries the rotated-in CA and no longer carries the rotated-out one.
+	onDisk, err := parseCertPool(caPath)
+	if err != nil {
+		t.Fatalf("failed to parse rotated bundle: %v", err)
+	}
+	if !onDisk.Equal(pool3) {
+		t.Error("cached pool after rotation does not match the trust bundle on disk")
+	}
+	if pool1.Equal(pool3) {
+		t.Error("cached pool after rotation still trusts the rotated-out CA")
+	}
+}
+
+// The counterpart to the rotation case: a rewrite that does not change the trust bundle is
+// not a rotation, so it must not cost a re-parse. Writers that rewrite a bundle in place on
+// a timer make this the common case, not the rare one.
+func TestCAPoolCache_IdenticalRewriteKeepsTheCachedPool(t *testing.T) {
+	t.Parallel()
+	ca := newTestCA(t)
+
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "trust-bundle.pem")
+	writeFile(t, caPath, ca.certPEM())
+
+	cache := newCAPoolCache(caPath)
+	pool1, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+
+	writeFile(t, caPath, ca.certPEM())
+
+	pool2, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+	if pool1 != pool2 {
+		t.Errorf("expected the cached pool to survive a byte-identical rewrite, got %p != %p", pool1, pool2)
+	}
+}
+
+// An empty bundle on the very first read is the sharpest case, because the cache starts out
+// holding no bytes and an empty file matches no bytes: a cache that skipped its
+// already-populated check would report a hit and hand back its nil pool with a nil error.
+// A nil Roots is not "trust nothing" -- x509.Verify reads it as "use the system roots" --
+// so that path fails open, and it is reachable before any good bundle has ever been loaded.
+func TestCAPoolCache_EmptyBundleOnFirstReadIsAnError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "trust-bundle.pem")
+	writeFile(t, caPath, nil)
+
+	pool, err := newCAPoolCache(caPath).getCertPool()
+	if err == nil {
+		t.Fatalf("expected an error for an empty trust bundle, got pool %p", pool)
+	}
+	if pool != nil {
+		t.Errorf("expected a nil pool alongside the error, got %p", pool)
+	}
+}
+
+// A bundle that stops being readable or parseable must fail the handshake rather than fall
+// back to the pool already in memory: the cached roots are exactly what an operator
+// emptying or corrupting the bundle is trying to stop trusting.
+func TestCAPoolCache_UnreadableBundleDoesNotServeTheCachedPool(t *testing.T) {
+	t.Parallel()
+	ca := newTestCA(t)
+
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "trust-bundle.pem")
+	writeFile(t, caPath, ca.certPEM())
+
+	cache := newCAPoolCache(caPath)
+	if _, err := cache.getCertPool(); err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{"unparseable", func(t *testing.T) { writeFile(t, caPath, []byte("not a certificate")) }},
+		{"empty", func(t *testing.T) { writeFile(t, caPath, nil) }},
+		{"removed", func(t *testing.T) {
+			if err := os.Remove(caPath); err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reload the good bundle so each case starts from a populated cache.
+			writeFile(t, caPath, ca.certPEM())
+			if _, err := cache.getCertPool(); err != nil {
+				t.Fatalf("failed to reload good bundle: %v", err)
+			}
+
+			tc.mutate(t)
+
+			pool, err := cache.getCertPool()
+			if err == nil {
+				t.Fatalf("expected an error for a %s bundle, got pool %p", tc.name, pool)
+			}
+			if pool != nil {
+				t.Errorf("expected a nil pool alongside the error, got %p", pool)
+			}
+		})
 	}
 }
