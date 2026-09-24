@@ -213,21 +213,30 @@ func sign(payloadBytes []byte, signingKey crypto.PrivateKey, algorithm, keyID st
 	var sigBytes []byte
 	switch algorithm {
 	case "RS256":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, keyErr := rsaSigningKey(signingKey, algorithm)
+		if keyErr != nil {
+			return "", keyErr
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA256.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA256, toBeSignedDigest)
 		if err != nil {
 			return "", fmt.Errorf("while performing RSA PKCS1v15 signature: %w", err)
 		}
 	case "RS384":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, keyErr := rsaSigningKey(signingKey, algorithm)
+		if keyErr != nil {
+			return "", keyErr
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA384.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA384, toBeSignedDigest)
 		if err != nil {
 			return "", fmt.Errorf("while performing RSA PKCS1v15 signature: %w", err)
 		}
 	case "RS512":
-		rsaKey := signingKey.(*rsa.PrivateKey)
+		rsaKey, keyErr := rsaSigningKey(signingKey, algorithm)
+		if keyErr != nil {
+			return "", keyErr
+		}
 		toBeSignedDigest := hashBytes(crypto.SHA512.New(), []byte(toBeSigned))
 		sigBytes, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, crypto.SHA512, toBeSignedDigest)
 		if err != nil {
@@ -235,7 +244,10 @@ func sign(payloadBytes []byte, signingKey crypto.PrivateKey, algorithm, keyID st
 		}
 	case "ES256":
 		// JOSE ES256 defined at https://datatracker.ietf.org/doc/rfc7518/ section 3.4
-		ecdsaKey := signingKey.(*ecdsa.PrivateKey)
+		ecdsaKey, keyErr := ecdsaSigningKey(signingKey, algorithm)
+		if keyErr != nil {
+			return "", keyErr
+		}
 		if ecdsaKey.Curve != elliptic.P256() {
 			return "", fmt.Errorf("ES256 requires a P256 key")
 		}
@@ -254,6 +266,29 @@ func sign(payloadBytes []byte, signingKey crypto.PrivateKey, algorithm, keyID st
 	sigB64 := base64.RawURLEncoding.EncodeToString(sigBytes)
 
 	return toBeSigned + "." + sigB64, nil
+}
+
+// rsaSigningKey and ecdsaSigningKey check the algorithm against the key type
+// rather than asserting it. Nothing validates the pairing when a pool is
+// loaded -- Unmarshal takes the algorithm as a string and the key as PKCS#8,
+// independently -- so an authority that names RS256 and carries an ECDSA key
+// is a routine hand-edit or a mismatched rotation, not a programming error.
+// Asserted, it panics inside whatever request happens to be signing; checked,
+// it fails that one request with a message naming both halves.
+func rsaSigningKey(signingKey crypto.PrivateKey, algorithm string) (*rsa.PrivateKey, error) {
+	key, ok := signingKey.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("algorithm %q requires an RSA key, got %T", algorithm, signingKey)
+	}
+	return key, nil
+}
+
+func ecdsaSigningKey(signingKey crypto.PrivateKey, algorithm string) (*ecdsa.PrivateKey, error) {
+	key, ok := signingKey.(*ecdsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("algorithm %q requires an ECDSA key, got %T", algorithm, signingKey)
+	}
+	return key, nil
 }
 
 func hashBytes(hasher hash.Hash, bytes []byte) []byte {
@@ -328,8 +363,17 @@ func Unmarshal(wireBytes []byte) (*ConcretePool, error) {
 			return nil, fmt.Errorf("while parsing signing key: %w", err)
 		}
 
-		// All key types from ParsePKCS8PrivateKey implement Signer
-		authority.SigningKey = key.(crypto.Signer)
+		// Not all key types from ParsePKCS8PrivateKey implement Signer: an
+		// X25519 key parses to *ecdh.PrivateKey, which is a key-agreement key
+		// and cannot sign. Checked rather than asserted because the pool file
+		// is operator-supplied and RefreshingPool re-reads it on a timer, so an
+		// unchecked assertion turns one bad key into a crash loop across every
+		// replica rather than an error on one request.
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("authority %q: signing key of type %T cannot sign", wireAuthority.ID, key)
+		}
+		authority.SigningKey = signer
 
 		pool.Authorities = append(pool.Authorities, authority)
 	}
