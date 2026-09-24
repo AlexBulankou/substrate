@@ -138,10 +138,18 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 		return fmt.Errorf("failed to convert Deployment selector: %w", err)
 	}
 
+	// ObservedGeneration is stamped here, after applyDeployment has returned
+	// without error, so it means "the spec at this generation has been
+	// applied" rather than "the controller saw this generation".
+	// reconcileWorkerPool returns before this call both when the apply fails
+	// and when the Deployment is not yet readable, so neither path can
+	// advertise an unapplied generation as observed -- the status stays at
+	// the older generation, which is the honest reading.
 	want := atev1alpha1.WorkerPoolStatus{
-		Replicas:      dep.Status.Replicas,
-		ReadyReplicas: dep.Status.ReadyReplicas,
-		Selector:      selector.String(),
+		Replicas:           dep.Status.Replicas,
+		ReadyReplicas:      dep.Status.ReadyReplicas,
+		Selector:           selector.String(),
+		ObservedGeneration: wp.Generation,
 	}
 	if equality.Semantic.DeepEqual(wp.Status, want) {
 		return nil
