@@ -250,6 +250,141 @@ func TestClientDialContextValidatesInput(t *testing.T) {
 
 // dialFixedAddress ignores the requested address and connects to address, so
 // tests can point a client at a listener on an ephemeral port.
+const actorSPIFFEID = "spiffe://substrate-actor.local/atespace/team/actor/actor"
+
+// newTrustRotationClient builds a client trusting trustCA and presenting cert,
+// and returns it with the path of its trust bundle so a test can rotate what it
+// trusts.
+func newTrustRotationClient(t *testing.T, trustCA *testCA, cert tls.Certificate, opts ...ClientOption) (*Client, string) {
+	t.Helper()
+	trustPath := filepath.Join(t.TempDir(), "trust.pem")
+	if err := os.WriteFile(trustPath, trustCA.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewClient(ClientConfig{
+		GatewayAddress:       "127.0.0.1:1",
+		ServerName:           "egress.test",
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil },
+		TrustBundlePath:      trustPath,
+	}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, trustPath
+}
+
+// serveTrustRotationGateway serves a front door presenting a certificate from
+// ca and answering every CONNECT with 200, for as many connections as the test
+// makes. Handshake failures are ignored rather than reported: a rotation test
+// expects the first dial to be refused.
+func serveTrustRotationGateway(t *testing.T, ca *testCA) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCAs := x509.NewCertPool()
+	clientCAs.AppendCertsFromPEM(ca.certPEM)
+	tlsListener := tls.NewListener(listener, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{issueDNSCertificate(t, ca, "egress.test")},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+	})
+	t.Cleanup(func() { _ = tlsListener.Close() })
+	go func() {
+		for {
+			conn, err := tlsListener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+					return
+				}
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// TestClientDialContextFollowsATrustBundleRotation pins why RootCAs is supplied
+// per dial rather than frozen into the client's config: RootCAs is immutable
+// once a config is in use, so a client built before a CA rotation would refuse
+// the gateway until its pod restarted -- with the actor's own certificate
+// already renewed under the new CA, which is the state kubelet leaves it in.
+func TestClientDialContextFollowsATrustBundleRotation(t *testing.T) {
+	oldCA, rotatedCA := newTestCA(t), newTestCA(t)
+	gatewayAddress := serveTrustRotationGateway(t, rotatedCA)
+	cert := rotatedCA.issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	client, trustPath := newTrustRotationClient(t, oldCA, cert, WithDialer(dialFixedAddress(gatewayAddress)))
+
+	if _, err := client.DialContext(context.Background(), "192.0.2.10:443"); !errors.Is(err, ErrGatewayHandshake) {
+		t.Fatalf("DialContext() before the rotation: error = %v, want ErrGatewayHandshake", err)
+	}
+
+	rotateTrustBundle(t, trustPath, rotatedCA)
+
+	conn, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err != nil {
+		t.Fatalf("DialContext() after the rotation: %v", err)
+	}
+	conn.Close()
+}
+
+func TestClientDialContextFailsClosedOnAnUnreadableTrustBundle(t *testing.T) {
+	ca := newTestCA(t)
+	gatewayAddress := serveTrustRotationGateway(t, ca)
+	cert := ca.issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	var dialed bool
+	dial := dialFixedAddress(gatewayAddress)
+	client, trustPath := newTrustRotationClient(t, ca, cert, WithDialer(
+		func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialed = true
+			return dial(ctx, network, address)
+		}))
+
+	if err := os.Remove(trustPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err == nil {
+		t.Fatal("DialContext() error = nil after the trust bundle disappeared, want a refusal")
+	}
+	// Asserting the reason, not just the refusal: a discarded reload error
+	// leaves RootCAs nil, and a nil RootCAs means "verify against the system
+	// trust store" -- which also refuses this gateway, but by widening the
+	// trust set rather than holding it.
+	if !strings.Contains(err.Error(), "reloading trust bundle") {
+		t.Errorf("DialContext() error = %q, want the trust-bundle reload failure", err)
+	}
+	// The reload happens before the dial, so a bundle that has gone away does
+	// not leave a connected socket with no owner.
+	if dialed {
+		t.Error("DialContext() connected to the gateway before reading the trust bundle, leaving the socket unowned")
+	}
+}
+
+// TestNewClientRejectsAnUnreadableTrustBundle pins the startup read. Loading
+// the bundle lazily per dial would otherwise let a client with a misprojected
+// volume construct successfully and fail only when an actor first tries to
+// reach the internet, which reports the misconfiguration as an egress outage.
+func TestNewClientRejectsAnUnreadableTrustBundle(t *testing.T) {
+	cert := newTestCA(t).issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	if _, err := NewClient(ClientConfig{
+		GatewayAddress:       "127.0.0.1:1",
+		ServerName:           "egress.test",
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &cert, nil },
+		TrustBundlePath:      filepath.Join(t.TempDir(), "absent.pem"),
+	}); err == nil {
+		t.Fatal("NewClient() error = nil for a trust bundle that does not exist, want a refusal")
+	}
+}
+
 func dialFixedAddress(address string) DialFunc {
 	return func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, address)
