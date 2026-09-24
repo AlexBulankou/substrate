@@ -196,6 +196,7 @@ func main() {
 	if err = (&controllers.WorkerPoolReconciler{
 		Client:                   mgr.GetClient(),
 		Scheme:                   mgr.GetScheme(),
+		Recorder:                 mgr.GetEventRecorderFor("workerpool-controller"),
 		OTelEndpoint:             *otelEndpoint,
 		OTelMetricExportInterval: *otelMetricExportInterval,
 		OTelMetricExportTimeout:  *otelMetricExportTimeout,
