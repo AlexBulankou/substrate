@@ -21,6 +21,7 @@
 package testca
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -223,6 +224,53 @@ func Handshake(t *testing.T, creds credentials.TransportCredentials, serverRoots
 		return false, server.err
 	}
 	return server.identified, clientErr
+}
+
+// ClientHandshake is the mirror of Handshake: it drives client credentials
+// against a plain TLS server presenting serverCert, and returns the client's
+// error. authority is passed through to creds.ClientHandshake, so it carries
+// the host:port form a gRPC dialer would supply.
+//
+// The server offers "h2" because gRPC's credentials check the negotiated
+// protocol after the handshake; a server that offers nothing fails the client
+// for a reason unrelated to what a test asks.
+func ClientHandshake(t *testing.T, creds credentials.TransportCredentials, serverCert Leaf, authority string) error {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer lis.Close()
+
+	go func() {
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		srv := tls.Server(conn, &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{{Certificate: [][]byte{serverCert.DER}, PrivateKey: serverCert.Key}},
+			NextProtos:   []string{"h2"},
+		})
+		// The error is the client's to report: a server-side failure here is
+		// always the far end of the rejection the test is about to see.
+		_ = srv.Handshake()
+	}()
+
+	raw, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	wrapped, _, err := creds.ClientHandshake(ctx, authority, raw)
+	if wrapped != nil {
+		wrapped.Close()
+	}
+	return err
 }
 
 // WriteBundle writes a trust-bundle file at the given mtime. Rotation tests
