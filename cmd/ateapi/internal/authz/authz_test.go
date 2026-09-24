@@ -17,9 +17,6 @@ package authz
 import (
 	"context"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -30,36 +27,27 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
 )
 
-func configureDockerEnv(ctx context.Context) error {
-	if os.Getenv("DOCKER_HOST") != "" {
-		return nil
+// skipWithoutDocker ends the test on an unavailable container: a skip on a
+// workstation, a failure wherever a container is required. Skipping
+// unconditionally is what turns this package -- the only test of the
+// authorization-model bootstrap -- into a silent pass in CI.
+func skipWithoutDocker(t *testing.T, err error) {
+	t.Helper()
+	if dockerenv.Required() {
+		t.Fatalf("PostgreSQL testcontainer unavailable and required (CI or REQUIRE_DOCKER is set): %v", err)
 	}
-	output, err := exec.CommandContext(ctx, "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}").Output()
-	if err != nil {
-		return err
-	}
-	host := strings.TrimSpace(string(output))
-	if host == "" {
-		return nil
-	}
-	_ = os.Setenv("DOCKER_HOST", host)
-	if os.Getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE") == "" {
-		socket := host
-		if runtime.GOOS == "darwin" {
-			socket = "/var/run/docker.sock"
-		}
-		_ = os.Setenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE", socket)
-	}
-	return nil
+	t.Skipf("PostgreSQL testcontainer unavailable (requires Docker): %v", err)
 }
 
 func startPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
-	if err := configureDockerEnv(ctx); err != nil {
-		t.Skipf("skipping test; docker is unavailable: %v", err)
+	if err := dockerenv.Configure(ctx); err != nil {
+		skipWithoutDocker(t, err)
 	}
 
 	pgContainer, err := postgres.Run(ctx,
@@ -70,7 +58,7 @@ func startPostgres(t *testing.T) *pgxpool.Pool {
 		postgres.BasicWaitStrategies(),
 	)
 	if err != nil {
-		t.Skipf("skipping test; failed to start postgres container: %v", err)
+		skipWithoutDocker(t, err)
 	}
 	t.Cleanup(func() {
 		_ = testcontainers.TerminateContainer(pgContainer)

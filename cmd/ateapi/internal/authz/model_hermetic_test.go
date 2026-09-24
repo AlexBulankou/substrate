@@ -15,9 +15,10 @@
 // Hermetic tests for the authorization model and the comparison that decides
 // whether to write it.
 //
-// server_test.go covers the same package end-to-end, but it stands up
-// PostgreSQL through testcontainers and skips outright when Docker is not
-// reachable -- which is the normal case in CI and in an agent pod.  Everything
+// authz_test.go covers the same package end-to-end, but it stands up
+// PostgreSQL through testcontainers, so it does not run at all where Docker is
+// unreachable -- the normal case in an agent pod, and a hard failure rather
+// than a skip wherever dockerenv.Required holds.  Everything
 // here runs with no daemon, no network and no container, so the parts of the
 // authz bootstrap that do not need a datastore stay covered in the
 // environments that actually run the suite.
