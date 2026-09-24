@@ -885,13 +885,15 @@ func listSnapshotFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
+// stopContainers stops the actor's application containers. The pause container
+// is left running: it is the sandbox, and cleanupContainers deletes the others
+// through it before deleting it last. Killing it first leaves the sentry a
+// zombie until reaped, which runsc delete mistakes for a live sandbox.
 func stopContainers(ctx context.Context, rcmd containerRuntime, containers []*ateompb.Container) {
 	for _, ctr := range containers {
 		_ = rcmd.cmdKill(ctx, ctr.GetName(), "SIGKILL")
 		_ = rcmd.cmdWait(ctx, ctr.GetName())
 	}
-	_ = rcmd.cmdKill(ctx, ocispec.PauseContainer, "SIGKILL")
-	_ = rcmd.cmdWait(ctx, ocispec.PauseContainer)
 }
 
 func cleanupContainers(ctx context.Context, rcmd containerRuntime, containers []*ateompb.Container) error {
@@ -1169,7 +1171,9 @@ func (s *AteomService) terminateWorkload(ctx context.Context, actorRef resources
 	// container without its record and the actor unrecoverable.
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	// Stop the containers before deleting them, to avoid leaving a live container with no bundle on disk. Best-effort: if the containers are already stopped, the delete will succeed anyway.
+	// Stop the containers before deleting them, to avoid leaving a live container
+	// with no bundle on disk. Best-effort: if they are already stopped, the
+	// delete succeeds anyway.
 	stopContainers(cleanupCtx, rcmd, containers)
 	// Keep this as best-effort cleanup:
 	// atelet resets the actor runsc, bundle, pidfile, and checkpoint
