@@ -25,6 +25,7 @@ import (
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	certsv1beta1ac "k8s.io/client-go/applyconfigurations/certificates/v1beta1"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,9 +42,24 @@ import (
 type EgressMITMTrustReconciler struct {
 	client.Client
 
+	// Recorder publishes onto the CA pool Secret -- the object an operator
+	// edits when they rotate the pool, and so the one they look at when the
+	// rotation does not take. The derived ClusterTrustBundle is cluster-scoped
+	// and would file its events under the default namespace, away from the
+	// input that caused them.
+	Recorder record.EventRecorder
+
 	// SystemNamespace is the namespace holding the egress MITM CA pool Secret.
 	SystemNamespace string
 }
+
+// Event reasons emitted on the CA pool Secret.
+const (
+	// reasonTrustBundleInvalid marks a pool the bundle cannot be derived from.
+	reasonTrustBundleInvalid = "TrustBundleInvalid"
+	// reasonTrustBundleApplyFailed marks a failed apply of the derived bundle.
+	reasonTrustBundleApplyFailed = "TrustBundleApplyFailed"
+)
 
 // EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway's
 // sdsmint sidecar signs per-SNI leaves with.
@@ -55,6 +71,7 @@ func EgressMITMCAPoolRef(systemNamespace string) types.NamespacedName {
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 //+kubebuilder:rbac:groups=certificates.k8s.io,resources=clustertrustbundles,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=certificates.k8s.io,resources=signers,resourceNames=egress-mitm.ate.dev/*,verbs=attest
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -77,6 +94,12 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	trustBundle, err := egressMITMTrustBundlePEM(secret)
 	if err != nil {
+		// The operator wrote this Secret by hand or with kubectl-ate, so a pool
+		// the controller cannot parse is an input error they can fix -- but
+		// only if they are told. Until the derive succeeds the previous bundle
+		// stays live, which makes the failure quiet as well as consequential.
+		r.Recorder.Eventf(secret, corev1.EventTypeWarning, reasonTrustBundleInvalid,
+			"Cannot derive the egress MITM trust bundle: %v", err)
 		return ctrl.Result{}, fmt.Errorf("failed to derive the egress MITM trust bundle from %q: %w", req.NamespacedName, err)
 	}
 
@@ -87,8 +110,15 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// without clobbering anything a different manager legitimately set.
 	const egressMITMTrustFieldOwner = "ate-egress-mitm-trust"
 	if err := r.Apply(ctx, ctbAC, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
+		r.Recorder.Eventf(secret, corev1.EventTypeWarning, reasonTrustBundleApplyFailed,
+			"Failed to apply ClusterTrustBundle %s: %v", *ctbAC.Name, err)
 		return ctrl.Result{}, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err)
 	}
+	// Warnings only, for two reasons. The apply is unguarded, so a success
+	// event would fire on every resync rather than on a change. And the delete
+	// path -- including its signer-mismatch refusal, which does strand a stale
+	// bundle -- is reached with the pool Secret already gone, leaving no object
+	// to attach an event to; that gap wants a different surface than Events.
 	log.Info("reconciled the egress MITM trust bundle",
 		"name", *ctbAC.Name,
 		"secret", req.NamespacedName.String())
@@ -165,6 +195,12 @@ func (r *EgressMITMTrustReconciler) deleteTrustBundle(ctx context.Context) error
 }
 
 func (r *EgressMITMTrustReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Fail closed rather than start with events silently disabled, same as the
+	// other two reconcilers in this package.
+	if r.Recorder == nil {
+		return fmt.Errorf("EgressMITMTrustReconciler: Recorder must be set")
+	}
+
 	poolRef := EgressMITMCAPoolRef(r.SystemNamespace)
 
 	// The pool Secret is the only object reconciled from. The bundle is watched

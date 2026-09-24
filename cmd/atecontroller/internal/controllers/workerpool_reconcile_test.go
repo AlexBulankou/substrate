@@ -33,6 +33,10 @@ package controllers
 // FakeRecorder proves "Eventf was called with these arguments", and the "an
 // Event actually lands in the API server" half is proven separately against the
 // real server by TestWorkerPoolEmitsSyncedEvent.
+//
+// wantEvent and wantNoEvents at the bottom of this file are shared with the
+// NetworkPolicy and EgressMITMTrust error-path tests, which are in the same
+// package and take the same approach for the same reason.
 
 import (
 	"context"
