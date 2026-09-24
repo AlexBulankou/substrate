@@ -48,7 +48,11 @@ import (
 // around the moment the test ran.  A tolerance still pins the two things that
 // matter -- the backdate and the lifetime arithmetic -- because the slack is
 // far smaller than either.
-const clockSlack = 2 * time.Minute
+// clockSlack must stay well below the 2-minute backdate MakeCert applies to
+// NotBefore.  At exactly 2 minutes a cert issued with no backdate at all sits
+// on the boundary and still compares equal, so the tolerance would silently
+// swallow the very behaviour the NotBefore assertions exist to pin.
+const clockSlack = 30 * time.Second
 
 const (
 	testNamespace = "test-ns"
@@ -180,6 +184,12 @@ func TestMakeCertDNSNamesCoverOnlySelectingServices(t *testing.T) {
 		testService("selects-us", corev1.ServiceTypeClusterIP, testLabels),
 		testService("also-selects-us", corev1.ServiceTypeNodePort, testLabels),
 		testService("selects-someone-else", corev1.ServiceTypeClusterIP, otherLabels),
+		// A selector-less ClusterIP Service clears the type filter and must be
+		// skipped by the empty-selector guard.  Without that guard its nil
+		// selector formats to the empty label selector, which matches every
+		// pod in the namespace --- including ours --- so this Service's name
+		// would be wrongly added as a SAN.
+		testService("selects-nobody", corev1.ServiceTypeClusterIP, nil),
 		pcr)
 
 	leaf, _ := issuedCert(t, impl, kc, pcr)

@@ -34,6 +34,11 @@
 //     early-return-on-failed-sync path is covered.
 //   - the slog.ErrorContext calls on the failure paths: the paths themselves
 //     are covered, the logging is not an observable contract.
+//   - the DeepCopy before ensureBundles mutates a fetched ClusterTrustBundle.
+//     The object comes from a live API Get, not from the informer cache, so
+//     both the real client and the fake hand back an object nobody else holds.
+//     The copy is defensive against a future switch to a lister; removing it
+//     changes nothing observable today.
 package signercontroller
 
 import (
@@ -99,6 +104,14 @@ func (f *fakeSigner) MakeCert(_ context.Context, pcr *certsv1beta1.PodCertificat
 	defer f.mu.Unlock()
 	f.seen = append(f.seen, pcr)
 	return f.err
+}
+
+// setErr changes what MakeCert returns on subsequent calls.  MakeCert reads
+// err under the mutex, so writes have to take it too.
+func (f *fakeSigner) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 // signed returns the requests MakeCert was called with, oldest first.
@@ -341,6 +354,41 @@ func TestProcessNextWorkItemRetriesAfterASigningFailure(t *testing.T) {
 	}
 
 	waitForQueueLen(t, c, 1)
+}
+
+// TestProcessNextWorkItemForgetsAKeyThatEventuallySucceeds pins the Forget
+// call on the success path.  Queue length cannot see it: a successful item is
+// never re-added, so it stays at zero whether or not Forget ran.  The only
+// observable is the rate limiter's retry count for the key, which Forget
+// resets and which otherwise keeps climbing --- so a key that failed once and
+// then succeeded would be rate-limited as though it were still failing.
+func TestProcessNextWorkItemForgetsAKeyThatEventuallySucceeds(t *testing.T) {
+	signer := &fakeSigner{name: testSignerName, err: errors.New("transient")}
+	hasher := &fakeHasher{assigned: true}
+	c, _ := newTestController(t, signer, hasher)
+
+	if err := c.pcrInformer.GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
+		t.Fatalf("seeding indexer: %v", err)
+	}
+	c.pcrQueue.Add("ns1/pcr1")
+
+	// First pass fails, so the key is requeued with a retry count.
+	if !c.processNextWorkItem(context.Background()) {
+		t.Fatal("processNextWorkItem returned false while the queue was live")
+	}
+	waitForQueueLen(t, c, 1)
+	if got := c.pcrQueue.NumRequeues("ns1/pcr1"); got == 0 {
+		t.Fatalf("NumRequeues = 0 after a failure, want a nonzero retry count")
+	}
+
+	// Second pass succeeds, which must clear the retry count.
+	signer.setErr(nil)
+	if !c.processNextWorkItem(context.Background()) {
+		t.Fatal("processNextWorkItem returned false while the queue was live")
+	}
+	if got := c.pcrQueue.NumRequeues("ns1/pcr1"); got != 0 {
+		t.Errorf("NumRequeues = %d after a success, want 0 --- the key was not forgotten", got)
+	}
 }
 
 func TestProcessNextWorkItemDropsAKeyWithNoObject(t *testing.T) {
