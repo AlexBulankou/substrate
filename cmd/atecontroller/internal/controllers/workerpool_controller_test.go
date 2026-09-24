@@ -336,6 +336,70 @@ func TestStatusReplicasPropagation(t *testing.T) {
 	})
 }
 
+// TestStatusObservedGenerationTracksSpec verifies that status.observedGeneration
+// reports which spec generation the rest of the status describes.
+//
+// Without it a client cannot distinguish "the controller has applied this spec
+// and the outcome is Replicas" from "the controller has not reached this spec
+// yet and Replicas is left over from the previous one" -- the two are
+// byte-identical on the wire.
+//
+// This also covers the CRD schema: an unpruned status field has to be declared
+// in manifests/ate-install/generated, so if the generated CRD loses
+// observedGeneration the API server prunes it and this test reads 0.
+func TestStatusObservedGenerationTracksSpec(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	wp := makeWorkerPool("test-observedgen", "default", 1, "ateom:v1")
+	if err := k8sClient.Create(ctx, wp); err != nil {
+		t.Fatalf("create WorkerPool: %v", err)
+	}
+	deleteOnCleanup(t, wp)
+
+	key := types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}
+
+	var firstGen int64
+	eventually(t, func(ctx context.Context) (bool, error) {
+		current := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, key, current); err != nil {
+			return false, nil
+		}
+		if current.Generation == 0 || current.Status.ObservedGeneration != current.Generation {
+			return false, nil
+		}
+		firstGen = current.Generation
+		return true, nil
+	})
+
+	// Change the spec. The API server bumps metadata.generation, which leaves
+	// the rest of status describing the OLD spec until the controller catches
+	// up -- exactly the window this field exists to make visible.
+	current := &atev1alpha1.WorkerPool{}
+	if err := k8sClient.Get(ctx, key, current); err != nil {
+		t.Fatalf("get WorkerPool: %v", err)
+	}
+	current.Spec.Replicas = 4
+	if err := k8sClient.Update(ctx, current); err != nil {
+		t.Fatalf("update WorkerPool spec: %v", err)
+	}
+
+	// Drive the assertion to a second generation on purpose. A controller that
+	// stamped a constant, or that stamped 1, would satisfy an equality check
+	// taken only at creation time.
+	secondGen := current.Generation
+	if secondGen <= firstGen {
+		t.Fatalf("spec update did not bump generation: %d, was %d", secondGen, firstGen)
+	}
+
+	eventually(t, func(ctx context.Context) (bool, error) {
+		latest := &atev1alpha1.WorkerPool{}
+		if err := k8sClient.Get(ctx, key, latest); err != nil {
+			return false, nil
+		}
+		return latest.Status.ObservedGeneration == secondGen, nil
+	})
+}
+
 func sampleWorkerPoolPodTemplate() *atev1alpha1.WorkerPoolPodTemplate {
 	return &atev1alpha1.WorkerPoolPodTemplate{
 		NodeSelector: map[string]string{
