@@ -49,6 +49,13 @@ var (
 	k8sClient  client.Client
 	testCtx    context.Context
 	testCancel context.CancelFunc
+
+	// fakeAte backs the ActorTemplate reconciler for the whole package. It is
+	// process-wide because controller-runtime enforces controller-name
+	// uniqueness per process, so there is exactly one registration to hang it
+	// off; see actortemplate_reconcile_test.go for how tests keep their error
+	// injection from colliding.
+	fakeAte *fakeControlClient
 )
 
 func TestMain(m *testing.M) {
@@ -95,6 +102,17 @@ func TestMain(m *testing.M) {
 		Recorder: mgr.GetEventRecorderFor("workerpool-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "controller setup failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fakeAte = newFakeControlClient()
+	if err := (&ActorTemplateReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		AteClient: fakeAte,
+		Recorder:  mgr.GetEventRecorderFor("actortemplate-controller"),
+	}).SetupWithManager(mgr); err != nil {
+		fmt.Fprintf(os.Stderr, "actortemplate controller setup failed: %v\n", err)
 		os.Exit(1)
 	}
 
