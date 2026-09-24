@@ -606,3 +606,29 @@ func TestTerminatingTemplateIsANoOp(t *testing.T) {
 	}
 	wantNoEvents(t, events)
 }
+
+// TestActorTemplateSetupWithManagerRefusesNilRecorder is the ActorTemplate
+// twin of TestSetupWithManagerRefusesNilRecorder in
+// workerpool_controller_test.go. Both reconcilers grew the same fail-closed
+// guard for the same reason -- a controller that reconciles correctly and
+// emits nothing is invisible until someone runs `kubectl describe` and finds
+// an empty Events section -- but only WorkerPool's guard was pinned, so
+// ActorTemplate's could have been deleted without breaking a test.
+//
+// The positive control is TestMain, not a second registration here: controller
+// name uniqueness is enforced per PROCESS, so re-registering "actortemplate"
+// would fail for an unrelated reason however fresh the manager is.
+func TestActorTemplateSetupWithManagerRefusesNilRecorder(t *testing.T) {
+	withoutRecorder := newTestManager(t)
+	err := (&ActorTemplateReconciler{
+		Client:    withoutRecorder.GetClient(),
+		Scheme:    withoutRecorder.GetScheme(),
+		AteClient: newFakeControlClient(),
+	}).SetupWithManager(withoutRecorder)
+	if err == nil {
+		t.Fatal("SetupWithManager accepted a nil Recorder; it must fail closed")
+	}
+	if !strings.Contains(err.Error(), "Recorder") {
+		t.Errorf("error %q does not name the missing field", err)
+	}
+}
