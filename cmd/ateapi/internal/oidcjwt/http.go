@@ -15,14 +15,18 @@
 package oidcjwt
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/credbundle"
 )
 
 // NewHTTPClient returns a client for OIDC discovery and JWKS requests.
@@ -32,21 +36,69 @@ func NewHTTPClient(issuer, certificateAuthorityFile, discoveryTokenFile string) 
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if certificateAuthorityFile != "" {
-		ca, err := os.ReadFile(certificateAuthorityFile)
-		if err != nil {
+		loadPool := credbundle.PoolLoader(certificateAuthorityFile)
+		// Read once so a missing or empty CA file fails ateapi at startup rather
+		// than at its first token validation, where it reads as the issuer being
+		// unreachable.
+		if _, err := loadPool(); err != nil {
 			return nil, fmt.Errorf("read certificate authority file: %w", err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("certificate authority file %q contains no certificates", certificateAuthorityFile)
-		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+		transport.DialTLSContext = dialTLSWithRoots(loadPool)
 	}
 	var roundTripper http.RoundTripper = transport
 	if discoveryTokenFile != "" {
 		roundTripper = &issuerDiscoveryTransport{base: transport, tokenFile: discoveryTokenFile, issuer: issuer}
 	}
 	return &http.Client{Timeout: 10 * time.Second, Transport: roundTripper}, nil
+}
+
+// dialTLSWithRoots builds the TLS connection for each request from a pool read
+// at dial time.
+//
+// Setting transport.TLSClientConfig instead would freeze the trust anchors for
+// the life of the process: RootCAs is read when a tls.Config goes into use and
+// never consulted again, so a rotation of the cluster trust bundle would leave
+// ateapi unable to reach its issuer -- and therefore unable to validate any
+// token -- until it restarts. That is the same rotation the bearer token in
+// issuerDiscoveryTransport below is already re-read per request to survive.
+//
+// PoolLoader caches the parse behind a stat, so the cost here is one stat per
+// new connection rather than a re-read.
+func dialTLSWithRoots(loadPool func() (*x509.CertPool, error)) func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		pool, err := loadPool()
+		if err != nil {
+			// Refusing beats falling back to the last good pool, which would turn
+			// an unreadable trust bundle into a trust anchor nobody can see from
+			// the filesystem, or to the host store, which would not verify the
+			// issuer at all.
+			return nil, fmt.Errorf("reload certificate authority file: %w", err)
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("parse address %q: %w", addr, err)
+		}
+		raw, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		conn := tls.Client(raw, &tls.Config{
+			RootCAs:    pool,
+			ServerName: host,
+			MinVersion: tls.VersionTLS12,
+			// The transport negotiates HTTP/2 from the ALPN result. A custom TLS
+			// dialer bypasses the place net/http would otherwise add these, so
+			// omitting them silently downgrades every discovery request to
+			// HTTP/1.1.
+			NextProtos: []string{"h2", "http/1.1"},
+		})
+		if err := conn.HandshakeContext(ctx); err != nil {
+			raw.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
 }
 
 // issuerDiscoveryTransport injects a bearer token for requests within the

@@ -88,7 +88,11 @@ func (c *CA) Pool() *x509.CertPool {
 // which is what a handshake test usually wants; set ExtKeyUsage to pin one
 // direction.
 type LeafOpts struct {
-	DNSNames    []string
+	DNSNames []string
+	// IPAddresses sets IP SANs. A test server reached over loopback needs one:
+	// when the name being verified is an IP literal, Go checks IP SANs and
+	// ignores DNS names entirely.
+	IPAddresses []net.IP
 	URIs        []string
 	ExtKeyUsage []x509.ExtKeyUsage
 }
@@ -128,6 +132,7 @@ func (c *CA) Issue(t *testing.T, opts LeafOpts) Leaf {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  eku,
 		DNSNames:     opts.DNSNames,
+		IPAddresses:  opts.IPAddresses,
 		URIs:         uris,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.Key)
