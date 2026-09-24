@@ -297,11 +297,21 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.
 	}, nil
 }
 
+// stdin is the source the "-" token file reads from. A variable so a test can
+// reach the branch; nothing but a test assigns it.
+var stdin io.Reader = os.Stdin
+
 // bearerTokenDialOption attaches the configured token, or mints an ate-client
 // ServiceAccount token when tokenFile is empty.
-func bearerTokenDialOption(ctx context.Context, clientset *kubernetes.Clientset, tokenFile string) (grpc.DialOption, error) {
+//
+// clientset is an interface rather than the concrete *kubernetes.Clientset --
+// as serverTLSConfig above already takes -- because every method used here is
+// on the interface, and taking the concrete type made the minting path below
+// untestable. The audience it sets is what ateapi checks, so it is worth a
+// test.
+func bearerTokenDialOption(ctx context.Context, clientset kubernetes.Interface, tokenFile string) (grpc.DialOption, error) {
 	if tokenFile == "-" {
-		creds, err := readBearerToken(os.Stdin)
+		creds, err := readBearerToken(stdin)
 		if err != nil {
 			return nil, fmt.Errorf("read bearer token from stdin: %w", err)
 		}
