@@ -24,6 +24,8 @@ import (
 	"errors"
 	"math/big"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -187,6 +190,185 @@ func TestDialForAteletOnNodeTarget(t *testing.T) {
 				t.Errorf("dial target = %q, want %q", got, tc.wantTarget)
 			}
 		})
+	}
+}
+
+// Concurrent RPCs against actors on the same node all miss the cold cache. Without
+// the dial being collapsed they all dial, only one connection ends up cached, and the
+// rest have no owner: lru.Add displaces its predecessor without invoking the eviction
+// func, and callers do not close what they take to be cache-owned. Every displaced
+// connection then outlives the process -- the exact cost newAteletConnCache's comment
+// describes for evictions, incurred silently on the dial path instead.
+//
+// The property asserted is the one that makes the leak unreachable rather than merely
+// cleaned up: exactly one dial happens, so there is never a second connection to
+// account for. Holding the dialing caller inside the credentials hook makes that
+// deterministic rather than a hope about the scheduler.
+func TestDialForAteletOnNodeCollapsesConcurrentDialsOfOneAtelet(t *testing.T) {
+	const callers = 8
+	ateletPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-abc", UID: "atelet-uid"},
+		Spec:       corev1.PodSpec{NodeName: "node-1"},
+		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.244.1.7"}}},
+	}
+
+	var dials atomic.Int64
+	var firstDial sync.Once
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	d := NewAteletDialer(newTestAteletIndexer(t, ateletPod), installdefaults.SystemNamespace, "", "",
+		WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+			dials.Add(1)
+			firstDial.Do(func() { close(dialing) })
+			// Hold whoever dials here, so any caller that is going to dial too has
+			// every opportunity to arrive before the count is read.
+			<-release
+			return insecure.NewCredentials(), nil
+		}))
+
+	conns := make([]*grpc.ClientConn, callers)
+	var entered, done sync.WaitGroup
+	entered.Add(callers)
+	done.Add(callers)
+	for i := range callers {
+		go func() {
+			defer done.Done()
+			entered.Done()
+			conn, err := d.DialForAteletOnNode("node-1")
+			if err != nil {
+				t.Errorf("DialForAteletOnNode returned error: %v", err)
+				return
+			}
+			conns[i] = conn
+		}()
+	}
+
+	// Every caller is in the call and one of them is parked in the hook. The others
+	// are now either parked in the hook too (a second dial -- the defect) or waiting
+	// on the first caller's result. Only elapsed time separates those, so settle
+	// before reading the count: generous, and only paid once.
+	entered.Wait()
+	<-dialing
+	time.Sleep(250 * time.Millisecond)
+	got := dials.Load()
+	close(release)
+	done.Wait()
+
+	if got != 1 {
+		t.Errorf("%d concurrent callers for one atelet produced %d dials, want 1: every dial beyond the first yields a connection nothing owns and nothing closes", callers, got)
+	}
+
+	cached, ok := d.ateletConns.Get(string(ateletPod.UID))
+	if !ok {
+		t.Fatal("no connection cached for the atelet after the race")
+	}
+	cachedConn := cached.(*grpc.ClientConn)
+	t.Cleanup(func() { cachedConn.Close() })
+
+	// Every caller must come away holding the one cached connection -- not a private
+	// one, and not a closed one.
+	for i, conn := range conns {
+		if conn == nil {
+			continue // the error is already reported above
+		}
+		if conn != cachedConn {
+			t.Errorf("caller %d got a connection that is not the cached one; it has no owner and leaks", i)
+			continue
+		}
+		if state := conn.GetState(); state == connectivity.Shutdown {
+			t.Errorf("caller %d got a closed connection", i)
+		}
+	}
+}
+
+// Collapsing concurrent dials must not collapse dials of *different* atelets. The
+// flight is keyed the same way the cache is -- on the atelet's pod UID -- so a
+// caller waiting on another atelet's in-flight dial would otherwise be handed a
+// connection to the wrong pod, which the per-atelet UID-pinned credentials exist
+// to make impossible.
+func TestDialForAteletOnNodeDoesNotCollapseDialsOfDifferentAtelets(t *testing.T) {
+	atelet1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-one", UID: "atelet-uid-1"},
+		Spec:       corev1.PodSpec{NodeName: "node-1"},
+		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.244.1.7"}}},
+	}
+	atelet2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-two", UID: "atelet-uid-2"},
+		Spec:       corev1.PodSpec{NodeName: "node-2"},
+		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.244.2.9"}}},
+	}
+
+	var firstDial sync.Once
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	d := NewAteletDialer(newTestAteletIndexer(t, atelet1, atelet2), installdefaults.SystemNamespace, "", "",
+		WithDialCredentials(func(podUID string) (credentials.TransportCredentials, error) {
+			if podUID == string(atelet1.UID) {
+				// Keep node-1's dial in flight for the whole of node-2's call.
+				firstDial.Do(func() { close(dialing) })
+				<-release
+			}
+			return insecure.NewCredentials(), nil
+		}))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var conn1 *grpc.ClientConn
+	go func() {
+		defer wg.Done()
+		var err error
+		if conn1, err = d.DialForAteletOnNode("node-1"); err != nil {
+			t.Errorf("DialForAteletOnNode(node-1) returned error: %v", err)
+		}
+	}()
+
+	<-dialing
+	conn2, err := d.DialForAteletOnNode("node-2")
+	if err != nil {
+		t.Fatalf("DialForAteletOnNode(node-2) returned error: %v", err)
+	}
+	t.Cleanup(func() { conn2.Close() })
+	close(release)
+	wg.Wait()
+	if conn1 != nil {
+		t.Cleanup(func() { conn1.Close() })
+	}
+
+	if got, want := conn2.Target(), "10.244.2.9:8085"; got != want {
+		t.Errorf("node-2 dial target = %q, want %q: it was served another atelet's in-flight dial", got, want)
+	}
+	if conn1 != nil && conn1 == conn2 {
+		t.Error("both atelets were served the same connection")
+	}
+}
+
+// A dial that cannot build credentials must surface the error and cache nothing --
+// a failed flight that left an entry behind would pin the failure for every later
+// caller.
+func TestDialForAteletOnNodeReportsACredentialsFailure(t *testing.T) {
+	ateletPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: installdefaults.SystemNamespace, Name: "atelet-abc", UID: "atelet-uid"},
+		Spec:       corev1.PodSpec{NodeName: "node-1"},
+		Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: "10.244.1.7"}}},
+	}
+	wantErr := errors.New("no client bundle on disk")
+	d := NewAteletDialer(newTestAteletIndexer(t, ateletPod), installdefaults.SystemNamespace, "", "",
+		WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+			return nil, wantErr
+		}))
+
+	conn, err := d.DialForAteletOnNode("node-1")
+	if err == nil {
+		t.Fatal("DialForAteletOnNode succeeded, want the credentials error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("error = %v, want it to wrap %v", err, wantErr)
+	}
+	if conn != nil {
+		t.Error("a connection was returned alongside the error")
+	}
+	if _, ok := d.ateletConns.Get(string(ateletPod.UID)); ok {
+		t.Error("a failed dial left an entry in the connection cache")
 	}
 }
 

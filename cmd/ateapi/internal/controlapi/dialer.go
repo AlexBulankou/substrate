@@ -31,6 +31,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
@@ -47,6 +48,15 @@ var ErrNoAteletOnNode = errors.New("no atelet pod found on node")
 type AteletDialer struct {
 	ateletIndexer cache.Indexer
 	ateletConns   *lru.Cache
+	// dialSF collapses concurrent dials of the same atelet into one.
+	// lru.Cache is individually goroutine-safe, but look-up-then-dial-then-insert
+	// is not atomic across callers, and lru.Add over an existing key replaces the
+	// value without invoking the eviction func — so a connection displaced that
+	// way is never closed. Callers treat the returned connection as cache-owned
+	// and do not close it either, which leaves it leaked for the life of the
+	// process. Collapsing the dial means there is no displaced connection to
+	// begin with, rather than one more thing to remember to close.
+	dialSF singleflight.Group
 	// dialCredentials builds the transport credentials used to dial a given
 	// atelet, keyed on the atelet's expected pod UID. Production wires this to
 	// per-atelet mTLS; tests can override it with insecure credentials.
@@ -131,23 +141,38 @@ func (d *AteletDialer) DialForAteletOnNode(nodeName string) (*grpc.ClientConn, e
 		return nil, fmt.Errorf("selected atelet %q has no assigned IPs", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name)
 	}
 
-	creds, err := d.dialCredentials(string(selectedAtelet.ObjectMeta.UID))
+	// Only one caller per atelet dials; the rest wait and share the result.
+	// The flight is keyed on the same pod UID as the cache, so dials of
+	// different atelets still proceed in parallel.
+	ateletConnAny, err, _ = d.dialSF.Do(ateletKey, func() (interface{}, error) {
+		// Re-check inside the flight: a racing caller may have completed the
+		// dial between our cache miss and our winning the singleflight slot.
+		if cached, ok := d.ateletConns.Get(ateletKey); ok {
+			return cached, nil
+		}
+
+		creds, err := d.dialCredentials(string(selectedAtelet.ObjectMeta.UID))
+		if err != nil {
+			return nil, fmt.Errorf("while building atelet credentials: %w", err)
+		}
+
+		ateletConn, err := grpc.NewClient(
+			net.JoinHostPort(selectedAtelet.Status.PodIPs[0].IP, strconv.Itoa(atelet.DefaultPort)),
+			grpc.WithTransportCredentials(creds),
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("while creating atelet gRPC client connection: %w", err)
+		}
+
+		d.ateletConns.Add(ateletKey, ateletConn)
+		return ateletConn, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("while building atelet credentials: %w", err)
+		return nil, err
 	}
 
-	ateletConn, err := grpc.NewClient(
-		net.JoinHostPort(selectedAtelet.Status.PodIPs[0].IP, strconv.Itoa(atelet.DefaultPort)),
-		grpc.WithTransportCredentials(creds),
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("while creating atelet gRPC client connection: %w", err)
-	}
-
-	d.ateletConns.Add(ateletKey, ateletConn)
-
-	return ateletConn, nil
+	return ateletConnAny.(*grpc.ClientConn), nil
 }
 
 func buildTLSConfig(ateletSPIFFEID, clientBundlePath, serverCAPath, expectedPodUID string) (*tls.Config, error) {
