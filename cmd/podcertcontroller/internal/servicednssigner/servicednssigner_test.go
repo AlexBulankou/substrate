@@ -211,6 +211,44 @@ func TestMakeCertSkipsServiceTypesThatDoNotSelectPods(t *testing.T) {
 	}
 }
 
+// TestMakeCertSkipsSelectorlessServices covers a live defect, not a hypothetical
+// one. A Service with no selector is a supported, reasonably common pattern --
+// its Endpoints are managed by hand, typically to point at something outside
+// the cluster. It does not select pods.
+//
+// Before the guard this test covers, such a Service still reached the pod List,
+// because the type switch above only filters on Spec.Type and a selector-less
+// Service is usually a plain ClusterIP. metav1.FormatLabelSelector renders an
+// empty selector as the literal string "<none>", which is not a parseable label
+// selector, so the List failed. The blast radius is the whole namespace: one
+// selector-less Service broke certificate issuance for every pod in it,
+// including pods with nothing to do with that Service.
+//
+// The two assertions are separate on purpose. That issuance still succeeds is
+// the regression this guards; that the Service contributes no DNS name is the
+// correctness half, since skipping it must not mean silently naming it.
+func TestMakeCertSkipsSelectorlessServices(t *testing.T) {
+	pcr := testPCR(t)
+	impl, kc, _ := newTestImpl(t,
+		testPod(testPodName, testPodUID, testLabels),
+		testService("selectorless", corev1.ServiceTypeClusterIP, nil),
+		testService("selects-us", corev1.ServiceTypeClusterIP, testLabels),
+		pcr)
+
+	leaf, _ := issuedCert(t, impl, kc, pcr)
+
+	for _, name := range leaf.DNSNames {
+		if strings.HasPrefix(name, "selectorless.") {
+			t.Errorf("cert names a Service that selects no pods: %v", leaf.DNSNames)
+		}
+	}
+	want := "selects-us." + testNamespace + ".svc"
+	if len(leaf.DNSNames) != 1 || leaf.DNSNames[0] != want {
+		t.Errorf("DNS names = %v, want exactly [%s] -- the selector-less Service must "+
+			"not suppress the one that does select this pod", leaf.DNSNames, want)
+	}
+}
+
 // TestMakeCertRequiresBothPodNameAndUID covers the two halves of the match
 // separately, so that dropping either comparison is caught. A same-name pod
 // with a different UID is the recycled-name case; a different pod with a

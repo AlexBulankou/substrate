@@ -113,6 +113,17 @@ func (h *Impl) MakeCert(ctx context.Context, pcr *certsv1beta1.PodCertificateReq
 			continue
 		}
 
+		// A Service with no selector does not select pods at all --- its
+		// Endpoints are managed by hand.  Skipping it is not just an
+		// optimization: metav1.FormatLabelSelector renders an empty selector as
+		// the literal string "<none>", which is not a parseable label selector,
+		// so the List below would fail.  A single selector-less Service in the
+		// namespace would otherwise break certificate issuance for every pod in
+		// it.
+		if len(svc.Spec.Selector) == 0 {
+			continue
+		}
+
 		// Find the set of pods that the service selects.
 		matchedPods, err := h.kc.CoreV1().Pods(pcr.ObjectMeta.Namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: metav1.FormatLabelSelector(&metav1.LabelSelector{MatchLabels: svc.Spec.Selector}),
