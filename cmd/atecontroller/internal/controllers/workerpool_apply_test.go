@@ -326,3 +326,70 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 				WithSpec(podSpecAC)))
 }
+
+// TestMicroVMPodShapeToleratesNilNodeSelector pins a guard that is currently
+// unreachable through buildDeploymentApplyConfig, which is exactly why it
+// needs a test rather than a deletion.
+//
+// buildDeploymentApplyConfig calls applyWorkerPoolPodTemplate unconditionally
+// before maybeApplyMicroVMPodShape, and that function unconditionally assigns
+// podSpecAC.NodeSelector = map[string]string{} -- so in the real call path the
+// map is never nil and the guard never fires. Give applyWorkerPoolPodTemplate
+// the obvious `if tmpl == nil { return }` early exit some future cleanup will
+// reach for, though, and a micro-VM pool with no spec.template would assign
+// into a nil map and panic. This calls the function directly so the guard
+// stays honest either way.
+func TestMicroVMPodShapeToleratesNilNodeSelector(t *testing.T) {
+	podSpecAC := corev1ac.PodSpec()
+	containerAC := corev1ac.Container().WithName("ateom")
+	if podSpecAC.NodeSelector != nil {
+		t.Fatal("setup failed: a fresh PodSpec should have a nil NodeSelector")
+	}
+
+	maybeApplyMicroVMPodShape(podSpecAC, containerAC, atev1alpha1.SandboxClassMicroVM)
+
+	if got := podSpecAC.NodeSelector["ate.dev/sandboxClass"]; got != string(atev1alpha1.SandboxClassMicroVM) {
+		t.Errorf("nodeSelector[ate.dev/sandboxClass] = %q, want %q", got, atev1alpha1.SandboxClassMicroVM)
+	}
+}
+
+// TestNodeSelectorTermCarriesMatchFields covers the MatchFields loop, which no
+// existing case reached -- every affinity fixture in this file uses
+// MatchExpressions only.
+//
+// The two loops are a copy-paste pair, so the failure to guard against is a
+// term whose MatchFields are dropped or appended to MatchExpressions instead.
+// Either one silently widens where a pod may be scheduled, which is the sort
+// of bug that surfaces as a workload on the wrong node rather than as an
+// error.
+func TestNodeSelectorTermCarriesMatchFields(t *testing.T) {
+	term := &corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key:      "workload",
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"ateom"},
+		}},
+		MatchFields: []corev1.NodeSelectorRequirement{{
+			Key:      "metadata.name",
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"node-1"},
+		}},
+	}
+
+	ac := nodeSelectorTermToApply(term)
+
+	if len(ac.MatchFields) != 1 {
+		t.Fatalf("MatchFields = %d entries, want 1 (dropped or misrouted)", len(ac.MatchFields))
+	}
+	if got := *ac.MatchFields[0].Key; got != "metadata.name" {
+		t.Errorf("MatchFields[0].Key = %q, want metadata.name", got)
+	}
+	if diff := cmp.Diff([]string{"node-1"}, ac.MatchFields[0].Values); diff != "" {
+		t.Errorf("MatchFields[0].Values mismatch (-want +got):\n%s", diff)
+	}
+	// Guard the copy-paste direction explicitly: the field requirement must
+	// not have been appended to MatchExpressions as well.
+	if len(ac.MatchExpressions) != 1 {
+		t.Errorf("MatchExpressions = %d entries, want 1; a MatchField leaked into it", len(ac.MatchExpressions))
+	}
+}
