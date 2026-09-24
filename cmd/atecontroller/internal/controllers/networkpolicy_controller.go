@@ -18,11 +18,13 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	networkingv1ac "k8s.io/client-go/applyconfigurations/networking/v1"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -36,9 +38,21 @@ const (
 	atenetRouterAppName     = "atenet-router"
 )
 
+// reasonNetworkPolicyApplyFailed marks a failed apply of the generated ingress
+// policy. It is deliberately not the WorkerPool reconciler's bare ApplyFailed:
+// both reconcilers publish onto the same WorkerPool, so a shared reason would
+// make `--field-selector reason=ApplyFailed` ambiguous about which derived
+// object failed.
+const reasonNetworkPolicyApplyFailed = "NetworkPolicyApplyFailed"
+
 type NetworkPolicyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Recorder publishes onto the WorkerPool rather than onto the generated
+	// NetworkPolicy: the pool is the object an operator owns and describes,
+	// and the policy is an implementation detail they did not create.
+	Recorder record.EventRecorder
 
 	// SystemNamespace is the namespace atenet-router runs in. The generated
 	// ingress policy admits only that namespace, so a value that does not
@@ -48,6 +62,7 @@ type NetworkPolicyReconciler struct {
 
 //+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *NetworkPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -81,8 +96,18 @@ func (r *NetworkPolicyReconciler) reconcileImpl(ctx context.Context, wp *atev1al
 	npAC := r.buildNetworkPolicyApplyConfig(wp)
 
 	if err := r.Apply(ctx, npAC, client.FieldOwner(networkPolicyFieldOwner), client.ForceOwnership); err != nil {
+		// A pool whose ingress policy never applies is reachable from anywhere
+		// the cluster's default posture allows, which is the opposite of what
+		// this controller exists to guarantee -- so the failure is worth a
+		// Warning on the pool rather than only a line in the controller's log.
+		r.Recorder.Eventf(wp, corev1.EventTypeWarning, reasonNetworkPolicyApplyFailed,
+			"Failed to apply NetworkPolicy %s: %v", *npAC.Name, err)
 		return fmt.Errorf("failed to apply NetworkPolicy %s:%s: %w", *npAC.Namespace, *npAC.Name, err)
 	}
+	// No Normal counterpart here. Unlike the WorkerPool reconciler, this one
+	// has no change guard -- server-side apply is issued on every reconcile,
+	// including resyncs that change nothing -- so a success event would fire
+	// on a timer and bury the Warning above rather than report a transition.
 	log.Info("reconcileImpl done",
 		"namespace", *npAC.Namespace,
 		"name", *npAC.Name)
@@ -128,6 +153,12 @@ func (r *NetworkPolicyReconciler) buildNetworkPolicyApplyConfig(wp *atev1alpha1.
 }
 
 func (r *NetworkPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Fail closed rather than start with events silently disabled: a nil
+	// Recorder reconciles perfectly and reports nothing, which is exactly the
+	// condition this instrumentation exists to end.
+	if r.Recorder == nil {
+		return fmt.Errorf("NetworkPolicyReconciler: Recorder must be set")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("networkpolicy").
 		For(&atev1alpha1.WorkerPool{}).
