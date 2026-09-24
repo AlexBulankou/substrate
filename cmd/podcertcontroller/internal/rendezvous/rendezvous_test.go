@@ -25,6 +25,18 @@
 //
 // Leases are placed directly in the informer's indexer, which is what the
 // lister underneath AssignedToThisReplica reads.
+//
+// Three behaviours here are deliberately not asserted, because no test can
+// distinguish them from their absence:
+//   - Hash's equal-weight tiebreak.  Reaching it needs two replica names whose
+//     FNV-64a weights collide for the same item, which is ~2^32 work to find.
+//     The branch is unreachable in practice, so both its direction and its
+//     existence are untestable.
+//   - AssignedToThisReplica's lister-error path.  The lister reads a cache
+//     indexer with labels.Everything(), which has no failure mode to inject.
+//   - Run's early return on a failed cache sync.  WaitForCacheSync only
+//     returns false once the stop channel closes, so on that path the
+//     fall-through would immediately hit <-ctx.Done() and return anyway.
 package rendezvous
 
 import (
@@ -191,6 +203,36 @@ func TestHashSpreadsItemsAcrossReplicas(t *testing.T) {
 	for _, r := range replicas {
 		if counts[r] < floor {
 			t.Errorf("replica %q got %d of %d items, want at least %d; distribution: %v", r, counts[r], items, floor, counts)
+		}
+	}
+}
+
+// TestHashMatchesAGoldenAssignment pins the concrete item-to-replica mapping,
+// which every other Hash test here leaves free.  The properties those tests
+// check -- order independence, stability, minimal rebalancing, even spread --
+// all survive changes to what is actually fed to the hash, so a build that
+// hashed replica+item instead of item+replica would pass all of them while
+// assigning every item somewhere else.
+//
+// That matters because the assignment is a cross-replica agreement, not a
+// local choice: two replicas on different builds must land on the same answer
+// or they will both process, or both skip, the same request.  A change here is
+// a fleet-wide reshuffle and has to be a deliberate edit to this table.
+func TestHashMatchesAGoldenAssignment(t *testing.T) {
+	replicas := []string{"replica-a", "replica-b", "replica-c", "replica-d", "replica-e"}
+
+	for _, tc := range []struct{ item, want string }{
+		{"ns1/pcr0", "replica-e"},
+		{"ns1/pcr1", "replica-d"},
+		{"ns1/pcr2", "replica-c"},
+		{"ns1/pcr3", "replica-d"},
+		{"ns1/pcr4", "replica-a"},
+		{"ns1/pcr5", "replica-b"},
+		{"ns1/pcr6", "replica-e"},
+		{"ns1/pcr7", "replica-a"},
+	} {
+		if got := Hash(tc.item, replicas); got != tc.want {
+			t.Errorf("Hash(%q) = %q, want %q", tc.item, got, tc.want)
 		}
 	}
 }
