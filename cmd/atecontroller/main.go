@@ -217,6 +217,7 @@ func main() {
 	if err = (&controllers.NetworkPolicyReconciler{
 		Client:          mgr.GetClient(),
 		Scheme:          mgr.GetScheme(),
+		Recorder:        mgr.GetEventRecorderFor("networkpolicy-controller"),
 		SystemNamespace: systemNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetPolicy")
@@ -225,6 +226,7 @@ func main() {
 
 	if err = (&controllers.EgressMITMTrustReconciler{
 		Client:          mgr.GetClient(),
+		Recorder:        mgr.GetEventRecorderFor("egressmitmtrust-controller"),
 		SystemNamespace: systemNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "EgressMITMTrust")
