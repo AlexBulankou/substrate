@@ -12,23 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ateompath
+package resources
 
-import (
-	"strings"
-	"testing"
-)
-
-func TestActorPathUsesUID(t *testing.T) {
-	uid1 := "123e4567-e89b-12d3-a456-426614174000"
-	uid2 := "987f6543-e21b-32d1-b654-246614174111"
-
-	path1 := ActorPath(uid1)
-	path2 := ActorPath(uid2)
-	if path1 == path2 {
-		t.Fatalf("different actor UIDs produced the same path %q", path1)
-	}
-	if want := "/actors/" + uid1; !strings.HasSuffix(path1, want) {
-		t.Errorf("ActorPath(%q) = %q, want suffix %q", uid1, path1, want)
-	}
-}
+// DurableDirTarFile is the snapshot file holding the tar of the actor's
+// durable-dir volumes. atelet uploads it alone when a paused actor's FULL
+// capture is suspended as DATA.
+//
+// TODO: atelet should ask for the scope it wants and upload whatever files the
+// snapshot has, without knowing this name.
+const DurableDirTarFile = "durable-dir.tar"
