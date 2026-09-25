@@ -17,20 +17,20 @@ package csi
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/nodepath"
+	"github.com/agent-substrate/substrate/internal/rotatingtls"
 	"github.com/agent-substrate/substrate/internal/volume"
 	v1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -296,16 +296,16 @@ func newCSIPlugin(ctx context.Context, lister listersv1alpha1.CSIDriverConfigLis
 		endpoint = "unix://" + kubeletPluginSocketPath(driverName)
 	}
 
-	var tlsCfg *tls.Config
+	var creds credentials.TransportCredentials
 	if isController {
 		var err error
-		tlsCfg, err = resolveTLSConfig(cfg, paths)
+		creds, err = resolveTransportCredentials(cfg, paths)
 		if err != nil {
 			return nil, fmt.Errorf("failed to resolve TLS config for %q: %w", driverName, err)
 		}
 	}
 
-	csiClient, err := NewCSIClient(endpoint, tlsCfg)
+	csiClient, err := NewCSIClient(endpoint, creds)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize CSI client from endpoint %q: %w", endpoint, err)
 	}
@@ -325,7 +325,15 @@ func newCSIPlugin(ctx context.Context, lister listersv1alpha1.CSIDriverConfigLis
 	return csiPlugin, nil
 }
 
-func resolveTLSConfig(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (*tls.Config, error) {
+// resolveTransportCredentials builds the credentials the controller dials the
+// CSI driver with, or nil when the driver has TLS disabled.
+//
+// Both halves of the mTLS material are re-read per handshake. In Substrate's
+// pod identity model the kubelet projects them into the pod as files and
+// rewrites them in place when they rotate, so a client that reads either one
+// at construction stops being able to dial the moment that happens, and keeps
+// failing until the controller restarts.
+func resolveTransportCredentials(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (credentials.TransportCredentials, error) {
 	if cfg == nil || cfg.Spec.TLS == nil || !cfg.Spec.TLS.Enabled {
 		return nil, nil
 	}
@@ -337,121 +345,41 @@ func resolveTLSConfig(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (*tls.Confi
 		return nil, fmt.Errorf("only pod identity TLS is supported in this configuration")
 	}
 
-	caCache := newCAPoolCache(paths.caCert)
+	// PoolLoader caches on the file's stat triple, so a handshake that finds an
+	// unchanged trust bundle pays one stat rather than a read and a reparse.
+	loadRoots := credbundle.PoolLoader(paths.caCert)
 
-	// Verify CA pool exists, is readable, and populate the initial cache.
-	if _, err := caCache.getCertPool(); err != nil {
+	// Read once here so an unreadable or malformed trust bundle fails the
+	// plugin as it is built rather than on the first RPC.
+	if _, err := loadRoots(); err != nil {
 		return nil, fmt.Errorf("failed to load CA cert pool from %q: %w", paths.caCert, err)
 	}
 
+	return rotatingtls.NewCredentials(tlsTemplate(tlsCfg, paths), loadRoots), nil
+}
+
+// tlsTemplate returns every TLS setting the controller dials with except the
+// trust anchors, which rotate and so are supplied per handshake.
+//
+// There is deliberately no InsecureSkipVerify and no VerifyConnection here.
+// Reloading the trust anchors does not need either: rotatingtls rebuilds the
+// config per connection, so the standard verification path sees the current
+// pool. Replacing it with a hand-rolled verifier is how the check against the
+// server's name came to be skipped whenever serverName was left unset.
+func tlsTemplate(tlsCfg *v1alpha1.CSIDriverTLSConfig, paths tlsPaths) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
+		// ServerName is optional in the CRD. Left empty, grpc-go derives the
+		// name to verify from the endpoint's own host; set, it both selects
+		// SNI and becomes the name verified.
 		ServerName: tlsCfg.ServerName,
 		// NextProtos configures ALPN h2 for gRPC over TLS.
 		NextProtos: []string{"h2"},
-		// Load Client Certificate dynamically.
-		// In Substrate's Pod Identity model, certificates are projected into the pod
-		// as files by the kubelet (via Substrate's podcertcontroller).
-		// Kubelet handles the rotation of these files on disk.
-		// credbundle.ClientLoader monitors these files and automatically reloads
-		// them when they change, ensuring rotation is picked up on subsequent handshakes.
+		// Load the client certificate dynamically. In Substrate's pod identity
+		// model the kubelet projects it into the pod as a file and rotates it
+		// there; credbundle.ClientLoader re-reads it when it changes.
 		GetClientCertificate: credbundle.ClientLoader(paths.clientCert),
-		// Dynamic CA Reloading:
-		// Standard tls.Config.RootCAs is a static cert pool evaluated at construction time.
-		// To automatically pick up CA trust bundle rotations on disk without restarting the process,
-		// we set InsecureSkipVerify=true and verify the server certificate chain dynamically
-		// against the CA bundle in VerifyConnection.
-		// caCache avoids re-reading and re-parsing the CA bundle from disk on every handshake
-		// unless the file has changed.
-		InsecureSkipVerify: true,
-		VerifyConnection: func(state tls.ConnectionState) error {
-			if len(state.PeerCertificates) == 0 {
-				return fmt.Errorf("server did not present certificates")
-			}
-
-			roots, err := caCache.getCertPool()
-			if err != nil {
-				return fmt.Errorf("failed to load CA cert pool from %q: %w", paths.caCert, err)
-			}
-
-			intermediates := x509.NewCertPool()
-			for _, cert := range state.PeerCertificates[1:] {
-				intermediates.AddCert(cert)
-			}
-
-			leaf := state.PeerCertificates[0]
-			opts := x509.VerifyOptions{
-				DNSName:       tlsCfg.ServerName,
-				Roots:         roots,
-				Intermediates: intermediates,
-				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			}
-			if _, err := leaf.Verify(opts); err != nil {
-				return fmt.Errorf("failed to verify server certificate against CA in %q: %w", paths.caCert, err)
-			}
-			return nil
-		},
-	}, nil
-}
-
-// caPoolCache holds the parsed *x509.CertPool and file stat so unchanged CA trust bundles
-// are not re-read from disk on every TLS handshake.
-type caPoolCache struct {
-	path string
-
-	mu   sync.Mutex
-	fi   os.FileInfo
-	pool *x509.CertPool
-}
-
-func newCAPoolCache(path string) *caPoolCache {
-	return &caPoolCache{path: path}
-}
-
-// isFileUnchanged reports whether newFi is the same file as the stat the cached
-// pool was parsed from.
-func (c *caPoolCache) isFileUnchanged(newFi os.FileInfo) bool {
-	if c.fi == nil || newFi == nil {
-		return false
 	}
-	return os.SameFile(c.fi, newFi) && c.fi.ModTime().Equal(newFi.ModTime()) && c.fi.Size() == newFi.Size()
-}
-
-// getCertPool returns the parsed CA cert pool, re-reading the file only when it has changed
-// on disk (identity, modification time, or size).
-func (c *caPoolCache) getCertPool() (*x509.CertPool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	fi, err := os.Stat(c.path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat CA cert file %q: %w", c.path, err)
-	}
-
-	if c.pool != nil && c.isFileUnchanged(fi) {
-		return c.pool, nil
-	}
-
-	pool, err := parseCertPool(c.path)
-	if err != nil {
-		return nil, err
-	}
-
-	c.fi, c.pool = fi, pool
-	return c.pool, nil
-}
-
-func parseCertPool(path string) (*x509.CertPool, error) {
-	certBytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read cert file %q: %w", path, err)
-	}
-
-	pool := x509.NewCertPool()
-	if ok := pool.AppendCertsFromPEM(certBytes); !ok {
-		return nil, fmt.Errorf("failed to parse any certificates from %q", path)
-	}
-	return pool, nil
 }
 
 // kubeletPluginSocketPath is the CSI driver socket in the kubelet plugins directory.
