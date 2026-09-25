@@ -74,13 +74,9 @@ func (r *runsc) shapeSpec(containerName string) error {
 	return ocispec.Save(bundle, spec)
 }
 
-func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
-	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
-
-	if err := r.shapeSpec(containerName); err != nil {
-		return fmt.Errorf("while shaping the OCI spec for %q: %w", containerName, err)
-	}
-
+// createArgs builds the argv for `runsc create <container>`. Factored out so
+// the argument construction can be unit-tested without executing runsc.
+func (r *runsc) createArgs(containerName string, additionalArgs []string) []string {
 	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
@@ -103,10 +99,20 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 
 	args = append(args, additionalArgs...)
 	args = append(args, containerName) // Name of the container
+	return args
+}
+
+func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName string, additionalArgs []string) error {
+	slog.InfoContext(ctx, "About to run runsc create", slog.String("container", containerName))
+
+	if err := r.shapeSpec(containerName); err != nil {
+		return fmt.Errorf("while shaping the OCI spec for %q: %w", containerName, err)
+	}
+
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
-		args...,
+		r.createArgs(containerName, additionalArgs)...,
 	)
 	cmd.Stdout = out
 	cmd.Stderr = out
@@ -119,10 +125,10 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 	return nil
 }
 
-func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName string) error {
-	slog.InfoContext(ctx, "About to run runsc start", slog.String("container", containerName))
-
-	startArgs := []string{
+// startArgs builds the argv for `runsc start <container>`. Factored out so the
+// argument construction can be unit-tested without executing runsc.
+func (r *runsc) startArgs(containerName string) []string {
+	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -133,8 +139,13 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 		"-allow-connected-on-save",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 	}
-	startArgs = append(startArgs, "start", containerName)
-	cmd := exec.CommandContext(ctx, r.path, startArgs...)
+	return append(args, "start", containerName)
+}
+
+func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName string) error {
+	slog.InfoContext(ctx, "About to run runsc start", slog.String("container", containerName))
+
+	cmd := exec.CommandContext(ctx, r.path, r.startArgs(containerName)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 
@@ -146,12 +157,10 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 	return nil
 }
 
-func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath string) error {
-	slog.InfoContext(ctx, "About to run runsc checkpoint", slog.String("container", containerName))
-
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+// checkpointArgs builds the argv for `runsc checkpoint <container>`. Factored
+// out so the argument construction can be unit-tested without executing runsc.
+func (r *runsc) checkpointArgs(containerName, checkpointPath string) []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -163,7 +172,13 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 		"checkpoint",
 		"-image-path", checkpointPath,
 		containerName, // Name of the container
-	)
+	}
+}
+
+func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath string) error {
+	slog.InfoContext(ctx, "About to run runsc checkpoint", slog.String("container", containerName))
+
+	cmd := exec.CommandContext(ctx, r.path, r.checkpointArgs(containerName, checkpointPath)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := reaper.RunCommand(cmd)
@@ -173,10 +188,10 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 	return nil
 }
 
-//nolint:unused
-func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
-	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
-
+// fsCheckpointArgs builds the argv for `runsc fscheckpoint <container>`.
+// Factored out so the argument construction can be unit-tested without
+// executing runsc.
+func (r *runsc) fsCheckpointArgs(containerName, checkpointPath string, durableDirMounts []string) []string {
 	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
@@ -194,12 +209,17 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 	}
 
 	// name of the container must be the last parameter.
-	args = append(args, containerName)
+	return append(args, containerName)
+}
+
+//nolint:unused
+func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
+	slog.InfoContext(ctx, "About to run runsc fscheckpoint", slog.String("container", containerName))
 
 	cmd := exec.CommandContext(
 		ctx,
 		r.path,
-		args...,
+		r.fsCheckpointArgs(containerName, checkpointPath, durableDirMounts)...,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -260,16 +280,10 @@ func (r *runsc) cmdResume(ctx context.Context, containerName string) error {
 	return nil
 }
 
-// We take a checkpoint only of the root container of the sandbox, but we need
-// to call restore on each container, using the same checkpoint.
-func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
-	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
-
-	if err := r.shapeSpec(containerName); err != nil {
-		return fmt.Errorf("while shaping the OCI spec for %q: %w", containerName, err)
-	}
-
-	restoreArgs := []string{
+// restoreArgs builds the argv for `runsc restore <container>`. Factored out so
+// the argument construction can be unit-tested without executing runsc.
+func (r *runsc) restoreArgs(containerName, checkpointPath string) []string {
+	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -281,7 +295,7 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		// Match cmdCreate: size the restored sentry from the cgroup CPU quota.
 		"--cpu-num-from-quota",
 	}
-	restoreArgs = append(restoreArgs,
+	return append(args,
 		"restore",
 		"-bundle", ateompath.OCIBundlePath(r.actorUID, containerName),
 		"-image-path", checkpointPath,
@@ -290,7 +304,18 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		"-detach",
 		containerName,
 	)
-	cmd := exec.CommandContext(ctx, r.path, restoreArgs...)
+}
+
+// We take a checkpoint only of the root container of the sandbox, but we need
+// to call restore on each container, using the same checkpoint.
+func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, checkpointPath string) error {
+	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
+
+	if err := r.shapeSpec(containerName); err != nil {
+		return fmt.Errorf("while shaping the OCI spec for %q: %w", containerName, err)
+	}
+
+	cmd := exec.CommandContext(ctx, r.path, r.restoreArgs(containerName, checkpointPath)...)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := reaper.RunCommand(cmd); err != nil {
@@ -299,10 +324,10 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 	return nil
 }
 
-func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+// deleteArgs builds the argv for `runsc delete <container>`. Factored out so
+// the argument construction can be unit-tested without executing runsc.
+func (r *runsc) deleteArgs(containerName string) []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -310,7 +335,11 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 		"delete",
 		"-force",
 		containerName,
-	)
+	}
+}
+
+func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
+	cmd := exec.CommandContext(ctx, r.path, r.deleteArgs(containerName)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err := reaper.RunCommand(cmd)
@@ -320,16 +349,20 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 	return nil
 }
 
-func (r *runsc) cmdState(ctx context.Context, containerName string) error {
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+// stateArgs builds the argv for `runsc state <container>`. Factored out so the
+// argument construction can be unit-tested without executing runsc.
+func (r *runsc) stateArgs(containerName string) []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"state",
 		containerName,
-	)
+	}
+}
+
+func (r *runsc) cmdState(ctx context.Context, containerName string) error {
+	cmd := exec.CommandContext(ctx, r.path, r.stateArgs(containerName)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := reaper.RunCommand(cmd); err != nil {
@@ -338,17 +371,21 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 	return nil
 }
 
-// cmdList returns the container IDs runsc has a record of.
-func (r *runsc) cmdList(ctx context.Context) ([]string, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+// listArgs builds the argv for `runsc list`. Factored out so the argument
+// construction can be unit-tested without executing runsc.
+func (r *runsc) listArgs() []string {
+	return []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		"-root", ateompath.RunSCStateDir(r.actorUID),
 		"list",
 		"-quiet",
-	)
+	}
+}
+
+// cmdList returns the container IDs runsc has a record of.
+func (r *runsc) cmdList(ctx context.Context) ([]string, error) {
+	cmd := exec.CommandContext(ctx, r.path, r.listArgs()...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
