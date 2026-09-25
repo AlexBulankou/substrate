@@ -32,6 +32,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"net/url"
 	"os"
 	"testing"
@@ -92,7 +93,11 @@ func (c *CA) Pool() *x509.CertPool {
 type Opts struct {
 	CommonName string
 	DNSNames   []string
-	URIs       []string
+	// IPs are IP SANs, in the textual form net.ParseIP accepts. A test server
+	// bound to a loopback address needs one, since the dialer verifies against
+	// the address it connected to.
+	IPs  []string
+	URIs []string
 }
 
 // Issued is a leaf certificate and its private key.
@@ -116,6 +121,14 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		}
 		uris = append(uris, parsed)
 	}
+	var ips []net.IP
+	for _, raw := range opts.IPs {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			t.Fatalf("parse IP SAN %q", raw)
+		}
+		ips = append(ips, ip)
+	}
 	commonName := opts.CommonName
 	if commonName == "" {
 		commonName = "leaf"
@@ -128,6 +141,7 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     opts.DNSNames,
+		IPAddresses:  ips,
 		URIs:         uris,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
