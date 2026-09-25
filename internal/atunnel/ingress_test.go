@@ -41,6 +41,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/resources"
 
 	"github.com/agent-substrate/substrate/internal/atenet"
+	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 func TestActivationDialerClosesLateConnection(t *testing.T) {
@@ -471,12 +472,12 @@ func TestInactive(t *testing.T) {
 
 func TestMutualTLSClientAuthentication(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t)
-	serverCert := ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+	ca := testca.New(t, "test-ca")
+	serverCert := issueTLS(t, ca, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 	bundlePath := filepath.Join(dir, "server.pem")
 	trustPath := filepath.Join(dir, "trust.pem")
 	writeCredentialBundle(t, bundlePath, serverCert)
-	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	upstream, err := url.Parse("http://actor.internal:80")
@@ -496,7 +497,7 @@ func TestMutualTLSClientAuthentication(t *testing.T) {
 		t.Fatalf("ordinary ingress ALPN protocols = %v, want none", got)
 	}
 
-	untrustedCA := newTestCA(t)
+	untrustedCA := testca.New(t, "test-ca")
 	tests := []struct {
 		name    string
 		cert    tls.Certificate
@@ -504,16 +505,16 @@ func TestMutualTLSClientAuthentication(t *testing.T) {
 	}{
 		{
 			name: "allowed client",
-			cert: ca.issue(t, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
+			cert: issueTLS(t, ca, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
 		},
 		{
 			name:    "wrong client ID",
-			cert:    ca.issue(t, "spiffe://cluster.local/ns/ate-system/sa/not-the-gateway", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
+			cert:    issueTLS(t, ca, "spiffe://cluster.local/ns/ate-system/sa/not-the-gateway", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
 			wantErr: true,
 		},
 		{
 			name:    "untrusted client",
-			cert:    untrustedCA.issue(t, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
+			cert:    issueTLS(t, untrustedCA, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}),
 			wantErr: true,
 		},
 		{
@@ -521,7 +522,7 @@ func TestMutualTLSClientAuthentication(t *testing.T) {
 			// right CA, right identity, wrong direction. Accepting it would let
 			// any serving credential in the mesh authenticate as a client.
 			name:    "client certificate without the clientAuth usage",
-			cert:    ca.issue(t, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}),
+			cert:    issueTLS(t, ca, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}),
 			wantErr: true,
 		},
 	}
@@ -544,13 +545,13 @@ const routerSPIFFEID = "spiffe://cluster.local/ns/ate-system/sa/atenet-router"
 
 // newTrustRotationServer builds an ingress server trusting ca, and returns it
 // with the path of the trust bundle so a test can rotate what it trusts.
-func newTrustRotationServer(t *testing.T, ca *testCA) (*Server, string) {
+func newTrustRotationServer(t *testing.T, ca *testca.CA) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
 	bundlePath := filepath.Join(dir, "server.pem")
 	trustPath := filepath.Join(dir, "trust.pem")
-	writeCredentialBundle(t, bundlePath, ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
-	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+	writeCredentialBundle(t, bundlePath, issueTLS(t, ca, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+	if err := os.WriteFile(trustPath, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	upstream, err := url.Parse("http://actor.internal:80")
@@ -585,10 +586,10 @@ func clientConfigPresenting(cert tls.Certificate) *tls.Config {
 // written microseconds apart differ in none of the three, so an in-place
 // rewrite is reliably invisible to the loader and the test flakes. kubelet
 // swaps the ..data symlink, which changes the inode the path resolves to.
-func rotateTrustBundle(t *testing.T, path string, ca *testCA) {
+func rotateTrustBundle(t *testing.T, path string, ca *testca.CA) {
 	t.Helper()
 	staging := path + ".rotated"
-	if err := os.WriteFile(staging, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(staging, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(staging, path); err != nil {
@@ -602,11 +603,11 @@ func rotateTrustBundle(t *testing.T, path string, ca *testCA) {
 // CA rotation would reject every worker the rotated-in CA signed until its pod
 // restarted.
 func TestServeFollowsAClientTrustBundleRotation(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	s, trustPath := newTrustRotationServer(t, ca)
 
-	rotatedCA := newTestCA(t)
-	rotatedClient := rotatedCA.issue(t, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	rotatedCA := testca.New(t, "test-ca")
+	rotatedClient := issueTLS(t, rotatedCA, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	if serverErr, clientErr := tlsHandshake(s.tlsConfig, clientConfigPresenting(rotatedClient)); serverErr == nil && clientErr == nil {
 		t.Fatal("a client from the rotated-in CA was accepted before the rotation, want a refusal")
 	}
@@ -618,16 +619,16 @@ func TestServeFollowsAClientTrustBundleRotation(t *testing.T) {
 	}
 	// The rotation replaces the trust set rather than widening it, so the
 	// rotated-out CA must stop being accepted at the same moment.
-	rotatedOutClient := ca.issue(t, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	rotatedOutClient := issueTLS(t, ca, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	if serverErr, clientErr := tlsHandshake(s.tlsConfig, clientConfigPresenting(rotatedOutClient)); serverErr == nil && clientErr == nil {
 		t.Fatal("a client from the rotated-out CA was still accepted, want a refusal")
 	}
 }
 
 func TestServeFailsClosedOnAnUnreadableClientTrustBundle(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	s, trustPath := newTrustRotationServer(t, ca)
-	client := ca.issue(t, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	client := issueTLS(t, ca, routerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	if serverErr, clientErr := tlsHandshake(s.tlsConfig, clientConfigPresenting(client)); serverErr != nil || clientErr != nil {
 		t.Fatalf("server error = %v, client error = %v, want the client accepted before the bundle disappears", serverErr, clientErr)
 	}
@@ -656,7 +657,7 @@ func TestServeFailsClosedOnAnUnreadableClientTrustBundle(t *testing.T) {
 // caught here -- the pair is redundant on purpose, because dropping both is
 // what turns the router's front door into an open one.
 func TestServeRefusesAClientWithNoCertificate(t *testing.T) {
-	s, _ := newTrustRotationServer(t, newTestCA(t))
+	s, _ := newTrustRotationServer(t, testca.New(t, "test-ca"))
 	serverErr, clientErr := tlsHandshake(s.tlsConfig, &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true, // Only the server's client authentication is under test.
@@ -672,9 +673,9 @@ func TestServeRefusesAClientWithNoCertificate(t *testing.T) {
 // failure rather than as this router's own misconfiguration.
 func TestNewServerRejectsAnUnreadableTrustBundle(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	bundlePath := filepath.Join(dir, "server.pem")
-	writeCredentialBundle(t, bundlePath, ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+	writeCredentialBundle(t, bundlePath, issueTLS(t, ca, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
 	upstream, err := url.Parse("http://actor.internal:80")
 	if err != nil {
 		t.Fatal(err)
@@ -695,15 +696,15 @@ func TestNewServerRejectsAnUnreadableTrustBundle(t *testing.T) {
 // enables HTTP/2 when tlsConfig.NextProtos is empty — this pins that.
 func TestServeNegotiatesH2(t *testing.T) {
 	dir := t.TempDir()
-	ca := newTestCA(t)
-	serverCert := ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
+	ca := testca.New(t, "test-ca")
+	serverCert := issueTLS(t, ca, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 	bundlePath := filepath.Join(dir, "server.pem")
 	trustPath := filepath.Join(dir, "trust.pem")
 	writeCredentialBundle(t, bundlePath, serverCert)
-	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	clientCert := ca.issue(t, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	clientCert := issueTLS(t, ca, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 
 	// The actor: an h2c-capable backend, so gRPC-shaped requests can arrive
 	// as HTTP/2 while everything else must still be downgraded to HTTP/1.1.
@@ -905,80 +906,18 @@ func makeCertFiles(t *testing.T, dir string) (bundlePath, trustPath string) {
 	return bundlePath, trustPath
 }
 
-type testCA struct {
-	cert    *x509.Certificate
-	key     *ecdsa.PrivateKey
-	certPEM []byte
-}
-
-func newTestCA(t *testing.T) *testCA {
+func issueTLS(t *testing.T, ca *testca.CA, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(now.UnixNano()),
-		Subject:               pkix.Name{CommonName: "test CA"},
-		NotBefore:             now.Add(-time.Minute),
-		NotAfter:              now.Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &testCA{
-		cert:    cert,
-		key:     key,
-		certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-	}
-}
-
-func (ca *testCA) issue(t *testing.T, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(now.UnixNano()),
-		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  usages,
-	}
+	opts := testca.Opts{ExtKeyUsage: usages}
 	if spiffeID != "" {
-		uri, err := url.Parse(spiffeID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		template.URIs = []*url.URL{uri}
+		opts.URIs = []string{spiffeID}
 	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
+	leaf := ca.Issue(t, opts)
+	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.X509KeyPair(
-		append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), ca.certPEM...),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }
 
 func writeCredentialBundle(t *testing.T, path string, cert tls.Certificate) {
@@ -1322,4 +1261,18 @@ func TestIngressReincarnationSurvivesStaleDeactivate(t *testing.T) {
 	if s.active[ref] != nil {
 		t.Error("Deactivate left the actor active")
 	}
+}
+
+func issueTLS(t *testing.T, ca *testca.CA, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
+	t.Helper()
+	opts := testca.Opts{ExtKeyUsage: usages}
+	if spiffeID != "" {
+		opts.URIs = []string{spiffeID}
+	}
+	leaf := ca.Issue(t, opts)
+	cert, err := x509.ParseCertificate(leaf.CertDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }

@@ -98,6 +98,8 @@ type Opts struct {
 	// the address it connected to.
 	IPs  []string
 	URIs []string
+	ExtKeyUsage []x509.ExtKeyUsage
+	MutateTemplate func(*x509.Certificate)
 }
 
 // Issued is a leaf certificate and its private key.
@@ -133,16 +135,23 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 	if commonName == "" {
 		commonName = "leaf"
 	}
+	extKeyUsage := opts.ExtKeyUsage
+	if len(extKeyUsage) == 0 {
+		extKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: commonName},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:  extKeyUsage,
 		DNSNames:     opts.DNSNames,
 		IPAddresses:  ips,
 		URIs:         uris,
+	}
+	if opts.MutateTemplate != nil {
+		opts.MutateTemplate(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
 	if err != nil {

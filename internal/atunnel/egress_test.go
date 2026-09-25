@@ -375,7 +375,7 @@ func TestEgressDeactivationDropsConcurrentRenewal(t *testing.T) {
 }
 
 func TestEgressEndToEnd(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	requests := make(chan *http.Request, 1)
 	gatewayDone := make(chan struct{})
 	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, req *http.Request) {

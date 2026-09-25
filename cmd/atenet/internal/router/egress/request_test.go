@@ -30,6 +30,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 const (
@@ -278,8 +279,8 @@ func TestRequestLegPolicyLookup(t *testing.T) {
 // The CONNECT leg refuses to open a tunnel for an actor with nothing that
 // could be allowed through it, and warms the cache for the requests inside.
 func TestConnectLegRequiresAPolicy(t *testing.T) {
-	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, actorCertOptions{})
+	ca := testca.New(t, "actor-identity-ca")
+	leaf := issueActorCert(t, ca, actorCertOptions{})
 
 	tests := []struct {
 		name   string
@@ -294,7 +295,7 @@ func TestConnectLegRequiresAPolicy(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := New(tc.client, ca.roots(), DefaultPolicyCacheTTL, nil, "")
+			h := New(tc.client, ca.Pool(), DefaultPolicyCacheTTL, nil, "")
 			res, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
 			if tc.want == 0 {
 				wantAllowed(t, res, err)
