@@ -23,9 +23,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/portforward"
+	"github.com/agent-substrate/substrate/internal/rotatingtls"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
@@ -171,13 +173,13 @@ func dialDirect(ctx context.Context, kubeconfigPath, k8sContext, endpoint, token
 
 	// Verify the server before attaching the bearer token below: the token
 	// must never be sent over an unauthenticated channel.
-	tlsCfg, err := serverTLSConfig(ctx, clientset)
+	creds, err := serverCredentials(ctx, clientset)
 	if err != nil {
 		return nil, err
 	}
 
 	var opts []grpc.DialOption
-	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	opts = append(opts, grpc.WithTransportCredentials(creds))
 	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	opts = append(opts, grpc.WithDefaultServiceConfig(roundRobinServiceConfig))
 	tokenOpt, err := bearerTokenDialOption(ctx, clientset, tokenFile)
@@ -234,14 +236,14 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}
 	localEndpoint := fmt.Sprintf("127.0.0.1:%d", localPort)
 
-	tlsCfg, err := serverTLSConfig(ctx, clientset)
+	creds, err := serverCredentials(ctx, clientset)
 	if err != nil {
 		stopForward()
 		return nil, err
 	}
 
 	var opts []grpc.DialOption
-	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	opts = append(opts, grpc.WithTransportCredentials(creds))
 	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	tokenOpt, err := bearerTokenDialOption(ctx, clientset, tokenFile)
 	if err != nil {
@@ -268,6 +270,26 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 }
 
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.Config, error) {
+	pool, err := serverTrustPool(ctx, clientset)
+	if err != nil {
+		return nil, err
+	}
+	cfg := serverTLSTemplate()
+	cfg.RootCAs = pool
+	return cfg, nil
+}
+
+// serverTLSTemplate is everything about the connection to ateapi other than the
+// trust anchors, which rotate and so are filled in per handshake.
+func serverTLSTemplate() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: apiServerName(),
+	}
+}
+
+// serverTrustPool reads the live servicedns trust anchors from the API server.
+func serverTrustPool(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
 	ctbs, err := clientset.CertificatesV1beta1().ClusterTrustBundles().List(ctx, metav1.ListOptions{
 		LabelSelector: liveBundleSelector,
 	})
@@ -290,11 +312,111 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface) (*tls.
 		return nil, fmt.Errorf("no live ClusterTrustBundle found for signer %q", serviceDNSSignerName)
 	}
 
-	return &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		RootCAs:    pool,
-		ServerName: apiServerName(),
-	}, nil
+	return pool, nil
+}
+
+const (
+	// trustPoolTTL bounds how long after a servicedns CA rotation this client
+	// can still be dialing with the pre-rotation anchor set.
+	//
+	// It is deliberately short, so that the correctness argument does not
+	// depend on the overlap window the signer happens to maintain between
+	// publishing a new CA and serving leaves from it. The cost is one LIST per
+	// minute from a long-lived process and, because the TTL is only consulted
+	// on a handshake, exactly zero extra calls from a kubectl-ate invocation
+	// that dials once and exits.
+	trustPoolTTL = time.Minute
+
+	// trustPoolListTimeout bounds a refresh LIST. The reload runs inside a TLS
+	// handshake, and the loader seam carries no context, so without this an
+	// unresponsive API server would hang the handshake rather than fail it.
+	trustPoolListTimeout = 10 * time.Second
+)
+
+// trustPoolCache serves the live servicedns trust anchors, re-reading them from
+// the API server at most once per ttl.
+//
+// A LIST on every handshake is not acceptable and a pool fixed at construction
+// is the defect; the TTL is the middle. Refresh errors are NOT papered over
+// with the last good pool: serving a known-stale anchor set indefinitely is the
+// frozen-pool defect on a slower clock, so a failed refresh fails the handshake
+// and gRPC reconnects.
+type trustPoolCache struct {
+	load func(context.Context) (*x509.CertPool, error)
+	ttl  time.Duration
+	now  func() time.Time
+
+	// mu is held across the reload so that concurrent handshakes past the TTL
+	// produce one LIST between them, not one each.
+	mu       sync.Mutex
+	pool     *x509.CertPool
+	loadedAt time.Time
+}
+
+func newTrustPoolCache(clientset kubernetes.Interface) *trustPoolCache {
+	return &trustPoolCache{
+		load: func(ctx context.Context) (*x509.CertPool, error) {
+			return serverTrustPool(ctx, clientset)
+		},
+		ttl: trustPoolTTL,
+		now: time.Now,
+	}
+}
+
+// roots returns the cached anchors, refreshing them if they have aged out.
+func (c *trustPoolCache) roots() (*x509.CertPool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.pool != nil && c.now().Sub(c.loadedAt) < c.ttl {
+		return c.pool, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), trustPoolListTimeout)
+	defer cancel()
+	pool, err := c.load(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refreshing the ateapi trust anchors: %w", err)
+	}
+	c.pool, c.loadedAt = pool, c.now()
+	return pool, nil
+}
+
+// serverCredentials returns transport credentials for ateapi whose trust
+// anchors follow a rotation of the servicedns CA (#9518).
+//
+// The anchors come from the API server rather than from a projected file, so
+// the loader is a TTL-cached LIST rather than credbundle.PoolLoader's stat
+// check; the per-handshake reload mechanism is the one #9517 established.
+//
+// The pool is read once here so that an unreachable API server or a missing
+// bundle fails at construction, as it did before, rather than at the first RPC.
+func serverCredentials(ctx context.Context, clientset kubernetes.Interface) (credentials.TransportCredentials, error) {
+	cache := newTrustPoolCache(clientset)
+	if err := cache.warm(ctx); err != nil {
+		return nil, err
+	}
+	return cache.credentials(), nil
+}
+
+// warm primes the cache from ctx, so that an unreachable API server or a
+// missing bundle is reported by the caller that built the client rather than
+// by the first handshake.
+func (c *trustPoolCache) warm(ctx context.Context) error {
+	pool, err := c.load(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pool, c.loadedAt = pool, c.now()
+	return nil
+}
+
+// credentials returns dial credentials that take their trust anchors from this
+// cache at every handshake.
+func (c *trustPoolCache) credentials() credentials.TransportCredentials {
+	return rotatingtls.NewCredentials(serverTLSTemplate(), c.roots)
 }
 
 // bearerTokenDialOption attaches the configured token, or mints an ate-client
