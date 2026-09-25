@@ -69,35 +69,25 @@ func TestParseRejectsNonPKCS8PrivateKeyBlock(t *testing.T) {
 }
 
 func TestLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
-	bundle := makeBundle(t, 7)
-	path := writeBundle(t, bundle)
+	path := writeBundle(t, makeBundle(t, 7))
 	getCert := Loader(path)
 
-	if _, err := getCert(nil); err != nil {
+	first, err := getCert(nil)
+	if err != nil {
 		t.Fatalf("Loader() first call error = %v", err)
 	}
 
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat bundle: %v", err)
-	}
-	// Replace the content with same-length garbage and restore the mtime, so
-	// file identity (inode), size, and mtime all still match the cached stat.
-	// The cached parse must be served; any re-read would fail loudly on the
-	// garbage.
-	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(bundle)), 0o600); err != nil {
-		t.Fatalf("overwrite bundle: %v", err)
-	}
-	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
-		t.Fatalf("restore mtime: %v", err)
-	}
+	// Rewriting the same bytes, which is what a re-projection of unchanged
+	// content looks like, must not cost a parse: the very same object is
+	// handed back.
+	rewritePreservingStat(t, path, nil)
 
-	cert, err := getCert(nil)
+	second, err := getCert(nil)
 	if err != nil {
-		t.Fatalf("Loader() with unchanged stat error = %v", err)
+		t.Fatalf("Loader() second call error = %v", err)
 	}
-	if got := leafSerial(t, cert); got != 7 {
-		t.Fatalf("Loader() leaf serial = %d, want cached 7", got)
+	if second != first {
+		t.Fatalf("Loader() re-parsed an unchanged bundle, want the cached parse")
 	}
 }
 
@@ -127,26 +117,19 @@ func TestLoaderPicksUpProjectedVolumeRotation(t *testing.T) {
 }
 
 func TestLoaderPicksUpInPlaceRewrite(t *testing.T) {
-	path := writeBundle(t, makeBundle(t, 1))
+	path := writeBundle(t, padded(t, makeBundle(t, 1)))
 	getCert := Loader(path)
 
 	if _, err := getCert(nil); err != nil {
 		t.Fatalf("Loader() first call error = %v", err)
 	}
 
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat bundle: %v", err)
-	}
-	// Rewrite the file in place (same inode) and push the mtime forward so
-	// the change is visible even on filesystems with coarse timestamps.
-	if err := os.WriteFile(path, makeBundle(t, 2), 0o600); err != nil {
-		t.Fatalf("rewrite bundle: %v", err)
-	}
-	bumped := fi.ModTime().Add(time.Second)
-	if err := os.Chtimes(path, bumped, bumped); err != nil {
-		t.Fatalf("bump mtime: %v", err)
-	}
+	// The rewrite is made indistinguishable from the previous content by stat
+	// alone: same inode, same size, same mtime. That is not a contrived case —
+	// it is what an in-place rotation landing inside the filesystem's timestamp
+	// granularity looks like, and two bundles minted from one template are the
+	// same size as a matter of course.
+	rewritePreservingStat(t, path, makeBundle(t, 2))
 
 	cert, err := getCert(nil)
 	if err != nil {
@@ -217,8 +200,7 @@ func TestClientLoaderCachesAndReloads(t *testing.T) {
 }
 
 func TestPoolLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
-	trust := makeTrustBundle(t, 5)
-	path := writeBundle(t, trust)
+	path := writeBundle(t, makeTrustBundle(t, 5))
 	getPool := PoolLoader(path)
 
 	first, err := getPool()
@@ -226,26 +208,46 @@ func TestPoolLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
 		t.Fatalf("PoolLoader() first call error = %v", err)
 	}
 
-	fi, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat bundle: %v", err)
-	}
-	// Overwrite with same-length garbage and restore the mtime so identity,
-	// size, and mtime all still match: the cached pool must be served, since a
-	// re-read would fail loudly on the garbage.
-	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(trust)), 0o600); err != nil {
-		t.Fatalf("overwrite bundle: %v", err)
-	}
-	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
-		t.Fatalf("restore mtime: %v", err)
-	}
+	rewritePreservingStat(t, path, nil)
 
 	second, err := getPool()
 	if err != nil {
-		t.Fatalf("PoolLoader() with unchanged stat error = %v", err)
+		t.Fatalf("PoolLoader() second call error = %v", err)
 	}
-	if !second.Equal(first) {
-		t.Fatalf("PoolLoader() returned a re-parsed pool, want the cached one")
+	if second != first {
+		t.Fatalf("PoolLoader() re-parsed an unchanged trust bundle, want the cached parse")
+	}
+}
+
+// TestPoolLoaderPicksUpARewriteIndistinguishableByStat is the trust-anchor half
+// of TestLoaderPicksUpInPlaceRewrite, and the one with teeth: a CA that has
+// been retired must stop being trusted even when the rotation that retired it
+// left the file's identity, size and mtime exactly as they were.
+func TestPoolLoaderPicksUpARewriteIndistinguishableByStat(t *testing.T) {
+	path := writeBundle(t, padded(t, makeTrustBundle(t, 1)))
+	getPool := PoolLoader(path)
+
+	before, err := getPool()
+	if err != nil {
+		t.Fatalf("PoolLoader() first call error = %v", err)
+	}
+
+	rotated := makeTrustBundle(t, 2)
+	rewritePreservingStat(t, path, rotated)
+
+	after, err := getPool()
+	if err != nil {
+		t.Fatalf("PoolLoader() after rotation error = %v", err)
+	}
+	if after.Equal(before) {
+		t.Fatalf("PoolLoader() still trusts the retired CA after an in-place rotation")
+	}
+	want, err := ParsePool(path)
+	if err != nil {
+		t.Fatalf("ParsePool() error = %v", err)
+	}
+	if !after.Equal(want) {
+		t.Fatalf("PoolLoader() pool does not match the rotated trust bundle")
 	}
 }
 
@@ -283,6 +285,25 @@ func TestPoolLoaderErrorWhenBundleMissing(t *testing.T) {
 	getPool := PoolLoader(t.TempDir() + "/absent.pem")
 	if _, err := getPool(); err == nil {
 		t.Fatalf("PoolLoader() error = nil, want missing-file error")
+	}
+}
+
+// TestLoadersRejectAnEmptyFile guards the first-call case that a contents
+// comparison gets wrong if it is written carelessly: two empty byte slices are
+// equal, so a cache that compares contents without first checking it holds a
+// parse would treat an empty file as a hit and hand back a nil result. A nil
+// trust pool is the dangerous one — it falls back to the host's root CAs, so a
+// truncated bundle would widen trust rather than fail.
+func TestLoadersRejectAnEmptyFile(t *testing.T) {
+	path := writeBundle(t, nil)
+
+	pool, err := PoolLoader(path)()
+	if err == nil {
+		t.Fatalf("PoolLoader() over an empty file = %v, nil; want an error", pool)
+	}
+	cert, err := Loader(path)(nil)
+	if err == nil {
+		t.Fatalf("Loader() over an empty file = %v, nil; want an error", cert)
 	}
 }
 
@@ -365,6 +386,58 @@ func generateCertificate(t *testing.T, serial int64) []byte {
 		t.Fatalf("create certificate: %v", err)
 	}
 	return der
+}
+
+// paddedBundleSize is comfortably larger than any bundle these tests generate.
+const paddedBundleSize = 4096
+
+// padded returns b extended to paddedBundleSize with newlines, so that a test
+// can rewrite a file with different content and still keep its size — one of
+// the three things a stat compares — identical. Whitespace between and after
+// PEM blocks belongs to no block, so the padding does not change the parse.
+func padded(t *testing.T, b []byte) []byte {
+	t.Helper()
+	if len(b) > paddedBundleSize {
+		t.Fatalf("bundle is %d bytes, larger than the %d-byte pad", len(b), paddedBundleSize)
+	}
+	return append(b, bytes.Repeat([]byte("\n"), paddedBundleSize-len(b))...)
+}
+
+// rewritePreservingStat overwrites path with content — or with the bytes
+// already there, when content is nil — leaving the file indistinguishable from
+// before by stat alone: os.WriteFile truncates the file in place rather than
+// replacing it, so the inode is unchanged; the mtime is restored; and content
+// is padded back out to the size it found. It asserts that afterwards, so a
+// test built on it cannot quietly stop exercising the case it names.
+func rewritePreservingStat(t *testing.T, path string, content []byte) {
+	t.Helper()
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if content == nil {
+		if content, err = os.ReadFile(path); err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+	}
+	if int64(len(content)) > before.Size() {
+		t.Fatalf("replacement is %d bytes, too long to fit the %d-byte file", len(content), before.Size())
+	}
+	content = append(content, bytes.Repeat([]byte("\n"), int(before.Size())-len(content))...)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", path, err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatalf("restore mtime on %s: %v", path, err)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("re-stat %s: %v", path, err)
+	}
+	if !os.SameFile(before, after) || !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+		t.Fatalf("the rewrite of %s is visible to stat, so the test is not exercising the case it names", path)
+	}
 }
 
 func writeBundle(t *testing.T, bundle []byte) string {

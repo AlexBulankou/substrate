@@ -15,6 +15,7 @@
 package csi
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -394,13 +395,14 @@ func resolveTLSConfig(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (*tls.Confi
 	}, nil
 }
 
-// caPoolCache holds the parsed *x509.CertPool and file stat so unchanged CA trust bundles
-// are not re-read from disk on every TLS handshake.
+// caPoolCache holds the parsed *x509.CertPool together with the bytes it was
+// parsed from, so unchanged CA trust bundles are not re-parsed on every TLS
+// handshake.
 type caPoolCache struct {
 	path string
 
 	mu   sync.Mutex
-	fi   os.FileInfo
+	raw  []byte
 	pool *x509.CertPool
 }
 
@@ -408,48 +410,53 @@ func newCAPoolCache(path string) *caPoolCache {
 	return &caPoolCache{path: path}
 }
 
-// isFileUnchanged reports whether newFi is the same file as the stat the cached
-// pool was parsed from.
-func (c *caPoolCache) isFileUnchanged(newFi os.FileInfo) bool {
-	if c.fi == nil || newFi == nil {
-		return false
-	}
-	return os.SameFile(c.fi, newFi) && c.fi.ModTime().Equal(newFi.ModTime()) && c.fi.Size() == newFi.Size()
-}
-
-// getCertPool returns the parsed CA cert pool, re-reading the file only when it has changed
-// on disk (identity, modification time, or size).
+// getCertPool returns the parsed CA cert pool, re-parsing only when the file
+// contents have changed since the last successful parse.
+//
+// The comparison is over the bytes, not over the file's metadata. Stat-based
+// invalidation is what a rotation can slip past: filesystem timestamps are
+// granular (a millisecond on a typical CONFIG_HZ=1000 kernel), an in-place
+// rewrite leaves the inode unchanged, and two certificates minted from one
+// template encode to the same length, so a rotation landing inside that window
+// is invisible in all three of identity, mtime and size at once. This pool is
+// read from inside VerifyPeerCertificate, so what a missed invalidation costs
+// is not a stale cache entry but the root set a peer is verified against, and
+// the direction of the error is fail-open: a rotated-out CA stays trusted.
+//
+// Reading the file is what makes the check exact, and costs nothing worth
+// saving: a trust bundle is a few kilobytes against the public-key operations
+// that follow. The parse is what the cache is for, and byte-identical content
+// still yields the identical parse.
+//
+// The already-parsed guard is load-bearing rather than an optimisation: bytes
+// are equal when both are empty, so without it a first call against an empty
+// file would serve a nil pool as if it were a cache hit.
 func (c *caPoolCache) getCertPool() (*x509.CertPool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fi, err := os.Stat(c.path)
+	raw, err := os.ReadFile(c.path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to stat CA cert file %q: %w", c.path, err)
+		return nil, fmt.Errorf("failed to read CA cert file %q: %w", c.path, err)
 	}
 
-	if c.pool != nil && c.isFileUnchanged(fi) {
+	if c.pool != nil && bytes.Equal(c.raw, raw) {
 		return c.pool, nil
 	}
 
-	pool, err := parseCertPool(c.path)
+	pool, err := parseCertPool(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("while parsing CA cert file %q: %w", c.path, err)
 	}
 
-	c.fi, c.pool = fi, pool
+	c.raw, c.pool = raw, pool
 	return c.pool, nil
 }
 
-func parseCertPool(path string) (*x509.CertPool, error) {
-	certBytes, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read cert file %q: %w", path, err)
-	}
-
+func parseCertPool(certBytes []byte) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	if ok := pool.AppendCertsFromPEM(certBytes); !ok {
-		return nil, fmt.Errorf("failed to parse any certificates from %q", path)
+		return nil, fmt.Errorf("failed to parse any certificates")
 	}
 	return pool, nil
 }

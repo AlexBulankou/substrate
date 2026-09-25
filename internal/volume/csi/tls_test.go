@@ -15,6 +15,7 @@
 package csi
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -389,15 +390,124 @@ func TestCAPoolCache_HitAndFileChange(t *testing.T) {
 		t.Errorf("expected cached cert pool pointer equality on unchanged file, got %p != %p", pool1, pool2)
 	}
 
-	// Modify the file.
+	// Rewrite the file with the SAME bytes. The cache keys on content, so this
+	// is a hit: an identical bundle yields an identical parse, and there is
+	// nothing for a caller to observe. Under the previous stat-triple this
+	// case was a coin flip — it invalidated or not depending on whether the
+	// rewrite happened to land in a later filesystem timestamp tick, which is
+	// why this assertion used to read the other way round and why it failed on
+	// a host with 1 ms mtime granularity.
 	writeFile(t, caPath, ca.certPEM())
 
-	// 3rd call should detect file change and return a newly parsed pool.
 	pool3, err := cache.getCertPool()
 	if err != nil {
 		t.Fatalf("failed to get cert pool: %v", err)
 	}
-	if pool1 == pool3 {
-		t.Errorf("expected new cert pool after file modification, got same pointer %p", pool3)
+	if pool1 != pool3 {
+		t.Errorf("expected cached cert pool on a byte-identical rewrite, got %p != %p", pool1, pool3)
+	}
+
+	// Rotate to a DIFFERENT CA. A rotation must be visible; see
+	// TestCAPoolCache_RotationInvisibleToStatTriple for the case where it is
+	// invisible to every stat dimension at once.
+	rotated := newTestCA(t)
+	writeFile(t, caPath, rotated.certPEM())
+
+	pool4, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool after rotation: %v", err)
+	}
+	if pool1 == pool4 {
+		t.Errorf("expected new cert pool after CA rotation, got same pointer %p", pool4)
+	}
+}
+
+// padPEM appends trailing newlines so a bundle reaches n bytes. PEM parsing
+// ignores trailing whitespace, so the padded bundle trusts exactly the same
+// CAs — this only removes size as a distinguisher, it does not fake the fix.
+func padPEM(b []byte, n int) []byte {
+	if len(b) >= n {
+		return b
+	}
+	return append(b, bytes.Repeat([]byte("\n"), n-len(b))...)
+}
+
+// The rotation case is only a regression test if the new bundle is
+// indistinguishable from the old one to the stat triple (os.SameFile &&
+// ModTime.Equal && Size ==) that used to guard this cache. Rather than hope
+// the host's clock cooperates, construct that collision deterministically:
+// os.WriteFile truncates in place so the inode is unchanged, the bundles are
+// padded to a common length, and os.Chtimes restores the original timestamp.
+// The premise is asserted live, not claimed in a comment — so if a future
+// change makes one of the three dimensions catch the rotation again, this test
+// says so instead of passing vacuously.
+//
+// Against the stat-triple implementation this test FAILS on every host: all
+// three dimensions compare equal, the stale pool is served, and a rotated-out
+// CA keeps being trusted. That is the defect.
+func TestCAPoolCache_RotationInvisibleToStatTriple(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "trust-bundle.pem")
+
+	oldCA := newTestCA(t)
+	newCA := newTestCA(t)
+	size := len(oldCA.certPEM())
+	if n := len(newCA.certPEM()); n > size {
+		size = n
+	}
+	before, after := padPEM(oldCA.certPEM(), size), padPEM(newCA.certPEM(), size)
+	if bytes.Equal(before, after) {
+		t.Fatal("the two test CAs are byte-identical; newTestCA is not minting distinct CAs")
+	}
+
+	writeFile(t, caPath, before)
+	fi1, err := os.Stat(caPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	cache := newCAPoolCache(caPath)
+	pool1, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool: %v", err)
+	}
+
+	writeFile(t, caPath, after)
+	if err := os.Chtimes(caPath, fi1.ModTime(), fi1.ModTime()); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Pin the premise: the rotation is invisible to all three stat dimensions.
+	fi2, err := os.Stat(caPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !os.SameFile(fi1, fi2) {
+		t.Fatal("in-place rewrite changed file identity; os.WriteFile no longer truncates in place")
+	}
+	if !fi1.ModTime().Equal(fi2.ModTime()) {
+		t.Fatalf("mtime not restored (%v -> %v)", fi1.ModTime(), fi2.ModTime())
+	}
+	if fi1.Size() != fi2.Size() {
+		t.Fatalf("rotation changed size (%d -> %d) despite padding", fi1.Size(), fi2.Size())
+	}
+
+	pool2, err := cache.getCertPool()
+	if err != nil {
+		t.Fatalf("failed to get cert pool after rotation: %v", err)
+	}
+	if pool1 == pool2 {
+		t.Fatal("cache served the stale pool after a rotation invisible to stat")
+	}
+
+	// Pointer inequality alone would not prove the right bundle was loaded.
+	opts := x509.VerifyOptions{Roots: pool2, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}
+	if _, err := newCA.cert.Verify(opts); err != nil {
+		t.Errorf("rotated-in CA is not trusted by the refreshed pool: %v", err)
+	}
+	if _, err := oldCA.cert.Verify(opts); err == nil {
+		t.Error("rotated-out CA is still trusted by the refreshed pool")
 	}
 }
