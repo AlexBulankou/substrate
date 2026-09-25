@@ -16,14 +16,11 @@ package ateapiauth
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"os"
 
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/k8sresolver"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -34,8 +31,9 @@ const DefaultServiceAccountCAFile = "/var/run/secrets/kubernetes.io/serviceaccou
 const roundRobinServiceConfig = `{"loadBalancingConfig": [{"round_robin":{}}]}`
 
 // ClientConfig configures how to dial the ateapi gRPC server with mutual TLS.
-// The credential bundle is re-read on every handshake so in-place
-// pod-certificate rotations are picked up.
+// Both the credential bundle and the CA file are re-read on every handshake,
+// so in-place pod-certificate and CA rotations are picked up without a
+// restart.
 type ClientConfig struct {
 	// CAFile is a PEM file containing CA certs that sign the server cert.
 	// Required.
@@ -62,13 +60,14 @@ func DialOptions(cfg ClientConfig) ([]grpc.DialOption, error) {
 	if cfg.ClientCredBundle == "" {
 		return nil, fmt.Errorf("ateapiauth: a client credential bundle (mTLS) is required")
 	}
-	pool, err := loadCAPool(cfg.CAFile)
-	if err != nil {
-		return nil, err
+	// Read once here so a missing or malformed CA file fails the dialer at
+	// construction rather than at the first RPC.
+	loadRoots := credbundle.PoolLoader(cfg.CAFile)
+	if _, err := loadRoots(); err != nil {
+		return nil, fmt.Errorf("ateapiauth: reading CA file: %w", err)
 	}
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		RootCAs:    pool,
 		ServerName: cfg.ServerName,
 	}
 
@@ -80,18 +79,6 @@ func DialOptions(cfg ClientConfig) ([]grpc.DialOption, error) {
 	}
 
 	tlsCfg.GetClientCertificate = credbundle.ClientLoader(cfg.ClientCredBundle)
-	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	opts = append(opts, grpc.WithTransportCredentials(newReloadingRootsCreds(tlsCfg, loadRoots)))
 	return opts, nil
-}
-
-func loadCAPool(caFile string) (*x509.CertPool, error) {
-	caPEM, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("ateapiauth: reading CA file: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("ateapiauth: no certificates found in CA file %q", caFile)
-	}
-	return pool, nil
 }
