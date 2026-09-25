@@ -15,14 +15,18 @@
 package oidcjwt
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/credbundle"
 )
 
 // NewHTTPClient returns a client for OIDC discovery and JWKS requests.
@@ -32,21 +36,60 @@ func NewHTTPClient(issuer, certificateAuthorityFile, discoveryTokenFile string) 
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if certificateAuthorityFile != "" {
-		ca, err := os.ReadFile(certificateAuthorityFile)
-		if err != nil {
+		loadRoots := credbundle.PoolLoader(certificateAuthorityFile)
+		// Read once here so a missing or malformed CA file fails the provider
+		// at startup rather than on the first discovery request.
+		if _, err := loadRoots(); err != nil {
 			return nil, fmt.Errorf("read certificate authority file: %w", err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("certificate authority file %q contains no certificates", certificateAuthorityFile)
-		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+		transport.DialTLSContext = rotatingDialTLS(transport, loadRoots)
 	}
 	var roundTripper http.RoundTripper = transport
 	if discoveryTokenFile != "" {
 		roundTripper = &issuerDiscoveryTransport{base: transport, tokenFile: discoveryTokenFile, issuer: issuer}
 	}
 	return &http.Client{Timeout: 10 * time.Second, Transport: roundTripper}, nil
+}
+
+// rotatingDialTLS returns a DialTLSContext that reads the trust anchors for
+// every connection.
+//
+// Setting them on transport.TLSClientConfig instead would freeze them: a
+// tls.Config's RootCAs is fixed once the transport is in use, so the issuer's
+// CA would be pinned for the lifetime of the process and discovery would fail
+// from the moment that CA rotated until ateapi restarted. The bearer token
+// beside it is already re-read per request for the same reason.
+//
+// credbundle.PoolLoader caches on a stat triple, so a connection that finds an
+// unchanged file pays one stat.
+func rotatingDialTLS(transport *http.Transport, loadRoots func() (*x509.CertPool, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		roots, err := loadRoots()
+		if err != nil {
+			return nil, fmt.Errorf("read certificate authority file: %w", err)
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("split host and port of %q: %w", addr, err)
+		}
+		conn, err := transport.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{
+			RootCAs:    roots,
+			ServerName: host,
+			// net/http negotiates HTTP/2 over ALPN, which it can only do for
+			// itself when it owns the dial. Advertise the same protocols it
+			// would have.
+			NextProtos: []string{"h2", "http/1.1"},
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
 }
 
 // issuerDiscoveryTransport injects a bearer token for requests within the
