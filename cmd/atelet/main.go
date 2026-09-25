@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -336,10 +335,6 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to listen", err)
 	}
 
-	tlsCfg, err := ateletServerTLSConfig(*grpcServerCredBundle, *clientCACerts)
-	if err != nil {
-		serverboot.Fatal(ctx, "Failed to build server TLS config", err)
-	}
 	ateletCert, err := credbundle.Parse(*grpcServerCredBundle)
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to load atelet Pod identity", err)
@@ -352,8 +347,16 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to load atelet Pod identity", fmt.Errorf("credential bundle has no Pod identity"))
 	}
 
-	ateomFacingTLS := tlsCfg.Clone()
-	ateomFacingTLS.VerifyConnection = verifyClientOnSameNode(ateletIdentity)
+	tlsCfg, err := ateletServerTLSConfig(*grpcServerCredBundle, *clientCACerts, nil)
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to build server TLS config", err)
+	}
+	// The credential broker is reachable only over the node-local socket, and
+	// additionally requires the caller to be an ateom on this node.
+	ateomFacingTLS, err := ateletServerTLSConfig(*grpcServerCredBundle, *clientCACerts, verifyClientOnSameNode(ateletIdentity))
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to build credential broker TLS config", err)
+	}
 	if err := os.Remove(nodepath.AteomSupportSocket); err != nil && !errors.Is(err, os.ErrNotExist) {
 		serverboot.Fatal(ctx, "Failed to remove stale credential broker socket", err)
 	}
@@ -1946,21 +1949,44 @@ func removeActorDirs(actorUID string) error {
 
 // ateletServerTLSConfig builds a *tls.Config for a gRPC server that presents the
 // credential bundle at servingBundlePath, requires a client certificate
-// chaining to a CA in clientCAPath.
-func ateletServerTLSConfig(servingBundlePath, clientCAPath string) (*tls.Config, error) {
-	caBytes, err := os.ReadFile(clientCAPath)
-	if err != nil {
-		return nil, fmt.Errorf("read CA bundle %s: %w", clientCAPath, err)
+// chaining to a CA in clientCAPath, and — when verifyConnection is non-nil —
+// applies it as an additional per-connection check on the verified peer.
+//
+// Both halves follow the projection rather than a startup snapshot. The serving
+// certificate already did, via credbundle.Loader; the client-CA pool is read per
+// connection under GetConfigForClient, because a tls.Config's ClientCAs is frozen
+// once the config is in use. Without that, a pod-identity CA rotation leaves this
+// atelet verifying against the retired CA and rejecting every caller holding a
+// freshly issued certificate — which is ateapi, so the node goes unreachable to
+// the control plane until the process restarts.
+//
+// verifyConnection is a parameter rather than something a caller sets on the
+// returned config because the config GetConfigForClient returns replaces the
+// outer one wholesale: a field assigned outside this function would be silently
+// dropped at handshake time, which for a check of this kind fails open.
+func ateletServerTLSConfig(servingBundlePath, clientCAPath string, verifyConnection func(tls.ConnectionState) error) (*tls.Config, error) {
+	// Read once here so a missing or malformed projection fails atelet at
+	// startup rather than at the first handshake.
+	loadClientCAs := credbundle.PoolLoader(clientCAPath)
+	if _, err := loadClientCAs(); err != nil {
+		return nil, err
 	}
-	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(caBytes) {
-		return nil, fmt.Errorf("parse CA bundle from %s", clientCAPath)
-	}
+	serving := credbundle.Loader(servingBundlePath)
+
 	return &tls.Config{
-		MinVersion:     tls.VersionTLS13,
-		GetCertificate: credbundle.Loader(servingBundlePath),
-		ClientAuth:     tls.RequireAndVerifyClientCert,
-		ClientCAs:      clientCAs,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			clientCAs, err := loadClientCAs()
+			if err != nil {
+				return nil, err
+			}
+			return &tls.Config{
+				MinVersion:       tls.VersionTLS13,
+				GetCertificate:   serving,
+				ClientAuth:       tls.RequireAndVerifyClientCert,
+				ClientCAs:        clientCAs,
+				VerifyConnection: verifyConnection,
+			}, nil
+		},
 	}, nil
 }
 
