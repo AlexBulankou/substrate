@@ -20,6 +20,7 @@ import (
 
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/k8sresolver"
+	"github.com/agent-substrate/substrate/internal/rotatingtls"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 )
@@ -79,6 +80,6 @@ func DialOptions(cfg ClientConfig) ([]grpc.DialOption, error) {
 	}
 
 	tlsCfg.GetClientCertificate = credbundle.ClientLoader(cfg.ClientCredBundle)
-	opts = append(opts, grpc.WithTransportCredentials(newReloadingRootsCreds(tlsCfg, loadRoots)))
+	opts = append(opts, grpc.WithTransportCredentials(rotatingtls.NewCredentials(tlsCfg, loadRoots)))
 	return opts, nil
 }
