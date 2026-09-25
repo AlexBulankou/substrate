@@ -15,22 +15,14 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
+	"errors"
 	"net"
-	"net/url"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -44,16 +36,14 @@ import (
 // rotation ateapi — holding a freshly issued certificate — cannot reach this
 // atelet at all until the process restarts.
 func TestAteletServerTLSConfigReloadsClientCAs(t *testing.T) {
-	servingCA := mtlsNewCA(t, "atelet-serving-ca")
-	servingBundle := mtlsWriteCredBundle(t, servingCA.issue(t, mtlsCertOpts{dnsNames: []string{"atelet.test"}}))
-	servingRoots := x509.NewCertPool()
-	servingRoots.AddCert(servingCA.cert)
+	servingCA := testca.New(t, "atelet-serving-ca")
+	servingBundle := testca.WriteCredBundle(t, servingCA.Issue(t, testca.Opts{DNSNames: []string{"atelet.test"}}))
+	servingRoots := servingCA.Pool()
 
-	clientCA1 := mtlsNewCA(t, "pod-identity-ca-1")
-	clientCA2 := mtlsNewCA(t, "pod-identity-ca-2")
+	clientCA1 := testca.New(t, "pod-identity-ca-1")
+	clientCA2 := testca.New(t, "pod-identity-ca-2")
 
-	caPath := filepath.Join(t.TempDir(), "client-ca.pem")
-	mtlsWriteFileAt(t, caPath, clientCA1.certPEM, time.Now())
+	caPath := testca.WriteFile(t, "client-ca.pem", clientCA1.CertPEM)
 
 	cfg, err := ateletServerTLSConfig(servingBundle, caPath, nil)
 	if err != nil {
@@ -61,8 +51,8 @@ func TestAteletServerTLSConfigReloadsClientCAs(t *testing.T) {
 	}
 	creds := credentials.NewTLS(cfg)
 
-	fromCA1 := clientCA1.issue(t, mtlsCertOpts{})
-	fromCA2 := clientCA2.issue(t, mtlsCertOpts{})
+	fromCA1 := clientCA1.Issue(t, testca.Opts{})
+	fromCA2 := clientCA2.Issue(t, testca.Opts{})
 
 	if err := mtlsHandshake(t, creds, servingRoots, "atelet.test", &fromCA1); err != nil {
 		t.Fatalf("handshake with a CA1-signed client cert failed before rotation: %v", err)
@@ -71,9 +61,8 @@ func TestAteletServerTLSConfigReloadsClientCAs(t *testing.T) {
 		t.Fatal("handshake with a CA2-signed client cert succeeded before rotation, want a chain failure")
 	}
 
-	// Publish CA2 as the projected bundle. The mtime bump keeps the change
-	// visible where filesystem timestamps are coarse.
-	mtlsWriteFileAt(t, caPath, clientCA2.certPEM, time.Now().Add(time.Second))
+	// Publish CA2 as the projected bundle.
+	testca.Republish(t, caPath, clientCA2.CertPEM)
 
 	if err := mtlsHandshake(t, creds, servingRoots, "atelet.test", &fromCA2); err != nil {
 		t.Fatalf("handshake with a CA2-signed client cert failed after rotation: %v", err)
@@ -86,14 +75,12 @@ func TestAteletServerTLSConfigReloadsClientCAs(t *testing.T) {
 // TestAteletServerTLSConfigRequiresAClientCertificate pins the other half of
 // the contract: the reload must not have relaxed client-cert verification.
 func TestAteletServerTLSConfigRequiresAClientCertificate(t *testing.T) {
-	servingCA := mtlsNewCA(t, "atelet-serving-ca")
-	servingBundle := mtlsWriteCredBundle(t, servingCA.issue(t, mtlsCertOpts{dnsNames: []string{"atelet.test"}}))
-	servingRoots := x509.NewCertPool()
-	servingRoots.AddCert(servingCA.cert)
+	servingCA := testca.New(t, "atelet-serving-ca")
+	servingBundle := testca.WriteCredBundle(t, servingCA.Issue(t, testca.Opts{DNSNames: []string{"atelet.test"}}))
+	servingRoots := servingCA.Pool()
 
-	clientCA := mtlsNewCA(t, "pod-identity-ca")
-	caPath := filepath.Join(t.TempDir(), "client-ca.pem")
-	mtlsWriteFileAt(t, caPath, clientCA.certPEM, time.Now())
+	clientCA := testca.New(t, "pod-identity-ca")
+	caPath := testca.WriteFile(t, "client-ca.pem", clientCA.CertPEM)
 
 	cfg, err := ateletServerTLSConfig(servingBundle, caPath, nil)
 	if err != nil {
@@ -107,7 +94,7 @@ func TestAteletServerTLSConfigRequiresAClientCertificate(t *testing.T) {
 
 	// A certificate from an unrelated CA is refused even though one was
 	// presented, so the failure above is not merely "no cert offered".
-	other := mtlsNewCA(t, "unrelated-ca").issue(t, mtlsCertOpts{})
+	other := testca.New(t, "unrelated-ca").Issue(t, testca.Opts{})
 	if err := mtlsHandshake(t, creds, servingRoots, "atelet.test", &other); err == nil {
 		t.Fatal("handshake with an untrusted client certificate succeeded, want a chain failure")
 	}
@@ -119,16 +106,14 @@ func TestAteletServerTLSConfigRequiresAClientCertificate(t *testing.T) {
 // wholesale — an externally assigned VerifyConnection would never run, and a
 // dropped check of this kind fails open.
 func TestAteletServerTLSConfigAppliesVerifyConnection(t *testing.T) {
-	servingCA := mtlsNewCA(t, "atelet-serving-ca")
-	servingBundle := mtlsWriteCredBundle(t, servingCA.issue(t, mtlsCertOpts{dnsNames: []string{"atelet.test"}}))
-	servingRoots := x509.NewCertPool()
-	servingRoots.AddCert(servingCA.cert)
+	servingCA := testca.New(t, "atelet-serving-ca")
+	servingBundle := testca.WriteCredBundle(t, servingCA.Issue(t, testca.Opts{DNSNames: []string{"atelet.test"}}))
+	servingRoots := servingCA.Pool()
 
-	clientCA := mtlsNewCA(t, "pod-identity-ca")
-	caPath := filepath.Join(t.TempDir(), "client-ca.pem")
-	mtlsWriteFileAt(t, caPath, clientCA.certPEM, time.Now())
+	clientCA := testca.New(t, "pod-identity-ca")
+	caPath := testca.WriteFile(t, "client-ca.pem", clientCA.CertPEM)
 
-	trusted := clientCA.issue(t, mtlsCertOpts{})
+	trusted := clientCA.Issue(t, testca.Opts{})
 
 	called := 0
 	cfg, err := ateletServerTLSConfig(servingBundle, caPath, func(tls.ConnectionState) error {
@@ -163,12 +148,12 @@ func TestAteletServerTLSConfigAppliesVerifyConnection(t *testing.T) {
 // read: a missing or malformed projection has to fail atelet at startup rather
 // than surface as a handshake error on the first ateapi call.
 func TestAteletServerTLSConfigFailsFastOnABadBundle(t *testing.T) {
-	servingCA := mtlsNewCA(t, "atelet-serving-ca")
-	servingBundle := mtlsWriteCredBundle(t, servingCA.issue(t, mtlsCertOpts{dnsNames: []string{"atelet.test"}}))
+	servingCA := testca.New(t, "atelet-serving-ca")
+	servingBundle := testca.WriteCredBundle(t, servingCA.Issue(t, testca.Opts{DNSNames: []string{"atelet.test"}}))
 	dir := t.TempDir()
 
 	garbage := filepath.Join(dir, "garbage.pem")
-	mtlsWriteFileAt(t, garbage, []byte("not a certificate\n"), time.Now())
+	testca.Republish(t, garbage, []byte("not a certificate\n"))
 
 	for _, tc := range []struct {
 		name string
@@ -186,16 +171,12 @@ func TestAteletServerTLSConfigFailsFastOnABadBundle(t *testing.T) {
 }
 
 // errRefusedByVerifyConnection is returned by the test's VerifyConnection stub.
-var errRefusedByVerifyConnection = &mtlsTestError{"refused by VerifyConnection"}
-
-type mtlsTestError struct{ msg string }
-
-func (e *mtlsTestError) Error() string { return e.msg }
+var errRefusedByVerifyConnection = errors.New("refused by VerifyConnection")
 
 // mtlsHandshake performs one TLS handshake against creds, presenting
 // clientCert (nil for none) and trusting the server with serverRoots. It
 // reports the first end to fail.
-func mtlsHandshake(t *testing.T, creds credentials.TransportCredentials, serverRoots *x509.CertPool, serverName string, clientCert *mtlsIssued) error {
+func mtlsHandshake(t *testing.T, creds credentials.TransportCredentials, serverRoots *x509.CertPool, serverName string, clientCert *testca.Issued) error {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -229,7 +210,7 @@ func mtlsHandshake(t *testing.T, creds credentials.TransportCredentials, serverR
 		// sends an empty certificate when none matches. That would make an
 		// untrusted certificate look refused without the server ever verifying
 		// a chain, so the negative cases below would pass against any pool.
-		offered := tls.Certificate{Certificate: [][]byte{clientCert.certDER}, PrivateKey: clientCert.key}
+		offered := tls.Certificate{Certificate: [][]byte{clientCert.CertDER}, PrivateKey: clientCert.Key}
 		clientCfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return &offered, nil
 		}
@@ -244,108 +225,4 @@ func mtlsHandshake(t *testing.T, creds credentials.TransportCredentials, serverR
 		return err
 	}
 	return clientErr
-}
-
-// mtlsCA is a self-signed certificate authority used to issue test certificates.
-type mtlsCA struct {
-	cert    *x509.Certificate
-	key     *ecdsa.PrivateKey
-	certPEM []byte
-}
-
-func mtlsNewCA(t *testing.T, cn string) *mtlsCA {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate CA key: %v", err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: cn},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create CA certificate: %v", err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatalf("parse CA certificate: %v", err)
-	}
-	return &mtlsCA{cert: cert, key: key, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
-}
-
-type mtlsCertOpts struct {
-	dnsNames []string
-	uris     []string
-}
-
-// mtlsIssued is a leaf certificate and its private key.
-type mtlsIssued struct {
-	certDER []byte
-	key     *ecdsa.PrivateKey
-}
-
-func (c *mtlsCA) issue(t *testing.T, opts mtlsCertOpts) mtlsIssued {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate leaf key: %v", err)
-	}
-	var uris []*url.URL
-	for _, u := range opts.uris {
-		parsed, err := url.Parse(u)
-		if err != nil {
-			t.Fatalf("parse URI SAN %q: %v", u, err)
-		}
-		uris = append(uris, parsed)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: strings.Join(append(opts.dnsNames, "leaf"), "-")},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:     opts.dnsNames,
-		URIs:         uris,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, &key.PublicKey, c.key)
-	if err != nil {
-		t.Fatalf("create leaf certificate: %v", err)
-	}
-	return mtlsIssued{certDER: der, key: key}
-}
-
-// mtlsWriteCredBundle writes a credential bundle (leaf certificate + PKCS8 key)
-// in the format credbundle.Parse expects and returns its path.
-func mtlsWriteCredBundle(t *testing.T, leaf mtlsIssued) string {
-	t.Helper()
-	keyDER, err := x509.MarshalPKCS8PrivateKey(leaf.key)
-	if err != nil {
-		t.Fatalf("marshal PKCS8 key: %v", err)
-	}
-	bundle := append(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...,
-	)
-	path := filepath.Join(t.TempDir(), "serving-bundle.pem")
-	if err := os.WriteFile(path, bundle, 0o600); err != nil {
-		t.Fatalf("write credential bundle: %v", err)
-	}
-	return path
-}
-
-func mtlsWriteFileAt(t *testing.T, path string, data []byte, mtime time.Time) {
-	t.Helper()
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-	if err := os.Chtimes(path, mtime, mtime); err != nil {
-		t.Fatalf("chtimes %s: %v", path, err)
-	}
 }
