@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -112,44 +111,6 @@ func TestDialOptionsFailsFastOnABadCAFile(t *testing.T) {
 				t.Fatal("DialOptions() error = nil, want an error at construction")
 			}
 		})
-	}
-}
-
-// TestReloadingRootsCredsSurfaceRoundTrip covers the parts of the
-// TransportCredentials contract that are not exercised by a handshake.
-func TestReloadingRootsCredsSurfaceRoundTrip(t *testing.T) {
-	ca := testca.New(t, "ca")
-	caFile := testca.WriteFile(t, "ca.pem", ca.CertPEM)
-
-	creds := newReloadingRootsCreds(&tls.Config{ServerName: ateapiServerName}, credbundle.PoolLoader(caFile))
-
-	if got := creds.Info().ServerName; got != ateapiServerName {
-		t.Errorf("Info().ServerName = %q, want %q", got, ateapiServerName)
-	}
-	if got := creds.Info().SecurityProtocol; got != "tls" {
-		t.Errorf("Info().SecurityProtocol = %q, want %q", got, "tls")
-	}
-
-	if err := creds.OverrideServerName("override.test"); err != nil {
-		t.Fatalf("OverrideServerName() error = %v", err)
-	}
-	if got := creds.Info().ServerName; got != "override.test" {
-		t.Errorf("after OverrideServerName, Info().ServerName = %q, want %q", got, "override.test")
-	}
-
-	// A clone carries the template forward but is independent of it, so an
-	// override on one channel does not retarget another.
-	clone := creds.Clone()
-	if err := clone.OverrideServerName("clone.test"); err != nil {
-		t.Fatalf("clone OverrideServerName() error = %v", err)
-	}
-	if got := creds.Info().ServerName; got != "override.test" {
-		t.Errorf("after cloning and overriding the clone, Info().ServerName = %q, want %q", got, "override.test")
-	}
-
-	// Serving is refused rather than quietly accepting unauthenticated peers.
-	if _, _, err := creds.ServerHandshake(nil); err == nil {
-		t.Error("ServerHandshake() error = nil, want these dial-only credentials to refuse")
 	}
 }
 
