@@ -15,22 +15,16 @@
 package csi
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"math/big"
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"testing"
-	"time"
 
+	"github.com/agent-substrate/substrate/internal/testca"
 	"github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -41,125 +35,10 @@ import (
 
 const mockDriverName = "mock-driver"
 
-// testCA is a self-signed CA that issues the server and client certificates for
-// one test.
-type testCA struct {
-	cert *x509.Certificate
-	key  *ecdsa.PrivateKey
-}
-
-func newTestCA(t *testing.T) *testCA {
-	t.Helper()
-	key := newKey(t)
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	cert, err := x509.ParseCertificate(createCert(t, tmpl, tmpl, &key.PublicKey, key))
-	if err != nil {
-		t.Fatalf("parse CA certificate: %v", err)
-	}
-	return &testCA{cert: cert, key: key}
-}
-
-// certPEM returns the CA certificate as a trust bundle would hold it.
-func (ca *testCA) certPEM() []byte {
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.cert.Raw})
-}
-
-// pool returns a CertPool trusting this CA and nothing else.
-func (ca *testCA) pool() *x509.CertPool {
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(ca.certPEM())
-	return pool
-}
-
-// serverCert issues a serving certificate valid for dnsName.
-func (ca *testCA) serverCert(t *testing.T, dnsName string) tls.Certificate {
-	t.Helper()
-	key := newKey(t)
-	der := createCert(t, &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "test-server"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		DNSNames:     []string{dnsName},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}, ca.cert, &key.PublicKey, ca.key)
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-}
-
-// serverCertForIP issues a serving certificate valid for an IP address, as a
-// driver reached at a bare host:port endpoint needs.
-func (ca *testCA) serverCertForIP(t *testing.T, ip string) tls.Certificate {
-	t.Helper()
-	key := newKey(t)
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		t.Fatalf("parse IP SAN %q", ip)
-	}
-	der := createCert(t, &x509.Certificate{
-		SerialNumber: big.NewInt(4),
-		Subject:      pkix.Name{CommonName: "test-server"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		IPAddresses:  []net.IP{parsed},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}, ca.cert, &key.PublicKey, ca.key)
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
-}
-
-// clientBundle issues a client certificate in credential-bundle layout: a PKCS#8
-// PRIVATE KEY block followed by the CERTIFICATE block
-func (ca *testCA) clientBundle(t *testing.T) []byte {
-	t.Helper()
-	key := newKey(t)
-	der := createCert(t, &x509.Certificate{
-		SerialNumber: big.NewInt(3),
-		Subject:      pkix.Name{CommonName: "test-client"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}, ca.cert, &key.PublicKey, ca.key)
-
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatalf("marshal client key: %v", err)
-	}
-	return append(
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...,
-	)
-}
-
-func newKey(t *testing.T) *ecdsa.PrivateKey {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	return key
-}
-
-func createCert(t *testing.T, tmpl, parent *x509.Certificate, pub *ecdsa.PublicKey, signer *ecdsa.PrivateKey) []byte {
-	t.Helper()
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
-	if err != nil {
-		t.Fatalf("create certificate %q: %v", tmpl.Subject.CommonName, err)
-	}
-	return der
-}
-
-// writeCreds lays out a credential bundle and a trust bundle on disk the way the
-// projected pod-identity volumes do, and returns the paths to read them from.
+// writeCreds lays out the two files the plugin reads as a projected volume.
+// Both go under one directory so a rotation rewrites the same path the plugin
+// already stat'd; testca.Republish is what keeps that rewrite visible to the
+// stat-triple cache.
 func writeCreds(t *testing.T, clientBundle, trustBundle []byte) tlsPaths {
 	t.Helper()
 	dir := t.TempDir()
@@ -167,33 +46,34 @@ func writeCreds(t *testing.T, clientBundle, trustBundle []byte) tlsPaths {
 		clientCert: filepath.Join(dir, "credential-bundle.pem"),
 		caCert:     filepath.Join(dir, "trust-bundle.pem"),
 	}
-	writeFile(t, paths.clientCert, clientBundle)
-	writeFile(t, paths.caCert, trustBundle)
+	testca.Republish(t, paths.clientCert, clientBundle)
+	testca.Republish(t, paths.caCert, trustBundle)
 	return paths
 }
 
-// writeFile writes data to path, standing in for the kubelet swapping a
-// projected volume's contents.
-//
-// It advances the file's modification time past the previous one. The trust
-// bundle and credential bundle caches invalidate on the file's stat triple,
-// and a rotation written within the filesystem's timestamp granularity of the
-// last one is otherwise invisible to them — which would make a rotation test
-// pass while the cache never noticed.
-func writeFile(t *testing.T, path string, data []byte) {
+func issueBundle(t *testing.T, ca *testca.CA) []byte {
 	t.Helper()
-	mtime := time.Now()
-	if fi, err := os.Stat(path); err == nil {
-		if next := fi.ModTime().Add(time.Second); next.After(mtime) {
-			mtime = next
-		}
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-	if err := os.Chtimes(path, mtime, mtime); err != nil {
-		t.Fatalf("chtimes %s: %v", path, err)
-	}
+	leaf := ca.Issue(t, testca.Opts{ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}})
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(leaf.Key)
+	return append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.CertDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...,
+	)
+}
+
+// issueServerCert issues a serving certificate valid for dnsName.
+func issueServerCert(t *testing.T, ca *testca.CA, dnsName string) tls.Certificate {
+	t.Helper()
+	leaf := ca.Issue(t, testca.Opts{DNSNames: []string{dnsName}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, PrivateKey: leaf.Key}
+}
+
+// issueServerCertForIP issues a serving certificate valid for an IP address, as
+// a driver reached at a bare host:port endpoint needs.
+func issueServerCertForIP(t *testing.T, ca *testca.CA, ip string) tls.Certificate {
+	t.Helper()
+	leaf := ca.Issue(t, testca.Opts{IPs: []string{ip}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, PrivateKey: leaf.Key}
 }
 
 // startTLSServer serves the CSI Identity service over mTLS and returns its address.
@@ -257,9 +137,9 @@ var _ listersv1alpha1.CSIDriverConfigLister = (*mockLister)(nil)
 
 func TestMTLSSucceeds(t *testing.T) {
 	t.Parallel()
-	ca := newTestCA(t)
-	addr := startTLSServer(t, ca.serverCert(t, "localhost"), ca.pool())
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca := testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCert(t, ca, "localhost"), ca.Pool())
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	plugin, err := dialPlugin(t, addr, "localhost", paths)
 	if err != nil {
@@ -271,9 +151,9 @@ func TestMTLSSucceeds(t *testing.T) {
 // The server presents a certificate from a CA the client does not trust.
 func TestMTLSRejectsUntrustedServerCA(t *testing.T) {
 	t.Parallel()
-	serverCA, unauthClientCA := newTestCA(t), newTestCA(t)
-	addr := startTLSServer(t, serverCA.serverCert(t, "localhost"), unauthClientCA.pool())
-	paths := writeCreds(t, unauthClientCA.clientBundle(t), unauthClientCA.certPEM())
+	serverCA, unauthClientCA := testca.New(t, "test-ca"), testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCert(t, serverCA, "localhost"), unauthClientCA.Pool())
+	paths := writeCreds(t, issueBundle(t, unauthClientCA), unauthClientCA.CertPEM)
 
 	if _, err := dialPlugin(t, addr, "localhost", paths); err == nil {
 		t.Fatal("newCSIPlugin accepted a server certificate from an untrusted CA")
@@ -283,9 +163,9 @@ func TestMTLSRejectsUntrustedServerCA(t *testing.T) {
 // The server's certificate is trusted but was issued for a different name.
 func TestMTLSRejectsServerNameMismatch(t *testing.T) {
 	t.Parallel()
-	ca := newTestCA(t)
-	addr := startTLSServer(t, ca.serverCert(t, "localhost"), ca.pool())
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca := testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCert(t, ca, "localhost"), ca.Pool())
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	if _, err := dialPlugin(t, addr, "wrong.example", paths); err == nil {
 		t.Fatal("newCSIPlugin accepted a server certificate issued for another name")
@@ -296,9 +176,9 @@ func TestMTLSRejectsServerNameMismatch(t *testing.T) {
 // is what proves the connection is mutually authenticated and not one-way TLS.
 func TestMTLSRejectsUntrustedClientCert(t *testing.T) {
 	t.Parallel()
-	ca, otherCA := newTestCA(t), newTestCA(t)
-	addr := startTLSServer(t, ca.serverCert(t, "localhost"), otherCA.pool())
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca, otherCA := testca.New(t, "test-ca"), testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCert(t, ca, "localhost"), otherCA.Pool())
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	if _, err := dialPlugin(t, addr, "localhost", paths); err == nil {
 		t.Fatal("newCSIPlugin succeeded with a client certificate the server should reject")
@@ -339,8 +219,8 @@ func TestResolveTLSConfigRejectsManualCerts(t *testing.T) {
 func TestResolveTLSConfigFields(t *testing.T) {
 	t.Parallel()
 	const serverName = "my-service.default.svc"
-	ca := newTestCA(t)
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca := testca.New(t, "test-ca")
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	got := tlsTemplate(&v1alpha1.CSIDriverTLSConfig{
 		Enabled:        true,
@@ -386,9 +266,9 @@ func TestResolveTLSConfigFields(t *testing.T) {
 // controller endpoint and be accepted as the CSI driver.
 func TestMTLSRejectsAnUnrelatedNameWithoutAServerName(t *testing.T) {
 	t.Parallel()
-	ca := newTestCA(t)
-	addr := startTLSServer(t, ca.serverCert(t, "unrelated.example"), ca.pool())
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca := testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCert(t, ca, "unrelated.example"), ca.Pool())
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	if _, err := dialPlugin(t, addr, "" /*serverName*/, paths); err == nil {
 		t.Fatal("newCSIPlugin with no serverName accepted a certificate issued for an unrelated name")
@@ -401,9 +281,9 @@ func TestMTLSRejectsAnUnrelatedNameWithoutAServerName(t *testing.T) {
 // certificate covers here with an IP SAN.
 func TestMTLSSucceedsWithoutAServerName(t *testing.T) {
 	t.Parallel()
-	ca := newTestCA(t)
-	addr := startTLSServer(t, ca.serverCertForIP(t, "127.0.0.1"), ca.pool())
-	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+	ca := testca.New(t, "test-ca")
+	addr := startTLSServer(t, issueServerCertForIP(t, ca, "127.0.0.1"), ca.Pool())
+	paths := writeCreds(t, issueBundle(t, ca), ca.CertPEM)
 
 	plugin, err := dialPlugin(t, addr, "" /*serverName*/, paths)
 	if err != nil {
@@ -423,13 +303,13 @@ func TestMTLSSucceedsWithoutAServerName(t *testing.T) {
 // retired CA as no longer trusted rather than everything being trusted.
 func TestMTLSPicksUpCARotation(t *testing.T) {
 	t.Parallel()
-	ca1, ca2 := newTestCA(t), newTestCA(t)
+	ca1, ca2 := testca.New(t, "test-ca"), testca.New(t, "test-ca")
 
 	// The client bundle stays under ca1, so both servers accept this client and
 	// only the server-side trust anchors are under test.
-	paths := writeCreds(t, ca1.clientBundle(t), ca1.certPEM())
-	underCA1 := startTLSServer(t, ca1.serverCert(t, "localhost"), ca1.pool())
-	underCA2 := startTLSServer(t, ca2.serverCert(t, "localhost"), ca1.pool())
+	paths := writeCreds(t, issueBundle(t, ca1), ca1.CertPEM)
+	underCA1 := startTLSServer(t, issueServerCert(t, ca1, "localhost"), ca1.Pool())
+	underCA2 := startTLSServer(t, issueServerCert(t, ca2, "localhost"), ca1.Pool())
 
 	creds, err := resolveTransportCredentials(driverConfig("", &v1alpha1.CSIDriverTLSConfig{
 		Enabled:        true,
@@ -448,7 +328,7 @@ func TestMTLSPicksUpCARotation(t *testing.T) {
 	}
 
 	// Publish CA2 as the projected trust bundle.
-	writeFile(t, paths.caCert, ca2.certPEM())
+	testca.Republish(t, paths.caCert, ca2.CertPEM)
 
 	if err := probe(t, underCA2, creds); err != nil {
 		t.Fatalf("after rotation, the CA2 server was rejected: %v", err)

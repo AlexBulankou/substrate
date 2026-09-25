@@ -16,8 +16,6 @@ package atunnel
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -34,6 +32,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -85,7 +84,7 @@ func TestBrokerCertificateSourceRejectsExpiredCertificate(t *testing.T) {
 
 type ateomSupportStub struct {
 	ateletpb.UnimplementedAteomSupportServer
-	ca         *testCA
+	ca         *testca.CA
 	lifetime   time.Duration
 	publicKeys chan []byte
 }
@@ -112,7 +111,7 @@ func (s *ateomSupportStub) MintActorCertificate(_ context.Context, req *ateletpb
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, template, s.ca.cert, csr.PublicKey, s.ca.key)
+	der, err := s.ca.Sign(template, csr.PublicKey)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -122,7 +121,7 @@ func (s *ateomSupportStub) MintActorCertificate(_ context.Context, req *ateletpb
 
 func newTestBrokerCertificateSource(t *testing.T, ateletIdentity *substratex509.PodIdentity, lifetime time.Duration) (*BrokerCertificateSource, *ateomSupportStub) {
 	t.Helper()
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	workerCert := issueTestPodCertificate(t, ca, &substratex509.PodIdentity{
 		Namespace:          "ate-demo",
 		ServiceAccountName: "ateom",
@@ -139,12 +138,12 @@ func newTestBrokerCertificateSource(t *testing.T, ateletIdentity *substratex509.
 	credentialPath := filepath.Join(dir, "worker.pem")
 	trustPath := filepath.Join(dir, "trust.pem")
 	writeCredentialBundle(t, credentialPath, workerCert)
-	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, ca.CertPEM, 0o600); err != nil {
 		t.Fatalf("While writing trust anchors: %v", err)
 	}
 
 	clientCAs := x509.NewCertPool()
-	clientCAs.AppendCertsFromPEM(ca.certPEM)
+	clientCAs.AppendCertsFromPEM(ca.CertPEM)
 	// t.TempDir() embeds the test name, which overruns the ~104 byte unix
 	// socket path limit on darwin, so the socket gets its own short dir.
 	socketDir, err := os.MkdirTemp("", "atunnel")
@@ -198,28 +197,20 @@ func testAteletIdentity(nodeName string) *substratex509.PodIdentity {
 	}
 }
 
-func issueTestPodCertificate(t *testing.T, ca *testCA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
+func issueTestPodCertificate(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
 	t.Helper()
-	cert := ca.issue(t, spiffeID, usages)
-	template, err := x509.ParseCertificate(cert.Certificate[0])
+	leaf := ca.Issue(t, testca.Opts{
+		URIs:        []string{spiffeID},
+		ExtKeyUsage: usages,
+		Mutate: func(template *x509.Certificate) {
+			if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
-		t.Fatal(err)
-	}
-	key, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
-	if !ok {
-		t.Fatalf("private key has type %T", cert.PrivateKey)
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert.Certificate[0] = der
-	cert.Leaf, err = x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }

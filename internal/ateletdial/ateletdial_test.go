@@ -16,16 +16,10 @@ package ateletdial
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
-	"math/big"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
@@ -85,7 +80,7 @@ func TestTLSConfigRejectsAnUnusableWorkerIdentity(t *testing.T) {
 	// where a nil local identity would be compared against atelet's and match
 	// nothing.
 	t.Run("certificate has no Pod identity extension", func(t *testing.T) {
-		bare := env.ca.issue(t, workerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+		bare := issuePodCertificate(t, env.ca, nil, workerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 		path := filepath.Join(t.TempDir(), "bare.pem")
 		writeCredentialBundle(t, path, bare)
 
@@ -157,7 +152,7 @@ func TestVerifyConnectionAcceptsTheAteletOnThisNode(t *testing.T) {
 func TestVerifyConnectionRejectsAnUnacceptableAtelet(t *testing.T) {
 	env := newWorkerEnv(t)
 	verify := env.verifier(t, ateletSPIFFEID)
-	otherCA := newTestCA(t)
+	otherCA := testca.New(t, "test-ca")
 
 	for _, tc := range []struct {
 		name  string
@@ -205,7 +200,7 @@ func TestVerifyConnectionRejectsAnUnacceptableAtelet(t *testing.T) {
 			// identity extension names no node at all, so there is nothing to
 			// compare and it cannot be shown to be node-local.
 			name:  "no Pod identity extension",
-			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{env.ca.issue(t, ateletSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}).Leaf}},
+			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{issuePodCertificate(t, env.ca, nil, ateletSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}).Leaf}},
 			want:  "is not on worker node",
 		},
 		{
@@ -259,7 +254,7 @@ func TestVerifyConnectionFollowsATrustBundleRotation(t *testing.T) {
 	env := newWorkerEnv(t)
 	verify := env.verifier(t, ateletSPIFFEID)
 
-	rotatedCA := newTestCA(t)
+	rotatedCA := testca.New(t, "test-ca")
 	rotated := env.ateletState(t, rotatedCA, ateletIdentity("node-a", "node-uid"), ateletSPIFFEID)
 
 	// Before the projection is rewritten the new CA is correctly a stranger.
@@ -373,7 +368,7 @@ func startAteletOnSocket(t *testing.T, env *workerEnv, identity *substratex509.P
 	t.Helper()
 	ateletCert := issuePodCertificate(t, env.ca, identity, ateletSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(env.ca.certPEM) {
+	if !clientCAs.AppendCertsFromPEM(env.ca.CertPEM) {
 		t.Fatal("test CA PEM did not parse")
 	}
 	// t.TempDir() embeds the test name, which overruns the ~104 byte unix
@@ -405,7 +400,7 @@ func startAteletOnSocket(t *testing.T, env *workerEnv, identity *substratex509.P
 // --- helpers ---
 
 type workerEnv struct {
-	ca             *testCA
+	ca             *testca.CA
 	credentialPath string
 	trustPath      string
 	identity       *substratex509.PodIdentity
@@ -415,7 +410,7 @@ type workerEnv struct {
 // bundle and the projected atelet trust bundle.
 func newWorkerEnv(t *testing.T) *workerEnv {
 	t.Helper()
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	identity := &substratex509.PodIdentity{
 		Namespace:          "ate-demo",
 		ServiceAccountName: "ateom",
@@ -447,12 +442,12 @@ func (e *workerEnv) verifier(t *testing.T, spiffeID string) func(tls.ConnectionS
 	return cfg.VerifyConnection
 }
 
-func (e *workerEnv) ateletState(t *testing.T, ca *testCA, identity *substratex509.PodIdentity, spiffeID string) tls.ConnectionState {
+func (e *workerEnv) ateletState(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string) tls.ConnectionState {
 	t.Helper()
 	return e.stateFor(t, ca, identity, spiffeID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth})
 }
 
-func (e *workerEnv) stateFor(t *testing.T, ca *testCA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.ConnectionState {
+func (e *workerEnv) stateFor(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.ConnectionState {
 	t.Helper()
 	cert := issuePodCertificate(t, ca, identity, spiffeID, usages)
 	return tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert.Leaf}}
@@ -470,86 +465,25 @@ func ateletIdentity(nodeName, nodeUID string) *substratex509.PodIdentity {
 	}
 }
 
-type testCA struct {
-	cert    *x509.Certificate
-	key     *ecdsa.PrivateKey
-	certPEM []byte
-}
-
-func newTestCA(t *testing.T) *testCA {
+// issuePodCertificate issues a leaf under ca naming spiffeID. A nil identity
+// issues one with NO Pod identity extension — the case several tests need,
+// where the peer is otherwise well-formed but names no node at all.
+func issuePodCertificate(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(now.UnixNano()),
-		Subject:               pkix.Name{CommonName: "test CA"},
-		NotBefore:             now.Add(-time.Minute),
-		NotAfter:              now.Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &testCA{cert: cert, key: key, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
-}
-
-// issue mints a leaf with a SPIFFE URI SAN and no Pod identity extension.
-func (ca *testCA) issue(t *testing.T, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
-	t.Helper()
-	return ca.issueWithTemplate(t, spiffeID, usages, nil)
-}
-
-func (ca *testCA) issueWithTemplate(t *testing.T, spiffeID string, usages []x509.ExtKeyUsage, decorate func(*x509.Certificate)) tls.Certificate {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	uri, err := url.Parse(spiffeID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(now.UnixNano()),
-		Subject:      pkix.Name{CommonName: spiffeID},
-		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  usages,
-		URIs:         []*url.URL{uri},
-	}
-	if decorate != nil {
-		decorate(template)
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, Leaf: leaf, PrivateKey: key}
-}
-
-func issuePodCertificate(t *testing.T, ca *testCA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
-	t.Helper()
-	return ca.issueWithTemplate(t, spiffeID, usages, func(template *x509.Certificate) {
-		if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
-			t.Fatalf("AddPodIdentityToCertificate: %v", err)
+	opts := testca.Opts{URIs: []string{spiffeID}, ExtKeyUsage: usages}
+	if identity != nil {
+		opts.Mutate = func(template *x509.Certificate) {
+			if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
+				t.Fatalf("AddPodIdentityToCertificate: %v", err)
+			}
 		}
-	})
+	}
+	leaf := ca.Issue(t, opts)
+	cert, err := x509.ParseCertificate(leaf.CertDER)
+	if err != nil {
+		t.Fatalf("parsing leaf: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }
 
 func writeCredentialBundle(t *testing.T, path string, cert tls.Certificate) {
@@ -567,9 +501,9 @@ func writeCredentialBundle(t *testing.T, path string, cert tls.Certificate) {
 	}
 }
 
-func writeTrustBundle(t *testing.T, path string, ca *testCA) {
+func writeTrustBundle(t *testing.T, path string, ca *testca.CA) {
 	t.Helper()
-	if err := os.WriteFile(path, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(path, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -583,10 +517,10 @@ func writeTrustBundle(t *testing.T, path string, ca *testCA) {
 // so an in-place rewrite here is reliably invisible to the loader and the test
 // flakes. kubelet swaps the ..data symlink, which changes the inode the path
 // resolves to, so the rotation this asserts is the one that actually happens.
-func rotateTrustBundle(t *testing.T, path string, ca *testCA) {
+func rotateTrustBundle(t *testing.T, path string, ca *testca.CA) {
 	t.Helper()
 	staging := path + ".rotated"
-	if err := os.WriteFile(staging, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(staging, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(staging, path); err != nil {

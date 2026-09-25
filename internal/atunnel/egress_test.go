@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -375,7 +376,7 @@ func TestEgressDeactivationDropsConcurrentRenewal(t *testing.T) {
 }
 
 func TestEgressEndToEnd(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	requests := make(chan *http.Request, 1)
 	gatewayDone := make(chan struct{})
 	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, req *http.Request) {

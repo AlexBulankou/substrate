@@ -17,16 +17,11 @@ package atunnel
 import (
 	"bufio"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -35,10 +30,12 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 func TestClientDialContext(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	request := make(chan *http.Request, 1)
 	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, req *http.Request) {
 		request <- req
@@ -92,7 +89,7 @@ func TestClientDialContext(t *testing.T) {
 }
 
 func TestClientDialContextRejected(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, _ *http.Request) {
 		body := "denied by policy"
 		_, _ = fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
@@ -125,11 +122,11 @@ func TestClientDialContextGatewayRefusesClientCertificate(t *testing.T) {
 		{name: "TLS 1.2 refuses during the handshake", maxTLSVersion: tls.VersionTLS12},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			ca := newTestCA(t)
+			ca := testca.New(t, "test-ca")
 			// The gateway trusts a different CA than the one that issued the
 			// client's certificate, which is the shape of an actor presenting a
 			// podidentity credential to a door that only accepts actor identity.
-			gatewayAddress := serveTestRefusingGateway(t, ca, newTestCA(t), tt.maxTLSVersion)
+			gatewayAddress := serveTestRefusingGateway(t, ca, testca.New(t, "test-ca"), tt.maxTLSVersion)
 			client := newTestClient(t, ca, WithDialer(dialFixedAddress(gatewayAddress)))
 
 			_, err := client.DialContext(context.Background(), "192.0.2.10:443")
@@ -155,7 +152,7 @@ func TestClientDialContextGatewayRefusesClientCertificate(t *testing.T) {
 // and says nothing. There is still nobody but the front door on the other end,
 // since no CONNECT response means no upstream was ever dialed.
 func TestClientDialContextGatewayHangsUpBeforeResponding(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, _ *http.Request) {
 		_ = conn.Close()
 	})
@@ -224,7 +221,7 @@ func TestConnectExchangeError(t *testing.T) {
 }
 
 func TestClientDialContextValidatesInput(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	client := newTestClient(t, ca)
 	tests := []struct {
 		name        string
@@ -255,10 +252,10 @@ const actorSPIFFEID = "spiffe://substrate-actor.local/atespace/team/actor/actor"
 // newTrustRotationClient builds a client trusting trustCA and presenting cert,
 // and returns it with the path of its trust bundle so a test can rotate what it
 // trusts.
-func newTrustRotationClient(t *testing.T, trustCA *testCA, cert tls.Certificate, opts ...ClientOption) (*Client, string) {
+func newTrustRotationClient(t *testing.T, trustCA *testca.CA, cert tls.Certificate, opts ...ClientOption) (*Client, string) {
 	t.Helper()
 	trustPath := filepath.Join(t.TempDir(), "trust.pem")
-	if err := os.WriteFile(trustPath, trustCA.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, trustCA.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
@@ -277,14 +274,14 @@ func newTrustRotationClient(t *testing.T, trustCA *testCA, cert tls.Certificate,
 // ca and answering every CONNECT with 200, for as many connections as the test
 // makes. Handshake failures are ignored rather than reported: a rotation test
 // expects the first dial to be refused.
-func serveTrustRotationGateway(t *testing.T, ca *testCA) string {
+func serveTrustRotationGateway(t *testing.T, ca *testca.CA) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	clientCAs := x509.NewCertPool()
-	clientCAs.AppendCertsFromPEM(ca.certPEM)
+	clientCAs.AppendCertsFromPEM(ca.CertPEM)
 	tlsListener := tls.NewListener(listener, &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{issueDNSCertificate(t, ca, "egress.test")},
@@ -317,9 +314,9 @@ func serveTrustRotationGateway(t *testing.T, ca *testCA) string {
 // the gateway until its pod restarted -- with the actor's own certificate
 // already renewed under the new CA, which is the state kubelet leaves it in.
 func TestClientDialContextFollowsATrustBundleRotation(t *testing.T) {
-	oldCA, rotatedCA := newTestCA(t), newTestCA(t)
+	oldCA, rotatedCA := testca.New(t, "test-ca"), testca.New(t, "test-ca")
 	gatewayAddress := serveTrustRotationGateway(t, rotatedCA)
-	cert := rotatedCA.issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	cert := issueTLS(t, rotatedCA, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	client, trustPath := newTrustRotationClient(t, oldCA, cert, WithDialer(dialFixedAddress(gatewayAddress)))
 
 	if _, err := client.DialContext(context.Background(), "192.0.2.10:443"); !errors.Is(err, ErrGatewayHandshake) {
@@ -336,9 +333,9 @@ func TestClientDialContextFollowsATrustBundleRotation(t *testing.T) {
 }
 
 func TestClientDialContextFailsClosedOnAnUnreadableTrustBundle(t *testing.T) {
-	ca := newTestCA(t)
+	ca := testca.New(t, "test-ca")
 	gatewayAddress := serveTrustRotationGateway(t, ca)
-	cert := ca.issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	cert := issueTLS(t, ca, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	var dialed bool
 	dial := dialFixedAddress(gatewayAddress)
 	client, trustPath := newTrustRotationClient(t, ca, cert, WithDialer(
@@ -374,7 +371,7 @@ func TestClientDialContextFailsClosedOnAnUnreadableTrustBundle(t *testing.T) {
 // volume construct successfully and fail only when an actor first tries to
 // reach the internet, which reports the misconfiguration as an egress outage.
 func TestNewClientRejectsAnUnreadableTrustBundle(t *testing.T) {
-	cert := newTestCA(t).issue(t, actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	cert := issueTLS(t, testca.New(t, "test-ca"), actorSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	if _, err := NewClient(ClientConfig{
 		GatewayAddress:       "127.0.0.1:1",
 		ServerName:           "egress.test",
@@ -391,15 +388,15 @@ func dialFixedAddress(address string) DialFunc {
 	}
 }
 
-func newTestClient(t *testing.T, ca *testCA, opts ...ClientOption) *Client {
+func newTestClient(t *testing.T, ca *testca.CA, opts ...ClientOption) *Client {
 	t.Helper()
 	dir := t.TempDir()
 	trustPath := filepath.Join(dir, "trust.pem")
-	certificate := ca.issue(t,
+	certificate := issueTLS(t, ca,
 		"spiffe://substrate-actor.local/ateom-for-actor/team/actor",
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
-	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, ca.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
@@ -414,7 +411,7 @@ func newTestClient(t *testing.T, ca *testCA, opts ...ClientOption) *Client {
 	return client
 }
 
-func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *http.Request)) string {
+func serveTestConnectGateway(t *testing.T, ca *testca.CA, handle func(net.Conn, *http.Request)) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -422,7 +419,7 @@ func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *ht
 	}
 	serverCert := issueDNSCertificate(t, ca, "egress.test")
 	clientCAs := x509.NewCertPool()
-	clientCAs.AppendCertsFromPEM(ca.certPEM)
+	clientCAs.AppendCertsFromPEM(ca.CertPEM)
 	tlsListener := tls.NewListener(listener, &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{serverCert},
@@ -459,7 +456,7 @@ func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *ht
 //
 // It handshakes and closes rather than reading a request: a refused client
 // never gets to send one, and any error here is the refusal working.
-func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testCA, maxVersion uint16) string {
+func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testca.CA, maxVersion uint16) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -468,7 +465,7 @@ func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testCA, maxVersi
 	t.Cleanup(func() { _ = listener.Close() })
 
 	clientCAs := x509.NewCertPool()
-	clientCAs.AppendCertsFromPEM(clientCA.certPEM)
+	clientCAs.AppendCertsFromPEM(clientCA.CertPEM)
 	config := &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   maxVersion,
@@ -490,35 +487,15 @@ func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testCA, maxVersi
 	return listener.Addr().String()
 }
 
-func issueDNSCertificate(t *testing.T, ca *testCA, dnsName string) tls.Certificate {
+func issueDNSCertificate(t *testing.T, ca *testca.CA, dnsName string) tls.Certificate {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.Issue(t, testca.Opts{
+		DNSNames:    []string{dnsName},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(now.UnixNano()),
-		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(time.Hour),
-		DNSNames:     []string{dnsName},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }

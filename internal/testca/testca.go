@@ -98,6 +98,10 @@ type Opts struct {
 	// the address it connected to.
 	IPs  []string
 	URIs []string
+	// ExtKeyUsage overrides the default server+client EKU pair. A consolidated
+	// caller that used to build a server-only or client-only leaf keeps that
+	// property instead of silently widening it.
+	ExtKeyUsage []x509.ExtKeyUsage
 	// Mutate, when non-nil, edits the leaf template just before it is signed.
 	// It exists for negative cases: a test that needs a certificate broken in
 	// exactly one way builds an otherwise-valid one and breaks that property
@@ -138,13 +142,17 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 	if commonName == "" {
 		commonName = "leaf"
 	}
+	extKeyUsage := opts.ExtKeyUsage
+	if len(extKeyUsage) == 0 {
+		extKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth}
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: commonName},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		ExtKeyUsage:  extKeyUsage,
 		DNSNames:     opts.DNSNames,
 		IPAddresses:  ips,
 		URIs:         uris,
@@ -162,6 +170,15 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		t.Fatalf("create leaf certificate: %v", err)
 	}
 	return Issued{CertDER: der, Key: key}
+}
+
+// Sign signs tmpl for a public key the caller already holds, and returns the
+// DER. Issue covers the ordinary case by generating the key itself; this is
+// for the one case it cannot express — a test double standing in for a signing
+// service, which is handed a CSR and must sign THAT requester's key rather
+// than one of its own.
+func (c *CA) Sign(tmpl *x509.Certificate, pub any) ([]byte, error) {
+	return x509.CreateCertificate(rand.Reader, tmpl, c.Cert, pub, c.key)
 }
 
 // WriteCredBundle writes leaf as a credential bundle — the leaf certificate
