@@ -83,7 +83,7 @@ goals in the near term.
 
 To quickly set up the complete environment:
 
-1. Make sure you have [Go](https://go.dev/doc/install), [`kubectl`](https://kubernetes.io/docs/tasks/tools/), and [`docker`](https://www.docker.com/) installed and configured on your dev machine. We will automatically manage other dependencies via Go, including [`kind`](https://kind.sigs.k8s.io/).
+1. Make sure you have [Go](https://go.dev/doc/install), [`kubectl`](https://kubernetes.io/docs/tasks/tools/), and [`docker`](https://www.docker.com/) installed and configured on your dev machine. Your Docker installation must include the [Buildx](https://docs.docker.com/reference/cli/docker/buildx/) CLI plugin, which `--deploy-ate-system` uses to build the envoy-dataplane image — verify with `docker buildx version`. Docker Desktop and the packages from docker.com ship it; some distribution packages (for example Debian/Ubuntu's `docker.io`) do not, and install it separately as `docker-buildx-plugin`. We will automatically manage other dependencies via Go, including [`kind`](https://kind.sigs.k8s.io/).
 
 2. Run the following steps:
 ```shell
