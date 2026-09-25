@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -80,7 +79,7 @@ var (
 	egressGatewayAddress = pflag.String("egress-gateway-address", "", "Address of the egress PEP. Empty disables tunneled egress.")
 
 	actorIDCAPoolFile      = pflag.String("actor-id-ca-pool", "", "The file that contains the CA pool for signing actor JWTs")
-	podIdentityCACerts     = pflag.String("pod-identity-ca-certs", "", "The file that contains the pod-identity CA bundle, used both for verifying client certificates presented to the gRPC server and for verifying atelet serving certificates when dialing atelet. If empty, client-cert verification is disabled and atelet dials will fail.")
+	podIdentityCACerts     = pflag.String("pod-identity-ca-certs", "", "The file that contains the pod-identity CA bundle, used both for verifying client certificates presented to the gRPC server and for verifying atelet serving certificates when dialing atelet. If empty, a presented client certificate is verified against the host system trust store rather than the pod-identity CA — verification is not disabled — and atelet dials will fail.")
 	ateletClientCredBundle = pflag.String("atelet-client-cred-bundle", "", "Credential bundle presented as the client certificate when dialing atelet.")
 	ateletServiceAccount   = pflag.String("atelet-service-account", installdefaults.AteletServiceAccount, "ServiceAccount atelet runs as. It is the service-account segment of the SPIFFE ID expected on atelet's certificate, so it has to match what the deployment actually creates; a deployment that prefixes resource names needs it set.")
 
@@ -475,26 +474,45 @@ func newKubeClients() (*kubernetes.Clientset, versioned.Interface, error) {
 // composes gRPC TransportCredentials over the server bundle + optional
 // client-cert verification.
 func buildServerCreds(ctx context.Context) (credentials.TransportCredentials, error) {
-	var clientCAs *x509.CertPool
-	if *podIdentityCACerts != "" {
-		// TODO: Periodically reload these to handle rotations. Consult with Tina to see how she did it for client-go.
-		ca, err := os.ReadFile(*podIdentityCACerts)
-		if err != nil {
-			return nil, fmt.Errorf("read pod-identity CA: %w", err)
-		}
-		clientCAs = x509.NewCertPool()
-		if !clientCAs.AppendCertsFromPEM(ca) {
-			return nil, fmt.Errorf("parse pod-identity CA from %s", *podIdentityCACerts)
-		}
-		slog.InfoContext(ctx, "Using pod-identity CA for client-cert verification", slog.String("path", *podIdentityCACerts))
+	serving := credbundle.Loader(*grpcServerCredBundle)
+
+	// Client certs stay optional at the transport level: certless clients such
+	// as kubectl-ate authenticate with a Bearer token in the ateapiauth
+	// interceptor.
+	if *podIdentityCACerts == "" {
+		// No pod-identity CA configured. ClientCAs stays nil, which verifies a
+		// presented certificate against the host trust store rather than
+		// accepting it unverified. Nothing to rotate, so the config is static.
+		return credentials.NewTLS(&tls.Config{
+			GetCertificate: serving,
+			ClientAuth:     tls.VerifyClientCertIfGiven,
+		}), nil
 	}
+
+	// Read once here so a missing or malformed projection fails ateapi at
+	// startup rather than at the first handshake.
+	loadClientCAs := credbundle.PoolLoader(*podIdentityCACerts)
+	if _, err := loadClientCAs(); err != nil {
+		return nil, err
+	}
+	slog.InfoContext(ctx, "Using pod-identity CA for client-cert verification", slog.String("path", *podIdentityCACerts))
+
+	// A tls.Config's ClientCAs is frozen once the config is in use, so a pool
+	// built here would keep verifying against the retired CA after a rotation
+	// and refuse every mTLS caller holding a freshly issued certificate.
+	// GetConfigForClient rebuilds the config per connection instead.
 	return credentials.NewTLS(&tls.Config{
-		GetCertificate: credbundle.Loader(*grpcServerCredBundle),
-		// Client certs stay optional at the transport level: certless
-		// clients such as kubectl-ate authenticate with a Bearer token in the
-		// ateapiauth interceptor.
-		ClientAuth: tls.VerifyClientCertIfGiven,
-		ClientCAs:  clientCAs,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			clientCAs, err := loadClientCAs()
+			if err != nil {
+				return nil, err
+			}
+			return &tls.Config{
+				GetCertificate: serving,
+				ClientAuth:     tls.VerifyClientCertIfGiven,
+				ClientCAs:      clientCAs,
+			}, nil
+		},
 	}), nil
 }
 
