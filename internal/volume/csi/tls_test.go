@@ -95,6 +95,27 @@ func (ca *testCA) serverCert(t *testing.T, dnsName string) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+// serverCertForIP issues a serving certificate valid for an IP address, as a
+// driver reached at a bare host:port endpoint needs.
+func (ca *testCA) serverCertForIP(t *testing.T, ip string) tls.Certificate {
+	t.Helper()
+	key := newKey(t)
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		t.Fatalf("parse IP SAN %q", ip)
+	}
+	der := createCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: "test-server"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		IPAddresses:  []net.IP{parsed},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, ca.cert, &key.PublicKey, ca.key)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
 // clientBundle issues a client certificate in credential-bundle layout: a PKCS#8
 // PRIVATE KEY block followed by the CERTIFICATE block
 func (ca *testCA) clientBundle(t *testing.T) []byte {
@@ -151,10 +172,27 @@ func writeCreds(t *testing.T, clientBundle, trustBundle []byte) tlsPaths {
 	return paths
 }
 
+// writeFile writes data to path, standing in for the kubelet swapping a
+// projected volume's contents.
+//
+// It advances the file's modification time past the previous one. The trust
+// bundle and credential bundle caches invalidate on the file's stat triple,
+// and a rotation written within the filesystem's timestamp granularity of the
+// last one is otherwise invisible to them — which would make a rotation test
+// pass while the cache never noticed.
 func writeFile(t *testing.T, path string, data []byte) {
 	t.Helper()
+	mtime := time.Now()
+	if fi, err := os.Stat(path); err == nil {
+		if next := fi.ModTime().Add(time.Second); next.After(mtime) {
+			mtime = next
+		}
+	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes %s: %v", path, err)
 	}
 }
 
@@ -278,12 +316,12 @@ func TestResolveTLSConfigDisabled(t *testing.T) {
 		{"TLS disabled", driverConfig("", &v1alpha1.CSIDriverTLSConfig{Enabled: false})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveTLSConfig(tc.cfg, defaultTLSPaths)
+			got, err := resolveTransportCredentials(tc.cfg, defaultTLSPaths)
 			if err != nil {
-				t.Fatalf("resolveTLSConfig: %v", err)
+				t.Fatalf("resolveTransportCredentials: %v", err)
 			}
 			if got != nil {
-				t.Errorf("resolveTLSConfig = %v, want nil", got)
+				t.Errorf("resolveTransportCredentials = %v, want nil", got)
 			}
 		})
 	}
@@ -293,8 +331,8 @@ func TestResolveTLSConfigRejectsManualCerts(t *testing.T) {
 	t.Parallel()
 	cfg := driverConfig("", &v1alpha1.CSIDriverTLSConfig{Enabled: true, UsePodIdentity: false})
 
-	if _, err := resolveTLSConfig(cfg, defaultTLSPaths); err == nil {
-		t.Fatal("resolveTLSConfig accepted usePodIdentity=false; manual certificates are unsupported")
+	if _, err := resolveTransportCredentials(cfg, defaultTLSPaths); err == nil {
+		t.Fatal("resolveTransportCredentials accepted usePodIdentity=false; manual certificates are unsupported")
 	}
 }
 
@@ -304,23 +342,27 @@ func TestResolveTLSConfigFields(t *testing.T) {
 	ca := newTestCA(t)
 	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
 
-	got, err := resolveTLSConfig(driverConfig("", &v1alpha1.CSIDriverTLSConfig{
+	got := tlsTemplate(&v1alpha1.CSIDriverTLSConfig{
 		Enabled:        true,
 		UsePodIdentity: true,
 		ServerName:     serverName,
-	}), paths)
-	if err != nil {
-		t.Fatalf("resolveTLSConfig: %v", err)
-	}
+	}, paths)
 
 	if got.MinVersion != tls.VersionTLS13 {
 		t.Errorf("MinVersion = %d, want %d", got.MinVersion, tls.VersionTLS13)
 	}
-	if !got.InsecureSkipVerify {
-		t.Error("InsecureSkipVerify = false, want true for dynamic CA rotation")
+	// The trust anchors rotate, so they are supplied per handshake rather than
+	// pinned here — but by reloading the pool, never by disabling verification
+	// and re-implementing it. A hand-rolled verifier is what skipped the check
+	// against the server's name when serverName was left unset.
+	if got.InsecureSkipVerify {
+		t.Error("InsecureSkipVerify = true, want the standard verification path")
 	}
-	if got.VerifyConnection == nil {
-		t.Error("VerifyConnection = nil, want dynamic CA verifier")
+	if got.VerifyConnection != nil {
+		t.Error("VerifyConnection is set, want the standard verification path")
+	}
+	if got.RootCAs != nil {
+		t.Error("RootCAs is set, want the anchors to come from the per-handshake loader")
 	}
 	if got.GetClientCertificate == nil {
 		t.Error("GetClientCertificate = nil, want the credential-bundle loader")
@@ -333,71 +375,98 @@ func TestResolveTLSConfigFields(t *testing.T) {
 	}
 }
 
-// TestMTLSPicksUpCARotation verifies that when the CA trust bundle on disk is rotated,
-// subsequent connections succeed with the new CA without restarting or reconstructing the plugin.
-func TestMTLSPicksUpCARotation(t *testing.T) {
-	t.Parallel()
-	ca1 := newTestCA(t)
-	ca2 := newTestCA(t)
-
-	// Initially, client trusts ca1 and server presents cert signed by ca1.
-	paths := writeCreds(t, ca1.clientBundle(t), ca1.certPEM())
-	addr1 := startTLSServer(t, ca1.serverCert(t, "localhost"), ca1.pool())
-
-	plugin1, err := dialPlugin(t, addr1, "localhost", paths)
-	if err != nil {
-		t.Fatalf("connection with initial CA failed: %v", err)
-	}
-	plugin1.client.Close()
-
-	// Start a new server signed by ca2, and client cert is issued by ca2.
-	addr2 := startTLSServer(t, ca2.serverCert(t, "localhost"), ca2.pool())
-
-	// Rotate the CA trust bundle (and client cert) on disk to ca2.
-	writeFile(t, paths.caCert, ca2.certPEM())
-	writeFile(t, paths.clientCert, ca2.clientBundle(t))
-
-	// Connect to addr2 using the updated CA trust bundle on disk.
-	plugin2, err := dialPlugin(t, addr2, "localhost", paths)
-	if err != nil {
-		t.Fatalf("connection after CA rotation failed: %v", err)
-	}
-	plugin2.client.Close()
-}
-
-func TestCAPoolCache_HitAndFileChange(t *testing.T) {
+// TestMTLSRejectsAnUnrelatedNameWithoutAServerName is the fail-open this
+// verification path was rebuilt to close.
+//
+// serverName is optional in the CRD, and the hand-rolled verifier passed it
+// straight to x509.VerifyOptions.DNSName, where the empty string means "skip
+// the name check entirely". A driver config that left it out therefore
+// verified the chain but not the identity, so any peer holding a pod-identity
+// certificate from the cluster CA — any workload in the mesh — could serve the
+// controller endpoint and be accepted as the CSI driver.
+func TestMTLSRejectsAnUnrelatedNameWithoutAServerName(t *testing.T) {
 	t.Parallel()
 	ca := newTestCA(t)
+	addr := startTLSServer(t, ca.serverCert(t, "unrelated.example"), ca.pool())
+	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
 
-	dir := t.TempDir()
-	caPath := filepath.Join(dir, "trust-bundle.pem")
-	writeFile(t, caPath, ca.certPEM())
+	if _, err := dialPlugin(t, addr, "" /*serverName*/, paths); err == nil {
+		t.Fatal("newCSIPlugin with no serverName accepted a certificate issued for an unrelated name")
+	}
+}
 
-	cache := newCAPoolCache(caPath)
+// TestMTLSSucceedsWithoutAServerName is the other half: leaving serverName out
+// is a supported configuration, so closing the hole above must not close it.
+// The name verified falls back to the endpoint's own host, which the server's
+// certificate covers here with an IP SAN.
+func TestMTLSSucceedsWithoutAServerName(t *testing.T) {
+	t.Parallel()
+	ca := newTestCA(t)
+	addr := startTLSServer(t, ca.serverCertForIP(t, "127.0.0.1"), ca.pool())
+	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
 
-	pool1, err := cache.getCertPool()
+	plugin, err := dialPlugin(t, addr, "" /*serverName*/, paths)
 	if err != nil {
-		t.Fatalf("failed to get cert pool: %v", err)
+		t.Fatalf("newCSIPlugin with no serverName over mTLS: %v", err)
 	}
+	t.Cleanup(func() { plugin.client.Close() })
+}
 
-	// 2nd call should return the exact cached instance (pointer equality).
-	pool2, err := cache.getCertPool()
+// TestMTLSPicksUpCARotation verifies that one set of credentials follows a CA
+// rotation: it dials a server holding a CA-1 certificate, republishes the
+// trust bundle as CA-2, and dials a server holding a CA-2 certificate.
+//
+// The credentials are resolved once and reused, which is what makes the test
+// non-vacuous. Building fresh credentials for the second dial would pass
+// against a pool frozen at construction — the very defect being guarded — so
+// the reuse is load-bearing, as are the two negative dials that pin the
+// retired CA as no longer trusted rather than everything being trusted.
+func TestMTLSPicksUpCARotation(t *testing.T) {
+	t.Parallel()
+	ca1, ca2 := newTestCA(t), newTestCA(t)
+
+	// The client bundle stays under ca1, so both servers accept this client and
+	// only the server-side trust anchors are under test.
+	paths := writeCreds(t, ca1.clientBundle(t), ca1.certPEM())
+	underCA1 := startTLSServer(t, ca1.serverCert(t, "localhost"), ca1.pool())
+	underCA2 := startTLSServer(t, ca2.serverCert(t, "localhost"), ca1.pool())
+
+	creds, err := resolveTransportCredentials(driverConfig("", &v1alpha1.CSIDriverTLSConfig{
+		Enabled:        true,
+		UsePodIdentity: true,
+		ServerName:     "localhost",
+	}), paths)
 	if err != nil {
-		t.Fatalf("failed to get cert pool: %v", err)
-	}
-	if pool1 != pool2 {
-		t.Errorf("expected cached cert pool pointer equality on unchanged file, got %p != %p", pool1, pool2)
+		t.Fatalf("resolveTransportCredentials: %v", err)
 	}
 
-	// Modify the file.
-	writeFile(t, caPath, ca.certPEM())
+	if err := probe(t, underCA1, creds); err != nil {
+		t.Fatalf("before rotation, the CA1 server was rejected: %v", err)
+	}
+	if err := probe(t, underCA2, creds); err == nil {
+		t.Fatal("before rotation, the CA2 server was accepted, want a chain failure")
+	}
 
-	// 3rd call should detect file change and return a newly parsed pool.
-	pool3, err := cache.getCertPool()
+	// Publish CA2 as the projected trust bundle.
+	writeFile(t, paths.caCert, ca2.certPEM())
+
+	if err := probe(t, underCA2, creds); err != nil {
+		t.Fatalf("after rotation, the CA2 server was rejected: %v", err)
+	}
+	if err := probe(t, underCA1, creds); err == nil {
+		t.Fatal("after rotation, the CA1 server was accepted, want a chain failure")
+	}
+}
+
+// probe dials addr with creds and issues one RPC, so the error it returns
+// covers the handshake as well as the call.
+func probe(t *testing.T, addr string, creds credentials.TransportCredentials) error {
+	t.Helper()
+	client, err := NewCSIClient("tcp://"+addr, creds)
 	if err != nil {
-		t.Fatalf("failed to get cert pool: %v", err)
+		t.Fatalf("NewCSIClient: %v", err)
 	}
-	if pool1 == pool3 {
-		t.Errorf("expected new cert pool after file modification, got same pointer %p", pool3)
-	}
+	defer client.Close()
+	_, err = NewPlugin(client).DriverName(t.Context())
+	return err
 }
