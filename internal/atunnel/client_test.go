@@ -17,16 +17,11 @@ package atunnel
 import (
 	"bufio"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -35,6 +30,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
 	"github.com/agent-substrate/substrate/internal/testca"
 )
 
@@ -259,7 +255,7 @@ const actorSPIFFEID = "spiffe://substrate-actor.local/atespace/team/actor/actor"
 func newTrustRotationClient(t *testing.T, trustCA *testca.CA, cert tls.Certificate, opts ...ClientOption) (*Client, string) {
 	t.Helper()
 	trustPath := filepath.Join(t.TempDir(), "trust.pem")
-	if err := os.WriteFile(trustPath, trustCA.certPEM, 0o600); err != nil {
+	if err := os.WriteFile(trustPath, trustCA.CertPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
@@ -396,7 +392,7 @@ func newTestClient(t *testing.T, ca *testca.CA, opts ...ClientOption) *Client {
 	t.Helper()
 	dir := t.TempDir()
 	trustPath := filepath.Join(dir, "trust.pem")
-	certificate := ca.Issue(t,
+	certificate := issueTLS(t, ca,
 		"spiffe://substrate-actor.local/atespace/team/actor/actor",
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
@@ -469,7 +465,7 @@ func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testca.CA, maxVe
 	t.Cleanup(func() { _ = listener.Close() })
 
 	clientCAs := x509.NewCertPool()
-	clientCAs.AppendCertsFromPEM(clientCA.certPEM)
+	clientCAs.AppendCertsFromPEM(clientCA.CertPEM)
 	config := &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		MaxVersion:   maxVersion,
@@ -493,33 +489,13 @@ func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testca.CA, maxVe
 
 func issueDNSCertificate(t *testing.T, ca *testca.CA, dnsName string) tls.Certificate {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leaf := ca.Issue(t, testca.Opts{
+		DNSNames:    []string{dnsName},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber: big.NewInt(now.UnixNano()),
-		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(time.Hour),
-		DNSNames:     []string{dnsName},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.Cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }

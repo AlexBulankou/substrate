@@ -96,9 +96,9 @@ type Opts struct {
 	// IPs are IP SANs, in the textual form net.ParseIP accepts. A test server
 	// bound to a loopback address needs one, since the dialer verifies against
 	// the address it connected to.
-	IPs  []string
-	URIs []string
-	ExtKeyUsage []x509.ExtKeyUsage
+	IPs            []string
+	URIs           []string
+	ExtKeyUsage    []x509.ExtKeyUsage
 	MutateTemplate func(*x509.Certificate)
 }
 
@@ -149,6 +149,12 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		DNSNames:     opts.DNSNames,
 		IPAddresses:  ips,
 		URIs:         uris,
+		// Encode basicConstraints even though a leaf is CA:FALSE. Without it
+		// the extension is omitted entirely, and then a MutateTemplate that
+		// sets IsCA is silently dropped on the floor — which turns a test for
+		// "reject a CA certificate presented as a leaf" into a test that
+		// issues an ordinary leaf and asserts it is rejected.
+		BasicConstraintsValid: true,
 	}
 	if opts.MutateTemplate != nil {
 		opts.MutateTemplate(tmpl)
@@ -158,6 +164,15 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		t.Fatalf("create leaf certificate: %v", err)
 	}
 	return Issued{CertDER: der, Key: key}
+}
+
+// Sign signs tmpl for a public key the caller already holds, and returns the
+// DER. Issue covers the ordinary case by generating the key itself; this is
+// for the one case it cannot express — a test double standing in for a signing
+// service, which is handed a CSR and must sign THAT requester's key rather
+// than one of its own.
+func (c *CA) Sign(tmpl *x509.Certificate, pub any) ([]byte, error) {
+	return x509.CreateCertificate(rand.Reader, tmpl, c.Cert, pub, c.key)
 }
 
 // WriteCredBundle writes leaf as a credential bundle — the leaf certificate

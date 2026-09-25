@@ -16,10 +16,6 @@ package egress
 
 import (
 	"context"
-	"github.com/agent-substrate/substrate/internal/testca"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -27,7 +23,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/big"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -45,6 +40,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/agent-substrate/substrate/internal/testca"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
@@ -53,10 +49,6 @@ const (
 	testEgressActor    = "my-actor"
 	testEgressActorUID = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 )
-
-// testCA is a throwaway CA standing in for the actor-identity CA.
-
-
 
 // oidActorIdentity mirrors the unexported OID substratex509 encodes the
 // ActorIdentity extension under: the Substrate PEN arc, sub-identifier 2.
@@ -85,8 +77,6 @@ type actorCertOptions struct {
 	// identity's actor the way ateapi mints it.
 	uriSAN string
 }
-
-
 
 // xfccHeader renders chain the way Envoy's SANITIZE_SET +
 // set_current_client_cert_details{chain: true} does.
@@ -706,7 +696,7 @@ func issueActorCertDER(t *testing.T, ca *testca.CA, opts actorCertOptions) []byt
 		MutateTemplate: func(template *x509.Certificate) {
 			template.Subject = pkix.Name{CommonName: testEgressActor}
 			template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
-			
+
 			identity := opts.identity
 			if identity == nil {
 				identity = &substratex509.ActorIdentity{

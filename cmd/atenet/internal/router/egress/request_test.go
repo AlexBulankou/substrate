@@ -29,8 +29,8 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/agent-substrate/substrate/internal/testca"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
 const (

@@ -16,21 +16,16 @@ package ateapiauth
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
-	"math/big"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -38,7 +33,6 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	"k8s.io/client-go/kubernetes/fake"
-	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 func TestDialOptionsRequiresCAFile(t *testing.T) {
@@ -63,7 +57,7 @@ func TestDialOptionsMTLSHandshake(t *testing.T) {
 	ca := testca.New(t, "test-ca")
 	dir := t.TempDir()
 	caFile := filepath.Join(dir, "ca.pem")
-	writeFile(t, caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.CertPEM}))
+	writeFile(t, caFile, ca.CertPEM)
 
 	clientBundle := filepath.Join(dir, "client-bundle.pem")
 	writeFile(t, clientBundle, issueClientBundle(t, ca, "spiffe://cluster.local/ns/ate-system/sa/ate-controller"))
@@ -124,13 +118,6 @@ func healthCheckCode(ctx context.Context, t *testing.T, target string, opts []gr
 	return status.Code(err)
 }
 
-
-
-// issueClientBundle returns a PEM credential bundle (leaf certificate + PKCS8
-// private key) for a client certificate carrying the given SPIFFE URI SAN.
-
-
-
 func writeFile(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -138,6 +125,8 @@ func writeFile(t *testing.T, path string, data []byte) {
 	}
 }
 
+// issueClientBundle returns a PEM credential bundle (leaf certificate + PKCS8
+// private key) for a client certificate carrying the given SPIFFE URI SAN.
 func issueClientBundle(t *testing.T, ca *testca.CA, spiffeID string) []byte {
 	t.Helper()
 	leaf := ca.Issue(t, testca.Opts{

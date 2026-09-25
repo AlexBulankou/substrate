@@ -16,8 +16,6 @@ package atunnel
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -32,11 +30,11 @@ import (
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
-	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 func TestBrokerCertificateSourceMintsAndReusesKey(t *testing.T) {
@@ -123,7 +121,7 @@ func (s *ateomSupportStub) MintActorCertificate(_ context.Context, req *ateletpb
 	if err := substratex509.AddActorIdentityToCertificate(&substratex509.ActorIdentity{Atespace: "team", ActorName: "actor", ActorUid: s.actorUID, Purpose: substratex509.ActorIdentityPurposeAtunnel}, template); err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
-	der, err := x509.CreateCertificate(rand.Reader, template, s.ca.Cert, csr.PublicKey, s.ca.key)
+	der, err := s.ca.Sign(template, csr.PublicKey)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
@@ -211,26 +209,18 @@ func testAteletIdentity(nodeName string) *substratex509.PodIdentity {
 
 func issueTestPodCertificate(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
 	t.Helper()
-	cert := issueTLS(t, ca, spiffeID, usages)
-	template, err := x509.ParseCertificate(cert.Certificate[0])
+	leaf := ca.Issue(t, testca.Opts{
+		URIs:        []string{spiffeID},
+		ExtKeyUsage: usages,
+		MutateTemplate: func(template *x509.Certificate) {
+			if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
-		t.Fatal(err)
-	}
-	key, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
-	if !ok {
-		t.Fatalf("private key has type %T", cert.PrivateKey)
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, ca.Cert, &key.PublicKey, ca.key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert.Certificate[0] = der
-	cert.Leaf, err = x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cert
+	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
 }

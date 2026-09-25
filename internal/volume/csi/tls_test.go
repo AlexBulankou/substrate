@@ -15,32 +15,41 @@
 package csi
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"math/big"
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"testing"
-	"time"
 
+	"github.com/agent-substrate/substrate/internal/testca"
 	"github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"k8s.io/apimachinery/pkg/labels"
-	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 const mockDriverName = "mock-driver"
+
+// writeCreds lays out the two files the plugin reads as a projected volume.
+// Both go under one directory so a rotation rewrites the same path the plugin
+// already stat'd; testca.Republish is what keeps that rewrite visible to the
+// stat-triple cache.
+func writeCreds(t *testing.T, clientBundle, trustBundle []byte) tlsPaths {
+	t.Helper()
+	dir := t.TempDir()
+	paths := tlsPaths{
+		clientCert: filepath.Join(dir, "credential-bundle.pem"),
+		caCert:     filepath.Join(dir, "trust-bundle.pem"),
+	}
+	testca.Republish(t, paths.clientCert, clientBundle)
+	testca.Republish(t, paths.caCert, trustBundle)
+	return paths
+}
 
 func issueBundle(t *testing.T, ca *testca.CA) []byte {
 	t.Helper()
@@ -63,20 +72,6 @@ func issueServerCertForIP(t *testing.T, ca *testca.CA, ip string) tls.Certificat
 	leaf := ca.Issue(t, testca.Opts{IPs: []string{ip}, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
 	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, PrivateKey: leaf.Key}
 }
-
-
-
-
-
-
-// serverCert issues a serving certificate valid for dnsName.
-
-
-// serverCertForIP issues a serving certificate valid for an IP address, as a
-// driver reached at a bare host:port endpoint needs.
-
-
-
 
 // startTLSServer serves the CSI Identity service over mTLS and returns its address.
 func startTLSServer(t *testing.T, serverCert tls.Certificate, clientCAs *x509.CertPool) string {
@@ -330,7 +325,7 @@ func TestMTLSPicksUpCARotation(t *testing.T) {
 	}
 
 	// Publish CA2 as the projected trust bundle.
-	writeFile(t, paths.caCert, ca2.CertPEM)
+	testca.Republish(t, paths.caCert, ca2.CertPEM)
 
 	if err := probe(t, underCA2, creds); err != nil {
 		t.Fatalf("after rotation, the CA2 server was rejected: %v", err)

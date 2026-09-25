@@ -16,16 +16,10 @@ package ateletdial
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
-	"math/big"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,10 +27,10 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/substratex509"
+	"github.com/agent-substrate/substrate/internal/testca"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
-	"github.com/agent-substrate/substrate/internal/testca"
 )
 
 const (
@@ -86,7 +80,7 @@ func TestTLSConfigRejectsAnUnusableWorkerIdentity(t *testing.T) {
 	// where a nil local identity would be compared against atelet's and match
 	// nothing.
 	t.Run("certificate has no Pod identity extension", func(t *testing.T) {
-		bare := env.ca.Issue(t, workerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+		bare := issuePodCertificate(t, env.ca, nil, workerSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 		path := filepath.Join(t.TempDir(), "bare.pem")
 		writeCredentialBundle(t, path, bare)
 
@@ -206,7 +200,7 @@ func TestVerifyConnectionRejectsAnUnacceptableAtelet(t *testing.T) {
 			// identity extension names no node at all, so there is nothing to
 			// compare and it cannot be shown to be node-local.
 			name:  "no Pod identity extension",
-			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{env.ca.Issue(t, ateletSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}).Leaf}},
+			state: tls.ConnectionState{PeerCertificates: []*x509.Certificate{issuePodCertificate(t, env.ca, nil, ateletSPIFFEID, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}).Leaf}},
 			want:  "is not on worker node",
 		},
 		{
@@ -471,20 +465,20 @@ func ateletIdentity(nodeName, nodeUID string) *substratex509.PodIdentity {
 	}
 }
 
-
-
-
-
+// issuePodCertificate issues a leaf under ca naming spiffeID. A nil identity
+// issues one with NO Pod identity extension — the case several tests need,
+// where the peer is otherwise well-formed but names no node at all.
 func issuePodCertificate(t *testing.T, ca *testca.CA, identity *substratex509.PodIdentity, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
 	t.Helper()
-	leaf := ca.Issue(t, testca.Opts{
-		URIs:        []string{spiffeID},
-		MutateTemplate: func(template *x509.Certificate) {
+	opts := testca.Opts{URIs: []string{spiffeID}, ExtKeyUsage: usages}
+	if identity != nil {
+		opts.MutateTemplate = func(template *x509.Certificate) {
 			if err := substratex509.AddPodIdentityToCertificate(identity, template); err != nil {
 				t.Fatalf("AddPodIdentityToCertificate: %v", err)
 			}
-		},
-	})
+		}
+	}
+	leaf := ca.Issue(t, opts)
 	cert, err := x509.ParseCertificate(leaf.CertDER)
 	if err != nil {
 		t.Fatalf("parsing leaf: %v", err)

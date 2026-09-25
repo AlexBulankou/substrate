@@ -1262,17 +1262,3 @@ func TestIngressReincarnationSurvivesStaleDeactivate(t *testing.T) {
 		t.Error("Deactivate left the actor active")
 	}
 }
-
-func issueTLS(t *testing.T, ca *testca.CA, spiffeID string, usages []x509.ExtKeyUsage) tls.Certificate {
-	t.Helper()
-	opts := testca.Opts{ExtKeyUsage: usages}
-	if spiffeID != "" {
-		opts.URIs = []string{spiffeID}
-	}
-	leaf := ca.Issue(t, opts)
-	cert, err := x509.ParseCertificate(leaf.CertDER)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tls.Certificate{Certificate: [][]byte{leaf.CertDER}, Leaf: cert, PrivateKey: leaf.Key}
-}
