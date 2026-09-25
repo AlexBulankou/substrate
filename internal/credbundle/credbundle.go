@@ -20,6 +20,7 @@
 package credbundle
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -32,9 +33,9 @@ import (
 // Kubernetes Pod Certificates mechanism.
 //
 // Returns a function that can be used as GetCertificate in a tls.Config. The parsed bundle is
-// cached: each handshake stats the file and re-reads it only when the file has changed, so
-// pod-certificate rotations are picked up on the next handshake without paying the read and
-// parse cost when nothing changed.
+// cached: each handshake re-reads the file and re-parses it only when the contents have changed,
+// so pod-certificate rotations are picked up on the next handshake without paying the parse cost
+// when nothing changed.
 func Loader(path string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	c := &certCache{path: path}
 	return func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -60,96 +61,103 @@ func ClientLoader(path string) func(*tls.CertificateRequestInfo) (*tls.Certifica
 // A tls.Config's ClientCAs (and RootCAs) is frozen once the config is in use,
 // so a pool built at startup never sees a CA rotation. Calling the returned
 // function per connection — from GetConfigForClient on the server side — keeps
-// verification current: the parsed pool is cached and the file re-read only
-// when it changes, mirroring Loader, so a rotation is picked up on the next
-// handshake without paying the read and parse cost when nothing changed.
+// verification current: the parsed pool is cached and re-parsed only when the
+// file contents change, mirroring Loader, so a rotation is picked up on the
+// next handshake without paying the parse cost when nothing changed.
 func PoolLoader(path string) func() (*x509.CertPool, error) {
 	c := &poolCache{path: path}
 	return c.get
 }
 
-// certCache holds the parse of a credential bundle file together with the stat
-// of the file it was parsed from, so unchanged files are not re-parsed on
-// every TLS handshake.
+// certCache holds the parse of a credential bundle file together with the bytes
+// it was parsed from, so unchanged files are not re-parsed on every TLS
+// handshake.
 type certCache struct {
 	path string
 
 	mu sync.Mutex
-	// fi is the stat of path taken just before cert was parsed; nil until the
-	// first successful parse. cert is served while a fresh stat of path still
-	// matches it.
-	fi   os.FileInfo
+	// raw is the content of path that cert was parsed from; nil until the first
+	// successful parse. cert is served while a fresh read of path returns the
+	// same bytes.
+	raw  []byte
 	cert *tls.Certificate
 }
 
-// get returns the parsed bundle, re-reading the file only when it has changed
-// since the last successful parse.
+// get returns the parsed bundle, re-parsing only when the file contents have
+// changed since the last successful parse.
 //
-// A change is any difference in file identity (os.SameFile: device and inode
-// on Unix), modification time, or size. The kubelet rotates projected volume
-// contents, including pod certificates, by writing a fresh timestamped
-// directory and atomically swapping a symlink to it, so a rotation always
-// surfaces here as a change of file identity; mtime and size additionally
-// cover in-place rewrites, whose mid-write states a reader may also observe.
+// The comparison is over the bytes, not over the file's metadata. Stat-based
+// invalidation is what a rotation can slip past: filesystem timestamps are
+// granular (a millisecond on a typical CONFIG_HZ=1000 kernel), an in-place
+// rewrite leaves the inode unchanged, and two certificates minted from one
+// template encode to the same length, so a rotation landing inside that window
+// is invisible in all three of identity, mtime and size at once. Reading the
+// file is what makes the check exact. It also costs nothing worth saving: a
+// trust bundle is a few kilobytes, read once per handshake, against the
+// public-key operations that follow. The parse is what the cache is for, and
+// byte-identical content still yields the identical parse.
 //
-// The file can still change between the stat and the read below. The parse of
-// the newer content is then stored against the older stat, so the next call
-// sees a stat mismatch and re-reads; the cache never lags a rotation by more
-// than one handshake. Errors leave the previous entry in place and are
-// returned to the caller: handshakes fail exactly as they would without
+// The already-parsed guard is load-bearing rather than an optimisation: bytes
+// are equal when both are empty, so without it a first call against an empty
+// file would serve a nil result as if it were a cache hit.
+//
+// The file can still change between the read and a caller's use of the result;
+// the next call re-reads and sees the newer content, so the cache never lags a
+// rotation by more than one handshake. Errors leave the previous entry in place
+// and are returned to the caller: handshakes fail exactly as they would without
 // caching, and every later call retries until a parse succeeds.
 func (c *certCache) get() (*tls.Certificate, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fi, err := os.Stat(c.path)
+	raw, err := os.ReadFile(c.path)
 	if err != nil {
-		return nil, fmt.Errorf("while getting file info for credential bundle %q: %w", c.path, err)
+		return nil, fmt.Errorf("while reading credential bundle %q: %w", c.path, err)
 	}
-	if c.cert != nil && os.SameFile(c.fi, fi) && fi.ModTime().Equal(c.fi.ModTime()) && fi.Size() == c.fi.Size() {
+	if c.cert != nil && bytes.Equal(c.raw, raw) {
 		return c.cert, nil
 	}
 
-	cert, err := Parse(c.path)
+	cert, err := parseBundle(raw)
 	if err != nil {
 		return nil, err
 	}
-	c.fi, c.cert = fi, cert
+	c.raw, c.cert = raw, cert
 	return cert, nil
 }
 
-// poolCache holds the parse of a trust-bundle file together with the stat of
-// the file it was parsed from, so unchanged files are not re-parsed on every
-// TLS handshake. It mirrors certCache; see get for the change-detection and
-// concurrency reasoning.
+// poolCache holds the parse of a trust-bundle file together with the bytes it
+// was parsed from, so unchanged files are not re-parsed on every TLS handshake.
+// It mirrors certCache; see get for the change-detection and concurrency
+// reasoning.
 type poolCache struct {
 	path string
 
 	mu   sync.Mutex
-	fi   os.FileInfo
+	raw  []byte
 	pool *x509.CertPool
 }
 
-// get returns the parsed trust pool, re-reading the file only when it has
-// changed since the last successful parse. Change detection and error handling
-// match certCache.get.
+// get returns the parsed trust pool, re-parsing only when the file contents
+// have changed since the last successful parse. Change detection and error
+// handling match certCache.get.
 func (c *poolCache) get() (*x509.CertPool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	fi, err := os.Stat(c.path)
+	raw, err := os.ReadFile(c.path)
 	if err != nil {
-		return nil, fmt.Errorf("while getting file info for trust bundle %q: %w", c.path, err)
+		return nil, fmt.Errorf("while reading trust bundle %q: %w", c.path, err)
 	}
-	if c.pool != nil && os.SameFile(c.fi, fi) && fi.ModTime().Equal(c.fi.ModTime()) && fi.Size() == c.fi.Size() {
+	if c.pool != nil && bytes.Equal(c.raw, raw) {
 		return c.pool, nil
 	}
 
-	pool, err := ParsePool(c.path)
+	pool, err := parsePool(raw, c.path)
 	if err != nil {
 		return nil, err
 	}
-	c.fi, c.pool = fi, pool
+	c.raw, c.pool = raw, pool
 	return pool, nil
 }
 
@@ -160,7 +168,12 @@ func Parse(bundlePath string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while reading credential bundle: %w", err)
 	}
+	return parseBundle(bundleBytes)
+}
 
+// parseBundle is Parse over content already in hand, so that certCache can
+// compare the bytes it read against the bytes it last parsed.
+func parseBundle(bundleBytes []byte) (*tls.Certificate, error) {
 	var leafKeyBytes []byte
 	var chainBytes [][]byte
 
@@ -214,6 +227,13 @@ func ParsePool(path string) (*x509.CertPool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("while reading trust bundle: %w", err)
 	}
+	return parsePool(pemBytes, path)
+}
+
+// parsePool is ParsePool over content already in hand, so that poolCache can
+// compare the bytes it read against the bytes it last parsed. path is carried
+// for the error message only.
+func parsePool(pemBytes []byte, path string) (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pemBytes) {
 		return nil, fmt.Errorf("trust bundle %q contains no certificates", path)
