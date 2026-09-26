@@ -98,6 +98,11 @@ type Opts struct {
 	// the address it connected to.
 	IPs  []string
 	URIs []string
+	// Mutate, when non-nil, edits the leaf template just before it is signed.
+	// It exists for negative cases: a test that needs a certificate broken in
+	// exactly one way builds an otherwise-valid one and breaks that property
+	// here, so the case cannot pass for an unrelated reason.
+	Mutate func(*x509.Certificate)
 }
 
 // Issued is a leaf certificate and its private key.
@@ -143,6 +148,14 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		DNSNames:     opts.DNSNames,
 		IPAddresses:  ips,
 		URIs:         uris,
+		// A real leaf carries basicConstraints CA:FALSE, and Mutate is how a
+		// test makes one look like a CA. Without this, Go omits the extension
+		// entirely and setting IsCA there silently does nothing — the negative
+		// case would pass by not being tested.
+		BasicConstraintsValid: true,
+	}
+	if opts.Mutate != nil {
+		opts.Mutate(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
 	if err != nil {
