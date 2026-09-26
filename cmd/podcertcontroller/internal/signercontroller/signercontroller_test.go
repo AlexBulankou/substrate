@@ -49,6 +49,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -160,7 +161,7 @@ func newTestController(t *testing.T, signer *fakeSigner, hasher *fakeHasher, obj
 	t.Helper()
 
 	kc := fake.NewSimpleClientset(objs...)
-	c := New(fixedClock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)}, signer, kc, hasher)
+	c := New(fixedClock{now: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)}, signer, kc, hasher, betaClient(t, kc))
 	t.Cleanup(func() { c.pcrQueue.ShutDown() })
 	return c, kc
 }
@@ -300,7 +301,7 @@ func TestProcessNextWorkItemSignsAndForgets(t *testing.T) {
 	c, _ := newTestController(t, signer, hasher)
 
 	pcr := testPCR("ns1", "pcr1", testSignerName)
-	if err := c.pcrInformer.GetIndexer().Add(pcr); err != nil {
+	if err := c.pcrClient.Informer().GetIndexer().Add(pcr); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 	c.pcrQueue.Add("ns1/pcr1")
@@ -325,7 +326,7 @@ func TestProcessNextWorkItemRetriesAnItemOwnedByAnotherReplica(t *testing.T) {
 	hasher := &fakeHasher{assigned: false}
 	c, _ := newTestController(t, signer, hasher)
 
-	if err := c.pcrInformer.GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
+	if err := c.pcrClient.Informer().GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 	c.pcrQueue.Add("ns1/pcr1")
@@ -344,7 +345,7 @@ func TestProcessNextWorkItemRetriesAfterASigningFailure(t *testing.T) {
 	hasher := &fakeHasher{assigned: true}
 	c, _ := newTestController(t, signer, hasher)
 
-	if err := c.pcrInformer.GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
+	if err := c.pcrClient.Informer().GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 	c.pcrQueue.Add("ns1/pcr1")
@@ -367,7 +368,7 @@ func TestProcessNextWorkItemForgetsAKeyThatEventuallySucceeds(t *testing.T) {
 	hasher := &fakeHasher{assigned: true}
 	c, _ := newTestController(t, signer, hasher)
 
-	if err := c.pcrInformer.GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
+	if err := c.pcrClient.Informer().GetIndexer().Add(testPCR("ns1", "pcr1", testSignerName)); err != nil {
 		t.Fatalf("seeding indexer: %v", err)
 	}
 	c.pcrQueue.Add("ns1/pcr1")
@@ -449,7 +450,7 @@ func TestRunWorkerDrainsTheQueueAndStopsOnShutdown(t *testing.T) {
 	c, _ := newTestController(t, signer, hasher)
 
 	for _, name := range []string{"pcr1", "pcr2", "pcr3"} {
-		if err := c.pcrInformer.GetIndexer().Add(testPCR("ns1", name, testSignerName)); err != nil {
+		if err := c.pcrClient.Informer().GetIndexer().Add(testPCR("ns1", name, testSignerName)); err != nil {
 			t.Fatalf("seeding indexer: %v", err)
 		}
 		c.pcrQueue.Add("ns1/" + name)
@@ -516,8 +517,8 @@ func TestInformerEventsEnqueueTheObjectKey(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.pcrInformer.Run(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), c.pcrInformer.HasSynced) {
+	go c.pcrClient.Informer().Run(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), c.pcrClient.Informer().HasSynced) {
 		t.Fatal("informer never synced")
 	}
 
@@ -833,4 +834,17 @@ func TestEnsureBundlesDoesNotConsultTheSignerWhenUnassigned(t *testing.T) {
 	if got := signer.ctbCallCount(); got != 0 {
 		t.Errorf("DesiredClusterTrustBundles called %d times on an unassigned replica, want 0", got)
 	}
+}
+
+// betaClient builds a PodCertificateRequest client over the fake clientset,
+// declaring the v1beta1 resource the client discovers. Mirrors the helper
+// upstream already uses in podidentitysigner_test.go.
+func betaClient(t *testing.T, kc *fake.Clientset) *podcertificate.Client {
+	t.Helper()
+	kc.Resources = []*metav1.APIResourceList{{GroupVersion: "certificates.k8s.io/v1beta1", APIResources: []metav1.APIResource{{Name: "podcertificaterequests"}}}}
+	client, err := podcertificate.NewClient(kc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }

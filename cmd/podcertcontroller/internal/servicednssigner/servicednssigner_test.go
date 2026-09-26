@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
 	"github.com/agent-substrate/substrate/internal/localca"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -120,7 +121,7 @@ func newTestImpl(t *testing.T, objs ...runtime.Object) (*Impl, *fake.Clientset, 
 	}
 	kc := fake.NewSimpleClientset(objs...)
 	pool := &localca.ConcretePool{CAs: []*localca.CA{ca}, ActiveForSigning: ca.ID}
-	return NewImpl(kc, pool), kc, ca
+	return NewImpl(kc, pool, betaClient(t, kc)), kc, ca
 }
 
 func issuedCert(t *testing.T, impl *Impl, kc *fake.Clientset, pcr *certsv1beta1.PodCertificateRequest) (*x509.Certificate, *certsv1beta1.PodCertificateRequest) {
@@ -530,7 +531,7 @@ func TestMakeCertReportsASigningFailure(t *testing.T) {
 		testPod(testPodName, testPodUID, testLabels),
 		testService("svc-a", corev1.ServiceTypeClusterIP, testLabels),
 		pcr)
-	impl := NewImpl(kc, &failingPool{createErr: injected})
+	impl := NewImpl(kc, &failingPool{createErr: injected}, betaClient(t, kc))
 
 	err := impl.MakeCert(context.Background(), pcr)
 	if err == nil {
@@ -554,7 +555,8 @@ func TestMakeCertReportsASigningFailure(t *testing.T) {
 // delete the bundle that relying parties are using to verify certificates.
 func TestDesiredClusterTrustBundlesReportsATrustAnchorFailure(t *testing.T) {
 	injected := errors.New("injected trust-anchor failure")
-	impl := NewImpl(fake.NewSimpleClientset(), &failingPool{anchorErr: injected})
+	kc := fake.NewSimpleClientset()
+	impl := NewImpl(kc, &failingPool{anchorErr: injected}, betaClient(t, kc))
 
 	ctbs, err := impl.DesiredClusterTrustBundles()
 	if err == nil {
@@ -569,4 +571,17 @@ func TestDesiredClusterTrustBundlesReportsATrustAnchorFailure(t *testing.T) {
 	if ctbs != nil {
 		t.Errorf("got %d trust bundles alongside the error, want none", len(ctbs))
 	}
+}
+
+// betaClient builds a PodCertificateRequest client over the fake clientset,
+// declaring the v1beta1 resource the client discovers. Mirrors the helper
+// upstream already uses in podidentitysigner_test.go.
+func betaClient(t *testing.T, kc *fake.Clientset) *podcertificate.Client {
+	t.Helper()
+	kc.Resources = []*metav1.APIResourceList{{GroupVersion: "certificates.k8s.io/v1beta1", APIResources: []metav1.APIResource{{Name: "podcertificaterequests"}}}}
+	client, err := podcertificate.NewClient(kc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
