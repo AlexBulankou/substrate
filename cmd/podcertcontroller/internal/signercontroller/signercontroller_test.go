@@ -18,14 +18,15 @@ import (
 	"context"
 	"testing"
 
+	"errors"
+	"fmt"
 	"github.com/agent-substrate/substrate/internal/clustertrustbundle"
 	certsv1 "k8s.io/api/certificates/v1"
 	certsv1beta1 "k8s.io/api/certificates/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-	"errors"
-	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
@@ -142,6 +143,11 @@ const testSignerName = "ate.dev/test-signer"
 // did not arrange for panics on the nil interface instead of returning a
 // plausible zero value, so a controller that starts calling something new
 // fails loudly rather than silently taking the zero-valued branch.
+//
+// Run drives the worker and the ensureBundles loop on separate goroutines, so
+// both fakes record under a mutex and hand out a copy. Recording unguarded is
+// a real race -- and one the race detector reports against the test rather
+// than the controller, which is a confusing place to start reading.
 type stubSigner struct {
 	SignerImpl
 
@@ -151,17 +157,28 @@ type stubSigner struct {
 	desiredCTBsErr error
 
 	makeCertErr error
-	madeCerts   []string
+
+	mu        sync.Mutex
+	madeCerts []string
 }
 
 func (f *stubSigner) SignerName() string { return f.signerName }
+
+// certs returns the PCRs MakeCert was called for, newest last.
+func (f *stubSigner) certs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.madeCerts...)
+}
 
 func (f *stubSigner) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
 	return f.desiredCTBs, f.desiredCTBsErr
 }
 
 func (f *stubSigner) MakeCert(_ context.Context, pcr *certsv1beta1.PodCertificateRequest) error {
+	f.mu.Lock()
 	f.madeCerts = append(f.madeCerts, pcr.ObjectMeta.Namespace+"/"+pcr.ObjectMeta.Name)
+	f.mu.Unlock()
 	return f.makeCertErr
 }
 
@@ -169,15 +186,26 @@ func (f *stubSigner) MakeCert(_ context.Context, pcr *certsv1beta1.PodCertificat
 // is mine", the single-replica case.
 type fakeHasher struct {
 	assigned map[string]bool
-	asked    []string
+
+	mu    sync.Mutex
+	asked []string
 }
 
 func (f *fakeHasher) AssignedToThisReplica(_ context.Context, item string) bool {
+	f.mu.Lock()
 	f.asked = append(f.asked, item)
+	f.mu.Unlock()
 	if f.assigned == nil {
 		return true
 	}
 	return f.assigned[item]
+}
+
+// asks returns the items the rendezvous was consulted about, newest last.
+func (f *fakeHasher) asks() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.asked...)
 }
 
 // newTestController wires a Controller over a fake clientset whose discovery
@@ -308,8 +336,8 @@ func TestHandlePCR(t *testing.T) {
 				}
 			}
 
-			if made := len(signer.madeCerts) > 0; made != tc.wantMadeCert {
-				t.Errorf("MakeCert called = %v, want %v (calls: %v)", made, tc.wantMadeCert, signer.madeCerts)
+			if made := len(signer.certs()) > 0; made != tc.wantMadeCert {
+				t.Errorf("MakeCert called = %v, want %v (calls: %v)", made, tc.wantMadeCert, signer.certs())
 			}
 		})
 	}
@@ -330,8 +358,8 @@ func TestHandlePCRSkipsRendezvousForOtherSigners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handlePCR: %v", err)
 	}
-	if len(hasher.asked) != 0 {
-		t.Errorf("rendezvous consulted for another signer's PCR: %v", hasher.asked)
+	if asked := hasher.asks(); len(asked) != 0 {
+		t.Errorf("rendezvous consulted for another signer's PCR: %v", asked)
 	}
 }
 
@@ -395,7 +423,7 @@ func TestProcessNextWorkItem(t *testing.T) {
 				t.Fatal("processNextWorkItem returned false, want true — the worker loop would exit")
 			}
 
-			if made := len(signer.madeCerts) > 0; made != tc.wantMadeCert {
+			if made := len(signer.certs()) > 0; made != tc.wantMadeCert {
 				t.Errorf("MakeCert called = %v, want %v", made, tc.wantMadeCert)
 			}
 
@@ -413,7 +441,7 @@ func TestProcessNextWorkItemForgetsAKeyThatEventuallySucceeds(t *testing.T) {
 	// Forget is what resets the rate limiter. Without it a key that failed
 	// once keeps its accumulated backoff forever, so a PCR that hits one
 	// transient error is slower to sign for the rest of the process's life.
-	signer := &fakeSigner{signerName: testSignerName, makeCertErr: errors.New("transient")}
+	signer := &stubSigner{signerName: testSignerName, makeCertErr: errors.New("transient")}
 	c, _ := newTestController(t, signer, &fakeHasher{}, pcrWithConditions("ns", "pcr", testSignerName))
 
 	c.pcrQueue.Add("ns/pcr")
@@ -616,8 +644,8 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		if len(kc.Actions()) != 0 {
 			t.Errorf("made %d API calls, want 0", len(kc.Actions()))
 		}
-		if len(hasher.asked) != 1 || hasher.asked[0] != "maintain-trust-bundles" {
-			t.Errorf("rendezvous asked about %v, want exactly [maintain-trust-bundles]", hasher.asked)
+		if asked := hasher.asks(); len(asked) != 1 || asked[0] != "maintain-trust-bundles" {
+			t.Errorf("rendezvous asked about %v, want exactly [maintain-trust-bundles]", asked)
 		}
 	})
 
@@ -751,7 +779,7 @@ func TestRunSignsQueuedRequests(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(30 * time.Second)
-	for len(signer.madeCerts) == 0 {
+	for len(signer.certs()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("Run never signed the queued request")
 		}
