@@ -24,6 +24,8 @@ import (
 	"errors"
 	"math/big"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -357,6 +360,99 @@ func TestDialForAteletOnNode(t *testing.T) {
 		}
 		if again != conn {
 			t.Error("second DialForAteletOnNode returned a different connection, want the cached one")
+		}
+	})
+
+	t.Run("collapses concurrent dials for the same atelet", func(t *testing.T) {
+		// The dial path is look-up -> dial -> insert. Each step is
+		// goroutine-safe, the sequence is not: without a singleflight every
+		// concurrent caller misses the cold cache and dials, only one
+		// connection can be the cached one, and lru.Add over an existing key
+		// replaces the value without running the eviction func that closes
+		// connections. The displaced ones are owned by nobody and leak for the
+		// life of the process.
+		var dials atomic.Int32
+		entered := make(chan struct{}, 1)
+		release := make(chan struct{})
+		d := NewAteletDialer(newTestAteletIndexer(t,
+			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
+		), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+			WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+				dials.Add(1)
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				<-release
+				return insecure.NewCredentials(), nil
+			}))
+
+		const callers = 8
+		conns := make([]*grpc.ClientConn, callers)
+		errs := make([]error, callers)
+		var wg sync.WaitGroup
+		for i := range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conns[i], errs[i] = d.DialForAteletOnNode("node1")
+			}()
+		}
+
+		// Hold the first caller inside the dial so the rest reach the same
+		// flight key while it is still in progress — the window the defect
+		// needs. The sleep only widens it; the assertions below do not depend
+		// on how many callers actually arrive in time.
+		<-entered
+		time.Sleep(50 * time.Millisecond)
+		close(release)
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("caller %d: DialForAteletOnNode: %v", i, err)
+			}
+		}
+		if got := dials.Load(); got != 1 {
+			t.Errorf("dialed %d times for one atelet, want 1 — the extra connections are owned by nobody", got)
+		}
+		cached, ok := d.ateletConns.Get("uid-1")
+		if !ok {
+			t.Fatal("no connection cached for uid-1")
+		}
+		for i, conn := range conns {
+			if conn != cached {
+				t.Errorf("caller %d got a connection that is not the cached one, so nothing will ever close it", i)
+			}
+		}
+	})
+
+	t.Run("dials different atelets in parallel", func(t *testing.T) {
+		// The flight key is the atelet's pod UID, so collapsing same-atelet
+		// dials must not serialize or coalesce dials of different atelets.
+		var dials atomic.Int32
+		d := NewAteletDialer(newTestAteletIndexer(t,
+			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
+			ateletPod("atelet-2", "uid-2", "node2", "10.0.0.2"),
+		), installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "",
+			WithDialCredentials(func(string) (credentials.TransportCredentials, error) {
+				dials.Add(1)
+				return insecure.NewCredentials(), nil
+			}))
+
+		first, err := d.DialForAteletOnNode("node1")
+		if err != nil {
+			t.Fatalf("DialForAteletOnNode(node1): %v", err)
+		}
+		second, err := d.DialForAteletOnNode("node2")
+		if err != nil {
+			t.Fatalf("DialForAteletOnNode(node2): %v", err)
+		}
+		if first == second {
+			t.Error("both nodes returned the same connection, want one per atelet")
+		}
+		if got := dials.Load(); got != 2 {
+			t.Errorf("dialed %d times for two atelets, want 2", got)
 		}
 	})
 
