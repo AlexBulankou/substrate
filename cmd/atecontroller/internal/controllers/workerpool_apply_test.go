@@ -1059,3 +1059,35 @@ func TestBuildDeploymentApplyConfigLogsExporter(t *testing.T) {
 		})
 	}
 }
+
+func TestNodeSelectorTermCarriesMatchFields(t *testing.T) {
+	term := &corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key:      "workload",
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"ateom"},
+		}},
+		MatchFields: []corev1.NodeSelectorRequirement{{
+			Key:      "metadata.name",
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{"node-1"},
+		}},
+	}
+
+	ac := nodeSelectorTermToApply(term)
+
+	if len(ac.MatchFields) != 1 {
+		t.Fatalf("MatchFields = %d entries, want 1 (dropped or misrouted)", len(ac.MatchFields))
+	}
+	if got := *ac.MatchFields[0].Key; got != "metadata.name" {
+		t.Errorf("MatchFields[0].Key = %q, want metadata.name", got)
+	}
+	if diff := cmp.Diff([]string{"node-1"}, ac.MatchFields[0].Values); diff != "" {
+		t.Errorf("MatchFields[0].Values mismatch (-want +got):\n%s", diff)
+	}
+	// Guard the copy-paste direction explicitly: the field requirement must
+	// not have been appended to MatchExpressions as well.
+	if len(ac.MatchExpressions) != 1 {
+		t.Errorf("MatchExpressions = %d entries, want 1; a MatchField leaked into it", len(ac.MatchExpressions))
+	}
+}
