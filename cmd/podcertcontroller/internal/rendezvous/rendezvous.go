@@ -233,13 +233,25 @@ func (h *Hasher) AssignedToThisReplica(ctx context.Context, item string) bool {
 			leaseDuration = time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
 		}
 
+		// RenewTime is optional in the API, so it can legitimately be absent on
+		// a lease that carries our label --- a half-written object, or one
+		// created by hand.  A replica that has never checked in cannot be
+		// live, and dereferencing the nil would take this controller down.
+		if lease.Spec.RenewTime == nil {
+			continue
+		}
+
 		// If the replica hasn't checked in by the deadline, consider it dead.
 		deadline := lease.Spec.RenewTime.Time.Add(leaseDuration)
 		if now.After(deadline) {
 			continue
 		}
 
-		if lease.Spec.HolderIdentity == nil {
+		// An unset --- or set-but-empty --- holder identity names no replica.
+		// The empty string is also Hash's "nothing chosen yet" sentinel, so
+		// passing one through would make the assignment depend on the order
+		// the leases happen to come back in.
+		if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
 			continue
 		}
 
