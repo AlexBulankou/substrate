@@ -298,3 +298,32 @@ func TestSteadyStateReconcileIsQuiet(t *testing.T) {
 	}
 	wantNoEvents(t, events)
 }
+
+// TestEventReasonsAreStable pins the reason strings to their wire form.
+//
+// Every wantEvent call in this package passes the reason *constant*, so those
+// assertions move with a rename and cannot fail on one. A reason is not an
+// internal identifier though: it is the key an operator filters on
+// (`--field-selector reason=...`) and the one a runbook or alert rule hard-codes,
+// so renaming it breaks a surface outside this repo. This table is the only
+// place the literals appear, so a rename means editing it and seeing the cost.
+//
+// NetworkPolicyApplyFailed is deliberately not the shared ApplyFailed: both
+// reconcilers publish onto the same WorkerPool, so one reason for both would
+// leave reason=ApplyFailed ambiguous about which derived object failed.
+func TestEventReasonsAreStable(t *testing.T) {
+	for _, tc := range []struct {
+		constant  string
+		onTheWire string
+	}{
+		{reasonApplyFailed, "ApplyFailed"},
+		{reasonSynced, "Synced"},
+		{reasonNetworkPolicyApplyFailed, "NetworkPolicyApplyFailed"},
+		{reasonTrustBundleInvalid, "TrustBundleInvalid"},
+		{reasonTrustBundleApplyFailed, "TrustBundleApplyFailed"},
+	} {
+		if tc.constant != tc.onTheWire {
+			t.Errorf("event reason is now %q, was %q: existing field selectors and alert rules match the old value", tc.constant, tc.onTheWire)
+		}
+	}
+}
