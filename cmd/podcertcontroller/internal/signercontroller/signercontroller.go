@@ -227,7 +227,12 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 				)
 				return
 			}
-			return
+			// continue, not return: a signer can want several bundles at
+			// once — during a CA rotation the outgoing anchor and the
+			// incoming one are both desired — and returning here would
+			// create exactly one of them per pass, leaving the rest absent
+			// for a whole tick while relying parties fail closed on them.
+			continue
 		} else if err != nil {
 			slog.ErrorContext(ctx, "Error while getting ClusterTrustBundle",
 				slog.String("err", err.Error()),
