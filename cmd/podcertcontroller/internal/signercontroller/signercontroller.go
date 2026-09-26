@@ -226,7 +226,12 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 				)
 				return
 			}
-			return
+			// continue, not return: a signer can want several bundles at
+			// once — during a CA rotation the outgoing anchor and the
+			// incoming one are both desired — and returning here would
+			// create exactly one of them per pass, leaving the rest absent
+			// for a whole tick while relying parties fail closed on them.
+			continue
 		} else if err != nil {
 			slog.ErrorContext(ctx, "Error while getting ClusterTrustBundle",
 				slog.String("err", err.Error()),
@@ -239,6 +244,12 @@ func (c *Controller) ensureBundles(ctx context.Context) {
 			slog.InfoContext(ctx, "ClusterTrustBundle already in correct state",
 				slog.String("key", wantCTB.ObjectMeta.Name),
 			)
+			// Skipping the write is what makes this check mean anything.
+			// Falling through issued an Update on every pass — this runs
+			// every 5s per signer — bumping resourceVersion and waking every
+			// watcher of the bundle, including the kubelet's on every node,
+			// for a change that is not there.
+			continue
 		}
 
 		ctb = ctb.DeepCopy()
