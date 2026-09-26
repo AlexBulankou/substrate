@@ -17,12 +17,10 @@ package authz
 import (
 	"context"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -32,33 +30,16 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-func configureDockerEnv(ctx context.Context) error {
-	if os.Getenv("DOCKER_HOST") != "" {
-		return nil
-	}
-	output, err := exec.CommandContext(ctx, "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}").Output()
-	if err != nil {
-		return err
-	}
-	host := strings.TrimSpace(string(output))
-	if host == "" {
-		return nil
-	}
-	_ = os.Setenv("DOCKER_HOST", host)
-	if os.Getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE") == "" {
-		socket := host
-		if runtime.GOOS == "darwin" {
-			socket = "/var/run/docker.sock"
-		}
-		_ = os.Setenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE", socket)
-	}
-	return nil
-}
-
 func startPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
-	if err := configureDockerEnv(ctx); err != nil {
+	if err := dockerenv.Configure(ctx); err != nil {
+		// Skipping is right on a workstation without Docker and wrong in CI,
+		// where it turns the only test of the authorization-model bootstrap
+		// into a silent pass.
+		if dockerenv.Required() {
+			t.Fatalf("Docker unavailable and required (CI or REQUIRE_DOCKER is set): %v", err)
+		}
 		t.Skipf("skipping test; docker is unavailable: %v", err)
 	}
 
