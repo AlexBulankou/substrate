@@ -325,6 +325,28 @@ func TestProcessNextWorkItem(t *testing.T) {
 	}
 }
 
+func TestProcessNextWorkItemForgetsAKeyThatEventuallySucceeds(t *testing.T) {
+	// Forget is what resets the rate limiter. Without it a key that failed
+	// once keeps its accumulated backoff forever, so a PCR that hits one
+	// transient error is slower to sign for the rest of the process's life.
+	signer := &fakeSigner{signerName: testSignerName, makeCertErr: errors.New("transient")}
+	c, _ := newTestController(t, signer, &fakeHasher{}, pcrWithConditions("ns", "pcr", testSignerName))
+
+	c.pcrQueue.Add("ns/pcr")
+	c.processNextWorkItem(t.Context())
+	if c.pcrQueue.NumRequeues("ns/pcr") == 0 {
+		t.Fatal("the failing attempt was not requeued, so the retry below proves nothing")
+	}
+
+	signer.makeCertErr = nil
+	c.pcrQueue.Add("ns/pcr")
+	c.processNextWorkItem(t.Context())
+
+	if got := c.pcrQueue.NumRequeues("ns/pcr"); got != 0 {
+		t.Errorf("NumRequeues = %d after a successful retry, want 0 — the backoff was never cleared", got)
+	}
+}
+
 func TestProcessNextWorkItemStopsOnShutdown(t *testing.T) {
 	// runWorker loops until this returns false. If a shut-down queue did not
 	// report it, the worker would spin.
