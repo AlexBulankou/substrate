@@ -15,7 +15,6 @@
 package credbundle
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -69,8 +68,37 @@ func TestParseRejectsNonPKCS8PrivateKeyBlock(t *testing.T) {
 }
 
 func TestLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
-	bundle := makeBundle(t, 7)
-	path := writeBundle(t, bundle)
+	path := writeBundle(t, makeBundle(t, 7))
+	getCert := Loader(path)
+
+	first, err := getCert(nil)
+	if err != nil {
+		t.Fatalf("Loader() first call error = %v", err)
+	}
+	second, err := getCert(nil)
+	if err != nil {
+		t.Fatalf("Loader() second call error = %v", err)
+	}
+
+	// Pointer identity, not serial equality: a re-parse of the same file
+	// produces an equal certificate but a different object, so this is what
+	// actually distinguishes a cache hit from a silent re-parse. Asserting on
+	// the value would pass either way.
+	if first != second {
+		t.Fatalf("Loader() re-parsed an unchanged file, want the cached parse")
+	}
+}
+
+// The invalidation must be on the bundle contents, not on the stat triple
+// (os.SameFile + mtime + size), because all three survive a real rotation: an
+// in-place rewrite keeps the inode, two credentials from the same template
+// encode to the same length, and mtime resolution is a filesystem timestamp
+// tick, so a rewrite in the same tick keeps the mtime as well. Restoring the
+// mtime here makes that collision deterministic instead of leaving it to the
+// scheduler. A stat-triple cache serves serial 1 forever.
+func TestLoaderPicksUpRotationWithAnIdenticalStatTriple(t *testing.T) {
+	before := makeBundle(t, 1)
+	path := writeBundle(t, before)
 	getCert := Loader(path)
 
 	if _, err := getCert(nil); err != nil {
@@ -81,23 +109,31 @@ func TestLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat bundle: %v", err)
 	}
-	// Replace the content with same-length garbage and restore the mtime, so
-	// file identity (inode), size, and mtime all still match the cached stat.
-	// The cached parse must be served; any re-read would fail loudly on the
-	// garbage.
-	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(bundle)), 0o600); err != nil {
-		t.Fatalf("overwrite bundle: %v", err)
+
+	after := makeBundle(t, 2)
+	if len(after) != len(before) {
+		t.Fatalf("test setup: rotated bundle is %d bytes, want the same %d as the original", len(after), len(before))
+	}
+	if err := os.WriteFile(path, after, 0o600); err != nil {
+		t.Fatalf("rotate bundle in place: %v", err)
 	}
 	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
 		t.Fatalf("restore mtime: %v", err)
 	}
+	fi2, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("re-stat bundle: %v", err)
+	}
+	if !os.SameFile(fi, fi2) || !fi2.ModTime().Equal(fi.ModTime()) || fi2.Size() != fi.Size() {
+		t.Fatalf("test setup: stat triple changed across the rotation, so this would pass without the fix")
+	}
 
 	cert, err := getCert(nil)
 	if err != nil {
-		t.Fatalf("Loader() with unchanged stat error = %v", err)
+		t.Fatalf("Loader() after rotation error = %v", err)
 	}
-	if got := leafSerial(t, cert); got != 7 {
-		t.Fatalf("Loader() leaf serial = %d, want cached 7", got)
+	if got := leafSerial(t, cert); got != 2 {
+		t.Fatalf("Loader() leaf serial = %d, want the rotated-in 2 -- a rotated-out credential is still being presented", got)
 	}
 }
 
@@ -217,8 +253,32 @@ func TestClientLoaderCachesAndReloads(t *testing.T) {
 }
 
 func TestPoolLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
-	trust := makeTrustBundle(t, 5)
-	path := writeBundle(t, trust)
+	path := writeBundle(t, makeTrustBundle(t, 5))
+	getPool := PoolLoader(path)
+
+	first, err := getPool()
+	if err != nil {
+		t.Fatalf("PoolLoader() first call error = %v", err)
+	}
+	second, err := getPool()
+	if err != nil {
+		t.Fatalf("PoolLoader() second call error = %v", err)
+	}
+
+	// Pointer identity for the same reason as the Loader case: x509.CertPool
+	// has an Equal method, so a re-parse of the same file compares equal and
+	// a value assertion could not tell the two apart.
+	if first != second {
+		t.Fatalf("PoolLoader() re-parsed an unchanged file, want the cached parse")
+	}
+}
+
+// The trust-anchor counterpart of TestLoaderPicksUpRotationWithAnIdenticalStatTriple,
+// and the more serious direction of the two: the pool is the root set a peer is
+// verified against, so a stat-triple cache keeps trusting a rotated-out CA.
+func TestPoolLoaderPicksUpRotationWithAnIdenticalStatTriple(t *testing.T) {
+	before := makeTrustBundle(t, 1)
+	path := writeBundle(t, before)
 	getPool := PoolLoader(path)
 
 	first, err := getPool()
@@ -230,22 +290,38 @@ func TestPoolLoaderServesCachedParseWhileFileUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat bundle: %v", err)
 	}
-	// Overwrite with same-length garbage and restore the mtime so identity,
-	// size, and mtime all still match: the cached pool must be served, since a
-	// re-read would fail loudly on the garbage.
-	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(trust)), 0o600); err != nil {
-		t.Fatalf("overwrite bundle: %v", err)
+
+	after := makeTrustBundle(t, 2)
+	if len(after) != len(before) {
+		t.Fatalf("test setup: rotated trust bundle is %d bytes, want the same %d as the original", len(after), len(before))
+	}
+	if err := os.WriteFile(path, after, 0o600); err != nil {
+		t.Fatalf("rotate trust bundle in place: %v", err)
 	}
 	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
 		t.Fatalf("restore mtime: %v", err)
 	}
+	fi2, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("re-stat bundle: %v", err)
+	}
+	if !os.SameFile(fi, fi2) || !fi2.ModTime().Equal(fi.ModTime()) || fi2.Size() != fi.Size() {
+		t.Fatalf("test setup: stat triple changed across the rotation, so this would pass without the fix")
+	}
 
 	second, err := getPool()
 	if err != nil {
-		t.Fatalf("PoolLoader() with unchanged stat error = %v", err)
+		t.Fatalf("PoolLoader() after rotation error = %v", err)
 	}
-	if !second.Equal(first) {
-		t.Fatalf("PoolLoader() returned a re-parsed pool, want the cached one")
+	if second.Equal(first) {
+		t.Fatalf("PoolLoader() served the pre-rotation pool -- a rotated-out CA is still a trust anchor")
+	}
+	wantPool := x509.NewCertPool()
+	if !wantPool.AppendCertsFromPEM(after) {
+		t.Fatalf("test setup: rotated trust bundle holds no certificates")
+	}
+	if !second.Equal(wantPool) {
+		t.Fatalf("PoolLoader() pool does not match the rotated-in trust bundle")
 	}
 }
 
