@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -300,25 +301,42 @@ func TestMakeCertErrors(t *testing.T) {
 		podUID     types.UID
 		omitKey    bool
 		failUpdate bool
+		// wantErr is the cause the error must name. Asserting only that MakeCert
+		// failed lets two mutants through: with the pod-Get error swallowed the
+		// fake returns an empty Pod whose UID is "", so the call still fails --
+		// as a bogus UID mismatch rather than the API error it was; with the
+		// public-key error swallowed the nil key fails later inside
+		// x509.CreateCertificate. Both still fail closed, which is the property
+		// that matters most, but an operator reading the wrong cause is a real
+		// cost, and a weak assertion is what hid it.
+		wantErr string
+		// notWantErr is the cause the mutant above would report instead.
+		notWantErr string
 	}{
 		{
-			name:    "pod not found",
-			omitPod: true,
-			podUID:  "pod-uid-1",
+			name:       "pod not found",
+			omitPod:    true,
+			podUID:     "pod-uid-1",
+			wantErr:    "while getting pod ate-system/atelet-abcde",
+			notWantErr: "UID mismatch",
 		},
 		{
-			name:   "pod UID mismatch",
-			podUID: "other-uid",
+			name:    "pod UID mismatch",
+			podUID:  "other-uid",
+			wantErr: "pod UID mismatch",
 		},
 		{
-			name:    "no key material in PCR",
-			podUID:  "pod-uid-1",
-			omitKey: true,
+			name:       "no key material in PCR",
+			podUID:     "pod-uid-1",
+			omitKey:    true,
+			wantErr:    "does not contain a public key",
+			notWantErr: "unsupported public key",
 		},
 		{
 			name:       "status update fails",
 			podUID:     "pod-uid-1",
 			failUpdate: true,
+			wantErr:    "injected update failure",
 		},
 	}
 
@@ -352,8 +370,15 @@ func TestMakeCertErrors(t *testing.T) {
 			}
 			impl := NewImpl(kc, caPool, betaClient(t, kc))
 
-			if err := impl.MakeCert(context.Background(), pcr); err == nil {
+			err = impl.MakeCert(context.Background(), pcr)
+			if err == nil {
 				t.Fatalf("MakeCert: got nil error, want error")
+			}
+			if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if tc.notWantErr != "" && strings.Contains(err.Error(), tc.notWantErr) {
+				t.Errorf("error = %v; the cause is being reported as %q", err, tc.notWantErr)
 			}
 
 			gotPCR, err := kc.CertificatesV1beta1().PodCertificateRequests("ate-system").Get(context.Background(), "req-1", metav1.GetOptions{})
@@ -364,6 +389,69 @@ func TestMakeCertErrors(t *testing.T) {
 				t.Errorf("PCR status updated despite error: %+v", gotPCR.Status)
 			}
 		})
+	}
+}
+
+// TestMakeCertIdentityComesFromTheRequestNotThePod documents CURRENT behaviour
+// rather than reporting a bug. MakeCert fetches the pod -- the comment above
+// the call says "to get its ServiceAccount" -- and then builds the SPIFFE ID
+// from pcr.Spec.ServiceAccountName, never reading pod.Spec.ServiceAccountName.
+// The pod fetch only validates the UID, so the identity in the issued
+// certificate is the one the requester asserted.
+//
+// Whether that is exploitable depends on something outside this package: if
+// PodCertificateRequest admission already rejects a spec whose
+// serviceAccountName disagrees with the named pod, the signer is merely relying
+// on a check it does not make itself. Every other case in this file gives the
+// pod and the request the same ServiceAccount, so none of them can see the
+// difference. This one pins it, and fails loudly if the provenance ever moves.
+func TestMakeCertIdentityComesFromTheRequestNotThePod(t *testing.T) {
+	ca, err := localca.GenerateCA("test-ca", localca.KeyTypeED25519, 365*24*time.Hour)
+	if err != nil {
+		t.Fatalf("while generating CA: %v", err)
+	}
+	caPool := &localca.ConcretePool{CAs: []*localca.CA{ca}}
+
+	_, subjectPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("while generating subject key: %v", err)
+	}
+
+	pod, pcr := makePodAndPCR("ate-system", "atelet-abcde", "requested-sa", 86400)
+	pod.Spec.ServiceAccountName = "pods-own-sa"
+	pcr.Spec.StubPKCS10Request = stubCSR(t, subjectPriv)
+
+	kc := fake.NewSimpleClientset(pod, pcr)
+	impl := NewImpl(kc, caPool, betaClient(t, kc))
+
+	if err := impl.MakeCert(context.Background(), pcr); err != nil {
+		t.Fatalf("MakeCert: %v", err)
+	}
+
+	gotPCR, err := kc.CertificatesV1beta1().PodCertificateRequests("ate-system").Get(context.Background(), "req-1", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("while fetching updated PCR: %v", err)
+	}
+	block, _ := pem.Decode([]byte(gotPCR.Status.CertificateChain))
+	if block == nil {
+		t.Fatalf("certificate chain contains no PEM block")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("while parsing leaf certificate: %v", err)
+	}
+	if len(leaf.URIs) != 1 {
+		t.Fatalf("cert carries %d URI SANs, want exactly 1", len(leaf.URIs))
+	}
+
+	got := leaf.URIs[0].String()
+	if got == "spiffe://cluster.local/ns/ate-system/sa/pods-own-sa" {
+		t.Fatalf("SPIFFE ID = %q -- the signer now takes the identity from the pod. "+
+			"That is a stronger check than this test pinned; update the test, and "+
+			"note the behaviour change in the signer's docs.", got)
+	}
+	if want := "spiffe://cluster.local/ns/ate-system/sa/requested-sa"; got != want {
+		t.Errorf("SPIFFE ID = %q, want %q", got, want)
 	}
 }
 
