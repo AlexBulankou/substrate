@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -288,14 +289,27 @@ func TestMakeCertErrors(t *testing.T) {
 		name       string
 		omitKey    bool
 		failUpdate bool
+		// wantErr is the cause the error must name. Asserting only that MakeCert
+		// failed lets a mutant through: swallow PublicKey's error and the nil key
+		// fails later anyway, inside x509.CreateCertificate. That still fails
+		// closed, which is the property that matters most, but it reports
+		// "unsupported public key type" for a request that simply carried no key
+		// at all -- an operator chasing a key-format bug that is not there. A
+		// weak assertion is what hid it.
+		wantErr string
+		// notWantErr is the cause the mutant above would report instead.
+		notWantErr string
 	}{
 		{
-			name:    "no key material in PCR",
-			omitKey: true,
+			name:       "no key material in PCR",
+			omitKey:    true,
+			wantErr:    "does not contain a public key",
+			notWantErr: "unsupported public key",
 		},
 		{
 			name:       "status update fails",
 			failUpdate: true,
+			wantErr:    "injected update failure",
 		},
 	}
 
@@ -324,8 +338,15 @@ func TestMakeCertErrors(t *testing.T) {
 			}
 			impl := NewImpl(caPool, betaClient(t, kc))
 
-			if err := impl.MakeCert(context.Background(), pcr); err == nil {
+			err = impl.MakeCert(context.Background(), pcr)
+			if err == nil {
 				t.Fatalf("MakeCert: got nil error, want error")
+			}
+			if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if tc.notWantErr != "" && strings.Contains(err.Error(), tc.notWantErr) {
+				t.Errorf("error = %v; the cause is being reported as %q", err, tc.notWantErr)
 			}
 
 			gotPCR, err := kc.CertificatesV1beta1().PodCertificateRequests("ate-system").Get(context.Background(), "req-1", metav1.GetOptions{})
