@@ -37,6 +37,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/google"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
@@ -136,14 +137,21 @@ func buildFixtureImage(t *testing.T, repo string) string {
 	// tag. The returned reference is digest-pinned, so the tag itself is
 	// throwaway.
 	ref := fmt.Sprintf("%s/e2e-combinedvolumes-fixture:%d", strings.TrimSuffix(repo, "/"), time.Now().UnixNano())
-	tag, err := name.ParseReference(ref, name.Insecure)
+	// No name.Insecure: let the registry package derive the scheme. It still
+	// picks http automatically for loopback/RFC1918 hosts, so CI's kind
+	// registry keeps working, but uses https for a real registry such as an
+	// Artifact Registry repo, which serves https only.
+	tag, err := name.ParseReference(ref)
 	if err != nil {
 		t.Fatalf("parsing %q: %v", ref, err)
 	}
-	// The default keychain reads the local docker config, so the push works
-	// against an authenticated registry (a GKE dev cluster's gcr.io) as well
-	// as CI's anonymous kind registry.
-	if err := remote.Write(tag, img, remote.WithAuthFromKeychain(authn.DefaultKeychain)); err != nil {
+	// MultiKeychain, not DefaultKeychain alone: the default reads the local
+	// docker config, which is empty on a machine that authenticates to
+	// Artifact Registry through ADC rather than `docker login`. google.Keychain
+	// resolves that case and DefaultKeychain still covers a docker-config
+	// registry, with anonymous fallback for CI's kind registry.
+	keychain := authn.NewMultiKeychain(google.Keychain, authn.DefaultKeychain)
+	if err := remote.Write(tag, img, remote.WithAuthFromKeychain(keychain)); err != nil {
 		t.Fatalf("pushing %q: %v", ref, err)
 	}
 
