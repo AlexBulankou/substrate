@@ -45,7 +45,7 @@ const (
 // impossible to land silently.
 func TestLayoutIsStable(t *testing.T) {
 	const (
-		actor  = "/var/lib/ateom-gvisor/actors/" + testActorUID
+		actor  = "/var/lib/ate/actors/" + testActorUID
 		bundle = actor + "/bundles/main"
 	)
 	tests := []struct {
@@ -53,14 +53,13 @@ func TestLayoutIsStable(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"ImageCacheDir", ImageCacheDir, "/var/lib/ateom-gvisor/image-cache"},
+		{"ImageCacheDir", ImageCacheDir, "/var/lib/ate/image-cache"},
 
-		{"RunSCBinaryPath", RunSCBinaryPath("deadbeef"), "/var/lib/ateom-gvisor/static-files/runsc-deadbeef"},
-		{"GVisorReleaseDir", GVisorReleaseDir("deadbeef"), "/var/lib/ateom-gvisor/static-files/gvisor-deadbeef"},
+		{"RunSCBinaryPath", RunSCBinaryPath("deadbeef"), "/var/lib/ate/static-files/runsc-deadbeef"},
+		{"GVisorReleaseDir", GVisorReleaseDir("deadbeef"), "/var/lib/ate/static-files/gvisor-deadbeef"},
 
 		{"ActorPath", ActorPath(testActorUID), actor},
 		{"ActorSandboxAssetsFile", ActorSandboxAssetsFile(testActorUID), actor + "/sandbox-assets.json"},
-		{"RunSCStateDir", RunSCStateDir(testActorUID), actor + "/runsc-state"},
 		{"OCIBundleDir", OCIBundleDir(testActorUID), actor + "/bundles"},
 		{"OCIBundlePath", OCIBundlePath(testActorUID, "main"), bundle},
 		{"CheckpointStateDir", CheckpointStateDir(testActorUID), actor + "/checkpoint-state"},
@@ -71,7 +70,6 @@ func TestLayoutIsStable(t *testing.T) {
 		{"SystemInfoVolumeRootsDir", SystemInfoVolumeRootsDir(testActorUID), actor + "/system-info"},
 		{"SystemInfoVolumeRoot", SystemInfoVolumeRoot(testActorUID, "vol"), actor + "/system-info/vol"},
 		{"RestoreStateDir", RestoreStateDir(testActorUID), actor + "/restore-state"},
-		{"PIDFileDir", PIDFileDir(testActorUID), actor + "/pidfiles"},
 		{"VolumesDir", VolumesDir(testActorUID), actor + "/volumes"},
 		{"VolumeHostPath", VolumeHostPath(testActorUID, "vol"), actor + "/volumes/vol"},
 	}
@@ -126,7 +124,6 @@ func TestSystemInfoRootsAreOutsideDurableDirMounts(t *testing.T) {
 func actorScopedPaths(uid string) map[string]string {
 	return map[string]string{
 		"ActorSandboxAssetsFile":     ActorSandboxAssetsFile(uid),
-		"RunSCStateDir":              RunSCStateDir(uid),
 		"OCIBundleDir":               OCIBundleDir(uid),
 		"OCIBundlePath":              OCIBundlePath(uid, "main"),
 		"CheckpointStateDir":         CheckpointStateDir(uid),
@@ -137,7 +134,6 @@ func actorScopedPaths(uid string) map[string]string {
 		"SystemInfoVolumeRootsDir":   SystemInfoVolumeRootsDir(uid),
 		"SystemInfoVolumeRoot":       SystemInfoVolumeRoot(uid, "vol"),
 		"RestoreStateDir":            RestoreStateDir(uid),
-		"PIDFileDir":                 PIDFileDir(uid),
 		"VolumesDir":                 VolumesDir(uid),
 		"VolumeHostPath":             VolumeHostPath(uid, "vol"),
 	}
