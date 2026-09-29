@@ -15,20 +15,24 @@
 package ateletpath
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/nodepath"
 )
 
-// This file is the atelet half of the on-disk path contract; internal/ateompath
-// carries the other half. The split is forced rather than chosen: this package
-// lives under cmd/atelet/internal/, so nothing outside cmd/atelet/ can import
-// it, and the paths declared here -- the image cache, the content-addressed
-// static files, and the actor-scoped directories only atelet derives -- are
-// unreachable from a test in internal/ateompath. The invariants are the same
-// ones, applied to the surface this package owns.
+// This file is the on-disk path contract for the surface atelet owns. It used
+// to be one half of a pair: internal/ateompath carried the other, and the
+// split was forced rather than chosen, because this package lives under
+// cmd/atelet/internal/ and nothing outside cmd/atelet/ can import it.
+// Upstream has since deleted internal/ateompath, so this is the whole
+// contract, and the invariants that suite carried have been brought here
+// rather than deleted with the package that happened to host them.
 
 const (
 	testActorUID  = "123e4567-e89b-12d3-a456-426614174000"
@@ -190,4 +194,178 @@ func isUnderDir(path, dir string) bool {
 		return false
 	}
 	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// TestRestoreStateDirIsSeparateFromCheckpointStateDir keeps a suspension
+// checkpoint from writing over the file runsc is still paging in. The two
+// directories are distinct today only because two constructors happen to spell
+// different names; nothing else holds them apart.
+func TestRestoreStateDirIsSeparateFromCheckpointStateDir(t *testing.T) {
+	restore := RestoreStateDir(testActorUID)
+	checkpoint := CheckpointStateDir(testActorUID)
+	if restore == checkpoint {
+		t.Fatalf("RestoreStateDir and CheckpointStateDir are the same directory %q; a suspension checkpoint would overwrite the file runsc is still paging in", restore)
+	}
+	if isUnderDir(restore, checkpoint) || isUnderDir(checkpoint, restore) {
+		t.Errorf("RestoreStateDir(%q) and CheckpointStateDir(%q) nest; they must be disjoint trees", restore, checkpoint)
+	}
+}
+
+// TestContainmentHoldsForEveryValidIdentifier widens the containment invariant
+// past the single UUID the rest of this file uses. The awkward identifiers are
+// the short and dash-heavy ones, and a path bug that only shows up for "a" or
+// "1-2-3" is invisible to a suite that only ever passes a UUID.
+func TestContainmentHoldsForEveryValidIdentifier(t *testing.T) {
+	// All DNS-1123 labels: lower-case alphanumerics and dashes, starting and
+	// ending alphanumeric.
+	uids := []string{
+		"a",
+		"0",
+		"a-b",
+		"actor-0",
+		"1-2-3",
+		testActorUID,
+		strings.Repeat("a", 63), // the label length limit
+	}
+	for _, uid := range uids {
+		root := ActorPath(uid)
+		if !isUnderDir(root, nodepath.ActorsDir) {
+			t.Errorf("ActorPath(%q) = %q escaped nodepath.ActorsDir %q", uid, root, nodepath.ActorsDir)
+			continue
+		}
+		for name, got := range actorScopedPaths(uid) {
+			if !isUnderDir(got, root) {
+				t.Errorf("%s(%q) = %q, want a path under %q", name, uid, got, root)
+			}
+		}
+	}
+}
+
+// TestUnvalidatedIdentifiersEscape records the precondition this package
+// carries but does not enforce: it composes paths, it does not sanitise them,
+// and filepath.Join cleans the result rather than rejecting it. Callers keep
+// the invariant, so a new call site that skips validation gets no help here.
+//
+// The two shapes below are the ones with teeth, because atelet's
+// removeActorDirs does os.RemoveAll(ActorPath(actorUID)):
+//
+//   - empty collapses ActorPath onto nodepath.ActorsDir itself, turning
+//     "reclaim this actor" into "delete every actor on the node";
+//   - a traversal element leaves the tree entirely.
+//
+// If this test ever fails, the package has grown its own guard. That is an
+// improvement: assert the new behaviour here and drop the warning from the
+// package doc.
+func TestUnvalidatedIdentifiersEscape(t *testing.T) {
+	if got := ActorPath(""); got != nodepath.ActorsDir {
+		t.Errorf("ActorPath(%q) = %q, want %q -- an empty UID no longer collapses onto the actors root, so the caller-side non-empty check may be redundant now", "", got, nodepath.ActorsDir)
+	}
+	if got := ActorPath("../../etc"); isUnderDir(got, nodepath.ActorsDir) {
+		t.Errorf("ActorPath(%q) = %q, unexpectedly contained in %q", "../../etc", got, nodepath.ActorsDir)
+	}
+}
+
+// TestSocketPathsFitTheUnixLimit covers the sockets the layout tests do not. A
+// unix socket path over the limit fails at bind time, on the node, at runtime
+// -- there is no earlier signal.
+func TestSocketPathsFitTheUnixLimit(t *testing.T) {
+	// sun_path is 108 bytes including the NUL terminator.
+	const maxUnixSocketLen = 107
+	for name, got := range map[string]string{
+		"AteomSupportSocket": nodepath.AteomSupportSocket,
+	} {
+		if len(got) > maxUnixSocketLen {
+			t.Errorf("%s = %q is %d bytes, over the %d-byte unix socket limit", name, got, len(got), maxUnixSocketLen)
+		}
+	}
+}
+
+// TestEveryActorScopedConstructorIsRegistered is what keeps the three
+// invariants above from quietly narrowing to the set of functions that existed
+// the day they were written. They all read from one hand-maintained map, so a
+// constructor added later is covered by nothing until somebody remembers to
+// list it -- and forgetting looks exactly like passing.
+//
+// This reads the package's own source and requires every exported function
+// taking an actorUID to appear in that map. Adding one without registering it
+// fails here, naming the function.
+func TestEveryActorScopedConstructorIsRegistered(t *testing.T) {
+	// Deliberately outside the invariants, each for a reason that is checked
+	// below rather than taken on trust.
+	exempt := map[string]string{
+		"ActorPath": "the tree root itself, not a path within it",
+		"ActorDirs": "an aggregate of already-registered constructors, not a new path (asserted by TestActorDirsExposesOnlyRegisteredPaths)",
+	}
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "ateletpath.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parsing ateletpath.go: %v", err)
+	}
+
+	registered := actorScopedPaths(testActorUID)
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || !fn.Name.IsExported() {
+			continue
+		}
+		if !takesActorUID(fn) {
+			continue
+		}
+		name := fn.Name.Name
+		if reason, ok := exempt[name]; ok {
+			t.Logf("%s is exempt from the actor-tree invariants: %s", name, reason)
+			continue
+		}
+		if _, ok := registered[name]; !ok {
+			t.Errorf("%s takes an actorUID but is missing from actorScopedPaths, so the containment, collision and cross-actor invariants do not cover it; add it there (or to the exempt map, with a reason)", name)
+		}
+	}
+}
+
+// TestActorDirsExposesOnlyRegisteredPaths discharges the ActorDirs exemption
+// above. ActorDirs is exempt on the grounds that it only aggregates paths the
+// registry already covers -- an unchecked claim is exactly the kind of
+// exemption that rots, because a field added later pointing somewhere new
+// would inherit the exemption and be covered by nothing.
+func TestActorDirsExposesOnlyRegisteredPaths(t *testing.T) {
+	known := map[string]bool{ActorPath(testActorUID): true}
+	for _, got := range actorScopedPaths(testActorUID) {
+		known[got] = true
+	}
+
+	dirs := ActorDirs(testActorUID)
+	v := reflect.ValueOf(dirs).Elem()
+	checked := 0
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Type().Field(i)
+		if !field.IsExported() || field.Type.Kind() != reflect.String {
+			continue
+		}
+		got := v.Field(i).String()
+		if got == "" {
+			continue
+		}
+		checked++
+		if !known[got] {
+			t.Errorf("ActorDirs().%s = %q, which no registered constructor produces; either register the constructor behind it or drop ActorDirs from the exempt map", field.Name, got)
+		}
+	}
+	if checked == 0 {
+		t.Error("inspected no ActorDirs path fields, so this test asserted nothing; the proto shape must have changed")
+	}
+}
+
+// takesActorUID reports whether fn's first parameter is the actor UID.
+func takesActorUID(fn *ast.FuncDecl) bool {
+	params := fn.Type.Params
+	if params == nil || len(params.List) == 0 {
+		return false
+	}
+	for _, name := range params.List[0].Names {
+		if name.Name == "actorUID" {
+			return true
+		}
+	}
+	return false
 }
