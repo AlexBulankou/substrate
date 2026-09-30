@@ -39,6 +39,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
@@ -531,14 +532,17 @@ func (s *RPCService) MintActorJWT(ctx context.Context, req *ateapipb.MintActorJW
 		return nil, fmt.Errorf("at least one audience must be requested")
 	}
 
+	// JWT timestamps have one-second resolution; truncating keeps expires_at
+	// equal to the exp claim.
+	now := time.Now().Truncate(time.Second)
+	expiresAt := now.Add(time.Duration(req.GetExpirationSeconds()) * time.Second)
 	actorClaims := &actoridjwt.Claims{
-		Issuer: s.actorJWTIssuer,
-		// TODO(identity): this format is very likely going to change.
-		Subject:    fmt.Sprintf("atespaces:%s:actors:%s", dbActor.GetMetadata().GetAtespace(), dbActor.GetMetadata().GetName()),
+		Issuer:     s.actorJWTIssuer,
+		Subject:    fmt.Sprintf("actor/%s/%s", dbActor.GetMetadata().GetAtespace(), dbActor.GetMetadata().GetName()),
 		Audiences:  req.GetAudience(),
-		Expiration: time.Now().Add(15 * time.Minute),
-		NotBefore:  time.Now().Add(-5 * time.Minute),
-		IssuedAt:   time.Now(),
+		Expiration: expiresAt,
+		NotBefore:  now.Add(-5 * time.Minute),
+		IssuedAt:   now,
 		JTI:        rand.Text(),
 
 		Substrate: actoridjwt.SubstrateClaims{
@@ -554,7 +558,8 @@ func (s *RPCService) MintActorJWT(ctx context.Context, req *ateapipb.MintActorJW
 	}
 
 	return &ateapipb.MintActorJWTResponse{
-		ActorJwt: actorJWT,
+		ActorJwt:  actorJWT,
+		ExpiresAt: timestamppb.New(expiresAt),
 	}, nil
 }
 
