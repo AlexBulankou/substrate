@@ -68,6 +68,8 @@ type Config struct {
 	SweperfTotalSteps     int    // total steps in trace; 0 falls back to default
 	SweperfNumCycles      int    // number of cycles to partition steps into; 0 falls back to default
 	SweperfPollIntervalMs int    // /status poll interval in ms; 0 falls back to default
+
+	AgentSessionThinkScale float64 // multiplier on the script's per-step think times; 0 reads as 1.0
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -116,6 +118,8 @@ type payload struct {
 	SweperfTotalSteps     *float64 `json:"sweperf_total_steps"`
 	SweperfNumCycles      *float64 `json:"sweperf_num_cycles"`
 	SweperfPollIntervalMs *float64 `json:"sweperf_poll_interval_ms"`
+
+	AgentSessionThinkScale *float64 `json:"agentsession_think_scale"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -209,6 +213,9 @@ func (c Config) Validate() error {
 	if c.SweperfPollIntervalMs < 0 {
 		return fmt.Errorf("sweperf_poll_interval_ms cannot be negative: %d", c.SweperfPollIntervalMs)
 	}
+	if c.AgentSessionThinkScale < 0 {
+		return fmt.Errorf("agentsession_think_scale cannot be negative: %f", c.AgentSessionThinkScale)
+	}
 	// MaxPingsPerWake < 1 is treated as 1 at read time (see iterate() in
 	// glutton/lifecycle.go), so Config's zero value stays usable — no
 	// validate rejection here.
@@ -277,6 +284,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.SweperfPollIntervalMs != nil {
 		out.SweperfPollIntervalMs = int(*p.SweperfPollIntervalMs)
+	}
+	if p.AgentSessionThinkScale != nil {
+		out.AgentSessionThinkScale = *p.AgentSessionThinkScale
 	}
 	return out
 }
@@ -354,6 +364,7 @@ func StartPoll(
 					slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 					slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
 					slog.Int("sweperf_poll_interval_ms", next.SweperfPollIntervalMs),
+					slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
 				)
 			}
 		}
@@ -401,6 +412,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Int("sweperf_total_steps", next.SweperfTotalSteps),
 			slog.Int("sweperf_num_cycles", next.SweperfNumCycles),
 			slog.Int("sweperf_poll_interval_ms", next.SweperfPollIntervalMs),
+			slog.Float64("agentsession_think_scale", next.AgentSessionThinkScale),
 		)
 	})
 }

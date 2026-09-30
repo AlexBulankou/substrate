@@ -143,6 +143,80 @@ The liveness check at session start already has the actor running, so the first 
 resume is a no-op. Its successful `ResumeActor`, `ResumeActor_rtt` and `ResumeToFirstExec`
 samples are not recorded; failures still are.
 
+### Agent-Session Benchmark
+
+The agent-session benchmark (`--user-class agentsession`) emulates a fleet of
+coding agents on Substrate. Each locust user is one session: an actor driven
+through a scripted 20-step coding task ("clone a repo, build it, fix a test,
+refactor, package it"), where every step costs the sandbox the CPU, memory,
+disk, and network a real coding agent's action would. Between steps the agent
+is "waiting for the LLM to think": the driver **suspends the actor** for the
+step's think time, and the next step's first request **wakes it through the
+atenet router** (request parking). Mostly-idle sessions plus fast wake is
+exactly the oversubscription story this measures.
+
+The entire workload is the declarative script in
+[`internal/benchmarking/boomer/agentsession/script.go`](../internal/benchmarking/boomer/agentsession/script.go)
+— one table entry per step, naming what the agent is doing and the resource
+ops that act it out. To change the workload, edit the table. Each session is
+an actor from the stock `glutton` template; steps are sequences of glutton
+RPCs:
+
+| Step | The agent is… | Sandbox effect |
+|---|---|---|
+| 01_read_task | reading the task prompt | fill 32Mi RAM (agent context) |
+| 02_clone_repo | `git clone` | 16Mi arrives over the network → disk; 0.5s CPU |
+| 03_explore_tree | listing/grepping the tree | disk read (digest); 0.2s CPU |
+| 04_read_key_files | opening files into context | disk read shipped back out; 8Mi RAM churn |
+| 05_install_deps | `pip install` / `go mod download` | 32Mi over the network → disk; 1.5s CPU ×2 |
+| 06_first_build | first full build | fill 64Mi RAM; 3s CPU ×2; 24Mi disk write |
+| 07_run_unit_tests | running the test suite (one fails) | disk read; 2.5s CPU ×2 |
+| 08_reason_about_failure | tracing the bug (long LLM turn, 8s think) | full RAM page-walk after the wake |
+| 09_edit_source | applying the fix | 64Ki patch over the network; 4Mi disk write |
+| 10_incremental_build | rebuilding changed packages | 1.2s CPU ×2; 8Mi disk write |
+| 11_rerun_failed_test | re-running the failing test | 0.8s CPU |
+| 12_write_new_tests | authoring regression tests (6s think) | 128Ki over the network; 2Mi disk write |
+| 13_run_new_tests | running the new tests | disk read; 1s CPU |
+| 14_full_test_suite | full-suite regression run | 4s CPU ×2; disk read; 8Mi RAM churn |
+| 15_lint_format | lint + format pass | disk read; 0.9s CPU |
+| 16_refactor | multi-file refactor (8s think) | 512Ki over the network; 6Mi disk write; 0.6s CPU |
+| 17_rebuild | full rebuild | 32Mi RAM churn; 2s CPU ×2; 16Mi disk write |
+| 18_final_test_suite | final full-suite run | 3.5s CPU ×2 |
+| 19_package_artifact | building the release package | disk read; 1s CPU; 24Mi disk write |
+| 20_commit_and_summarize | committing + summarizing | 256Ki disk write; 24Mi shipped back out; RAM walk |
+
+The script needs bigger actors than the 256Mi default: it holds ~96Mi of
+RAM arrays + ~110Mi of tmpfs files, and the observed guest peak with
+allocator transients is ~320Mi (512Mi OOMs). Deploy the workloads with
+`--actor-memory 1Gi`. `TestSessionBudgets` bounds the script-declared bytes
+only, so script edits that grow the working set fail the test and force this
+guidance to be revisited.
+
+```sh
+./benchmarking/deploy_locust.sh --deploy --sandbox-class gvisor --actor-memory 1Gi
+./benchmarking/locust/deploy.sh --deploy --user-class agentsession
+```
+
+#### Agent-Session Configuration Knobs
+
+* `--agentsession-think-scale` — multiplier on every think gap; 0.5 makes the
+  fleet twice as chatty, 4.0 models slow reasoning models (default 1.0). Each
+  gap gets ±20% jitter so sessions don't move in lockstep.
+* `--resume-mode implicit|explicit` — implicit (default) lets the parked
+  first request wake the actor; explicit issues ResumeActor before traffic.
+* `--lifecycle-mode suspend|pause` — durable suspend (default) or node-local
+  pause between steps.
+
+#### Agent-Session Reported Metrics
+
+* `WakeFirstTouch`: latency of a dedicated ping sent before each step's ops —
+  in implicit mode that ping is what triggers the parked wake, so this row
+  **is** the user-visible wake latency, unpolluted by the step's own work.
+* `Step_<name>` (e.g. `Step_06_first_build`): wall time of that step's ops,
+  think gap excluded.
+* `SuspendActor` / `ResumeActor` / `CreateActor` / `DeleteActor`: control-plane
+  lifecycle latencies.
+
 ### Viewing Traces
 You must have enabled otel tracing for your cluster to view traces.
 
