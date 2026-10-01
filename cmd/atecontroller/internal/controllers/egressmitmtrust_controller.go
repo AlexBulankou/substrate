@@ -50,8 +50,8 @@ type EgressMITMTrustReconciler struct {
 	bundleV1        bool
 }
 
-// EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway's
-// sdsmint sidecar signs per-SNI leaves with.
+// EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway
+// signs per-SNI leaves with.
 func EgressMITMCAPoolRef(systemNamespace string) types.NamespacedName {
 	const egressMITMCAPoolSecret = "egress-mitm-ca-pool"
 	return types.NamespacedName{Namespace: systemNamespace, Name: egressMITMCAPoolSecret}

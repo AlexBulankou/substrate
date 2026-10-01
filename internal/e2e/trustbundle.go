@@ -51,7 +51,7 @@ const (
 // EnsureEgressTrustBundle makes sure the egress trust bundle exists, then
 // waits until the reconciler-published bundle is non-empty. It provisions a
 // pool only when there is none and never replaces one it finds: the pool is
-// cluster-wide, and the sdsmint gateway mounts the one the install created.
+// cluster-wide, and the egress gateway mounts the one the install created.
 // A suite that needs to OWN the pool's contents (the identity suite's
 // deterministic assertions and rotation) uses ReplaceEgressTrustPool.
 func EnsureEgressTrustBundle(t *testing.T, ctx context.Context, clients *Clients) {

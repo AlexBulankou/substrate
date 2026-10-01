@@ -31,10 +31,9 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/images"
 )
 
-// Splicing credential injection into the real sdsmint manifest replaces the
-// marker and adds the provider flags to the egress sidecar. CI deploys the
-// sdsmint variant but never with injection, so this is the only automated check
-// on the spliced flags.
+// Splicing credential injection into the real egress manifest replaces the
+// marker and adds the provider flags to the egress sidecar. CI deploys with
+// injection on envoy, but only this pins the spliced flags themselves.
 func TestPatchAtenetEgressInject(t *testing.T) {
 	root, err := config.RepoRoot()
 	if err != nil {
@@ -42,7 +41,6 @@ func TestPatchAtenetEgressInject(t *testing.T) {
 	}
 	env := &Env{Cfg: &config.Config{
 		Root:                                  root,
-		ExperimentalUseSDSMint:                true,
 		ExperimentalEgressCredentialInjection: true,
 	}}
 
@@ -128,9 +126,9 @@ func TestEmitAdditionalEgressExtprocCluster(t *testing.T) {
 	}
 }
 
-// Splices the real sdsmint manifest and re-parses the result. CI deploys the
-// sdsmint variant but never with the extproc flag, so this is the only
-// automated check on the injected cluster.
+// Splices the real egress manifest and re-parses the result. CI never deploys
+// with the extproc flag, so this is the only automated check on the injected
+// cluster.
 func TestPatchAtenetEgressManifest(t *testing.T) {
 	root, err := config.RepoRoot()
 	if err != nil {
@@ -138,7 +136,6 @@ func TestPatchAtenetEgressManifest(t *testing.T) {
 	}
 	env := &Env{Cfg: &config.Config{
 		Root:                           root,
-		ExperimentalUseSDSMint:         true,
 		AdditionalEgressExtprocService: "ate-system/foo:50051",
 	}}
 
@@ -417,20 +414,9 @@ func TestRenderCordonControlPlane(t *testing.T) {
 			want: []string{"atenet-egress"},
 		},
 		{
-			name: "egress sdsmint file",
-			cfg:  config.Config{ExperimentalUseSDSMint: true},
-			path: func(e *Env) string { return e.atenetEgressManifestPath() },
-			want: []string{"atenet-egress"},
-		},
-		{
 			name: "agentgateway egress overlay",
+			cfg:  config.Config{Router: config.RouterAgentgateway},
 			path: func(e *Env) string { return e.Cfg.Path(installDir + "/agentgateway-egress") },
-			want: []string{"atenet-egress"},
-		},
-		{
-			name: "agentgateway egress mitm overlay",
-			cfg:  config.Config{Router: config.RouterAgentgateway, ExperimentalUseSDSMint: true},
-			path: func(e *Env) string { return e.Cfg.Path(installDir + "/agentgateway-egress-mitm") },
 			want: []string{"atenet-egress"},
 		},
 	} {
@@ -474,7 +460,6 @@ func TestRenderBytesCordonControlPlane(t *testing.T) {
 	e := &Env{Cfg: &config.Config{
 		Root:                           repoRoot(t),
 		CordonControlPlane:             true,
-		ExperimentalUseSDSMint:         true,
 		AdditionalEgressExtprocService: "ate-system/foo:50051",
 	}}
 	patched, err := e.patchAtenetEgressManifest()
@@ -513,20 +498,19 @@ func TestRenderWithoutCordonLeavesManifestsAlone(t *testing.T) {
 	}
 }
 
-// The two sdsmint switches are coupled: the MITM overlay mounts the CA pool
-// Secret EnsureEgressMITMCAPoolSecret generates, so selecting one without the
-// other leaves atenet-egress waiting on a Secret nobody creates.
-func TestAgentgatewayEgressMITMOverlay(t *testing.T) {
+// The agentgateway egress overlay mounts the CA pool Secret
+// EnsureEgressMITMCAPoolSecret generates; without it atenet-egress waits on a
+// Secret nobody creates.
+func TestAgentgatewayEgressOverlay(t *testing.T) {
 	cfg := &config.Config{
-		Root:                   repoRoot(t),
-		Router:                 config.RouterAgentgateway,
-		ExperimentalUseSDSMint: true,
+		Root:   repoRoot(t),
+		Router: config.RouterAgentgateway,
 	}
 	e := &Env{Cfg: cfg, Kube: fakeKube(t)}
 
-	built, err := e.Kustomize(installDir + "/agentgateway-egress-mitm")
+	built, err := e.Kustomize(installDir + "/agentgateway-egress")
 	if err != nil {
-		t.Fatalf("Kustomize(agentgateway-egress-mitm) = %v", err)
+		t.Fatalf("Kustomize(agentgateway-egress) = %v", err)
 	}
 	if !strings.Contains(string(built), SecretEgressMITMCAPool) {
 		t.Errorf("the MITM overlay does not mount the %s Secret", SecretEgressMITMCAPool)
