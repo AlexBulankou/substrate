@@ -723,7 +723,11 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 
-	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+	resp := &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}
+	if slices.Contains(snapshotFiles, durableTarFile) {
+		resp.DataSnapshotFiles = []string{durableTarFile}
+	}
+	return resp, nil
 }
 
 // listSnapshotFiles returns the (relative) names of regular files directly under

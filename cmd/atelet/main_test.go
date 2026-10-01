@@ -237,14 +237,32 @@ func TestSnapshotManifestRejectsNonLocalFile(t *testing.T) {
 	}
 }
 
+func TestSnapshotManifestRejectsDataFileNotInSnapshotFiles(t *testing.T) {
+	manifest, err := json.Marshal(sandboxAssetsRecord{
+		SandboxClass:      "gvisor",
+		PauseImage:        testPauseImage,
+		SnapshotFiles:     []string{"checkpoint.img"},
+		DataSnapshotFiles: []string{"data.tar"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := unmarshalSandboxRecord(manifest); err == nil {
+		t.Fatal("unmarshalSandboxRecord() accepted a data file that is not one of the snapshot files")
+	}
+}
+
 func TestCheckpointSnapshotFiles(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		files    []string
+		data     []string
 		required bool
 		wantErr  bool
 	}{
 		{name: "required and present", files: []string{"checkpoint.img"}, required: true},
+		{name: "data subset", files: []string{"checkpoint.img", "data.tar"}, data: []string{"data.tar"}, required: true},
+		{name: "data not a snapshot file", files: []string{"checkpoint.img"}, data: []string{"data.tar"}, required: true, wantErr: true},
 		{name: "optional and empty", required: false},
 		{name: "required and empty", required: true, wantErr: true},
 		{name: "escapes the directory", files: []string{"../outside"}, required: true, wantErr: true},
@@ -255,9 +273,12 @@ func TestCheckpointSnapshotFiles(t *testing.T) {
 		{name: "manifest name", files: []string{"checkpoint.img", sandboxManifestName}, required: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := checkpointSnapshotFiles(&ateompb.CheckpointWorkloadResponse{SnapshotFiles: tc.files}, tc.required)
+			files, data, err := checkpointSnapshotFiles(&ateompb.CheckpointWorkloadResponse{SnapshotFiles: tc.files, DataSnapshotFiles: tc.data}, tc.required)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("checkpointSnapshotFiles() = %v, %v; wantErr %v", files, err, tc.wantErr)
+				t.Fatalf("checkpointSnapshotFiles() = %v, %v, %v; wantErr %v", files, data, err, tc.wantErr)
+			}
+			if err == nil && !slices.Equal(data, tc.data) {
+				t.Errorf("data files = %v, want %v", data, tc.data)
 			}
 		})
 	}
@@ -1470,10 +1491,11 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 	}
 	fullRec := func(class string) sandboxAssetsRecord {
 		return sandboxAssetsRecord{
-			SandboxClass:  class,
-			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{"config.json", "memory-ranges", resources.DurableDirTarFile},
-			Scope:         ateattr.SnapshotScopeFull,
+			SandboxClass:      class,
+			PauseImage:        testPauseImage,
+			SnapshotFiles:     []string{"config.json", "memory-ranges", "data.tar"},
+			DataSnapshotFiles: []string{"data.tar"},
+			Scope:             ateattr.SnapshotScopeFull,
 		}
 	}
 
@@ -1495,7 +1517,7 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		s := &AteomHerder{gcsClient: store}
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
 		writeLocalSnapshot(t, dir, fullRec("microvm"), map[string]string{
-			"config.json": "cfg", "memory-ranges": "mem", resources.DurableDirTarFile: "data",
+			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 		})
 
 		if _, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), dir, uri); err != nil {
@@ -1503,7 +1525,7 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		}
 		want := []string{
 			pausedSnapshotPath + "/config.json.zstd",
-			pausedSnapshotPath + "/durable-dir.tar.zstd",
+			pausedSnapshotPath + "/data.tar.zstd",
 			pausedSnapshotPath + "/manifest.json",
 			pausedSnapshotPath + "/memory-ranges.zstd",
 		}
@@ -1515,12 +1537,12 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		}
 	})
 
-	t.Run("microvm full capture uploads durable tar alone as data", func(t *testing.T) {
+	t.Run("full capture uploads the reported data files alone as data", func(t *testing.T) {
 		store := &recordingObjectStorage{}
 		s := &AteomHerder{gcsClient: store}
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
 		writeLocalSnapshot(t, dir, fullRec("microvm"), map[string]string{
-			"config.json": "cfg", "memory-ranges": "mem", resources.DurableDirTarFile: "data",
+			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 		})
 
 		req := validUploadPausedCheckpointRequest()
@@ -1529,7 +1551,7 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 			t.Fatalf("uploadLocalCheckpointDir: %v", err)
 		}
 		want := []string{
-			pausedSnapshotPath + "/durable-dir.tar.zstd",
+			pausedSnapshotPath + "/data.tar.zstd",
 			pausedSnapshotPath + "/manifest.json",
 		}
 		if got := store.keys(); !slices.Equal(got, want) {
@@ -1539,20 +1561,20 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		if rec.Scope != ateattr.SnapshotScopeData {
 			t.Errorf("uploaded manifest scope = %q, want %q", rec.Scope, ateattr.SnapshotScopeData)
 		}
-		if want := []string{resources.DurableDirTarFile}; !slices.Equal(rec.SnapshotFiles, want) {
+		if want := []string{"data.tar"}; !slices.Equal(rec.SnapshotFiles, want) {
 			t.Errorf("uploaded manifest files = %v, want %v", rec.SnapshotFiles, want)
 		}
 	})
 
-	t.Run("gvisor full capture without durable tar has no data", func(t *testing.T) {
-		s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
+	t.Run("full capture listing no data files is rejected", func(t *testing.T) {
+		store := &recordingObjectStorage{}
+		s := &AteomHerder{gcsClient: store}
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
-		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
-			SandboxClass:  "gvisor",
-			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{"checkpoint.img"},
-			Scope:         ateattr.SnapshotScopeFull,
-		}, map[string]string{"checkpoint.img": "img"})
+		rec := fullRec("microvm")
+		rec.DataSnapshotFiles = nil
+		writeLocalSnapshot(t, dir, rec, map[string]string{
+			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
+		})
 
 		req := validUploadPausedCheckpointRequest()
 		req.DesiredScope = ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA
@@ -1560,41 +1582,8 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		if got := apierror.Code(err); got != codes.FailedPrecondition {
 			t.Fatalf("status.Code = %v (err %v), want FailedPrecondition", got, err)
 		}
-	})
-
-	t.Run("microvm full capture without durable tar has no data", func(t *testing.T) {
-		s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
-		dir := filepath.Join(t.TempDir(), "pause-snap-1")
-		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
-			SandboxClass:  "microvm",
-			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{"config.json", "memory-ranges"},
-			Scope:         ateattr.SnapshotScopeFull,
-		}, map[string]string{"config.json": "cfg", "memory-ranges": "mem"})
-
-		req := validUploadPausedCheckpointRequest()
-		req.DesiredScope = ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA
-		_, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
-		if got := apierror.Code(err); got != codes.FailedPrecondition {
-			t.Fatalf("status.Code = %v (err %v), want FailedPrecondition", got, err)
-		}
-	})
-
-	t.Run("unknown sandbox class cannot convert", func(t *testing.T) {
-		s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
-		dir := filepath.Join(t.TempDir(), "pause-snap-1")
-		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
-			SandboxClass:  "mystery",
-			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{resources.DurableDirTarFile},
-			Scope:         ateattr.SnapshotScopeFull,
-		}, map[string]string{resources.DurableDirTarFile: "data"})
-
-		req := validUploadPausedCheckpointRequest()
-		req.DesiredScope = ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA
-		_, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
-		if got := apierror.Code(err); got != codes.FailedPrecondition {
-			t.Fatalf("status.Code = %v (err %v), want FailedPrecondition", got, err)
+		if len(store.keys()) != 0 {
+			t.Errorf("objects uploaded despite rejection: %v", store.keys())
 		}
 	})
 
@@ -1604,9 +1593,9 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
 			SandboxClass:  "microvm",
 			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{resources.DurableDirTarFile},
+			SnapshotFiles: []string{"data.tar"},
 			Scope:         ateattr.SnapshotScopeData,
-		}, map[string]string{resources.DurableDirTarFile: "data"})
+		}, map[string]string{"data.tar": "data"})
 
 		_, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), dir, uri)
 		if got := apierror.Code(err); got != codes.FailedPrecondition {
@@ -1621,8 +1610,8 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
 			SandboxClass:  "microvm",
 			PauseImage:    testPauseImage,
-			SnapshotFiles: []string{resources.DurableDirTarFile},
-		}, map[string]string{resources.DurableDirTarFile: "data"})
+			SnapshotFiles: []string{"data.tar"},
+		}, map[string]string{"data.tar": "data"})
 
 		req := validUploadPausedCheckpointRequest()
 		req.DesiredScope = ateletpb.SnapshotScope_SNAPSHOT_SCOPE_DATA
@@ -1662,7 +1651,7 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		s := &AteomHerder{gcsClient: &recordingObjectStorage{putErr: errors.New("boom")}}
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
 		writeLocalSnapshot(t, dir, fullRec("microvm"), map[string]string{
-			"config.json": "cfg", "memory-ranges": "mem", resources.DurableDirTarFile: "data",
+			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 		})
 
 		_, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), dir, uri)

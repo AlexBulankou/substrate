@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/apierror"
@@ -230,7 +231,11 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		// rootfs_upper), and the tar durations scale with the actor's data.
 		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
 		slog.Duration("teardown", dTeardown))
-	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+	resp := &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}
+	if slices.Contains(snapshotFiles, durableTarFile) {
+		resp.DataSnapshotFiles = []string{durableTarFile}
+	}
+	return resp, nil
 }
 
 // snapshotVMState captures the paused guest into checkpointDir: the CH snapshot

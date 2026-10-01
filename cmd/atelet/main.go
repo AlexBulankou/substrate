@@ -26,7 +26,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -54,7 +53,6 @@ import (
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/agent-substrate/substrate/internal/version"
 	"github.com/agent-substrate/substrate/internal/volume"
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
 	"github.com/agent-substrate/substrate/pkg/client/informers/externalversions"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
@@ -687,7 +685,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 
 	s.systemInfoVolumes.Deregister(actorUID)
 
-	sandboxRec.SnapshotFiles, err = checkpointSnapshotFiles(resp, shouldHaveSnapshots(req))
+	sandboxRec.SnapshotFiles, sandboxRec.DataSnapshotFiles, err = checkpointSnapshotFiles(resp, shouldHaveSnapshots(req))
 	if err != nil {
 		return nil, err
 	}
@@ -747,15 +745,19 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	return &ateletpb.CheckpointResponse{}, nil
 }
 
-func checkpointSnapshotFiles(resp *ateompb.CheckpointWorkloadResponse, required bool) ([]string, error) {
-	files := resp.GetSnapshotFiles()
+func checkpointSnapshotFiles(resp *ateompb.CheckpointWorkloadResponse, required bool) (files, dataFiles []string, err error) {
+	files = resp.GetSnapshotFiles()
 	if len(files) == 0 && required {
-		return nil, errors.New("ateom reported no snapshot files for checkpoint")
+		return nil, nil, errors.New("ateom reported no snapshot files for checkpoint")
 	}
 	if err := validateSnapshotFiles(files); err != nil {
-		return nil, fmt.Errorf("ateom reported invalid snapshot files: %w", err)
+		return nil, nil, fmt.Errorf("ateom reported invalid snapshot files: %w", err)
 	}
-	return files, nil
+	dataFiles = resp.GetDataSnapshotFiles()
+	if err := validateDataSnapshotFiles(files, dataFiles); err != nil {
+		return nil, nil, fmt.Errorf("ateom reported invalid data snapshot files: %w", err)
+	}
+	return files, dataFiles, nil
 }
 
 func toAteomSnapshotScope(scope ateletpb.SnapshotScope) ateompb.SnapshotScope {
@@ -1016,25 +1018,16 @@ func readSnapshotManifest(dir string) ([]byte, error) {
 }
 
 // narrowFullCaptureToData rewrites rec so a FULL capture uploads as a DATA
-// snapshot. Each sandbox class owns one branch: micro-VM durable data is a
-// self-contained tar that can be carved out of the full file set; gVisor's
-// full checkpoint is monolithic until split checkpoints land.
+// snapshot holding only the data-scope files ateom reported at checkpoint.
 func narrowFullCaptureToData(rec *sandboxAssetsRecord) error {
-	switch atev1alpha1.SandboxClass(rec.SandboxClass) {
-	case atev1alpha1.SandboxClassMicroVM, atev1alpha1.SandboxClassGvisor:
-		if !slices.Contains(rec.SnapshotFiles, resources.DurableDirTarFile) {
-			// No durable-dir volumes were attached at pause: this snapshot
-			// holds no data, and never will — not retryable.
-			return apierror.FailedPrecondition("full %s capture has no %s; the actor has no durable data to upload as %s", rec.SandboxClass, resources.DurableDirTarFile, ateattr.SnapshotScopeData)
-		}
-		rec.SnapshotFiles = []string{resources.DurableDirTarFile}
-		rec.Scope = ateattr.SnapshotScopeData
-		return nil
-
-	default:
-		// The manifest's class is unvalidated input from disk/object storage.
-		return apierror.FailedPrecondition("unknown sandbox class %q in snapshot manifest", rec.SandboxClass)
+	if len(rec.DataSnapshotFiles) == 0 {
+		// Either no durable-dir volumes were attached at pause, or the
+		// manifest predates the list. Neither is retryable.
+		return apierror.FailedPrecondition("full capture lists no data-scope files; the actor has no durable data to upload as %s", ateattr.SnapshotScopeData)
 	}
+	rec.SnapshotFiles = rec.DataSnapshotFiles
+	rec.Scope = ateattr.SnapshotScopeData
+	return nil
 }
 
 func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (resp *ateletpb.RestoreResponse, err error) {
