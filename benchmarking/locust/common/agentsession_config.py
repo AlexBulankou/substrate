@@ -21,6 +21,18 @@ from locust.argument_parser import LocustArgumentParser
 @events.init_command_line_parser.add_listener
 def add_agentsession_arguments(parser: LocustArgumentParser) -> None:
     parser.add_argument(
+        "--agentsession-script",
+        type=str,
+        default="coding-session",
+        env_var="LOCUST_AGENTSESSION_SCRIPT",
+        help=(
+            "Built-in agent-session script variant to run; one of the YAML "
+            "files under internal/benchmarking/boomer/agentsession/scripts/ "
+            "(default: coding-session)"
+        ),
+        include_in_web_ui=True,
+    )
+    parser.add_argument(
         "--agentsession-think-scale",
         type=float,
         default=1.0,

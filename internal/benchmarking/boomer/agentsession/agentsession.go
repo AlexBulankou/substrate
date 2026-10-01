@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Package agentsession implements the AgentSessionUser locust test: each VU
-// is one coding-agent session replaying the scripted steps in script.go
-// against a glutton actor. After every step the actor is suspended for the
+// is one coding-agent session replaying a scripted step sequence (a YAML
+// file under scripts/, selected by --agentsession-script) against a glutton
+// actor. After every step the actor is suspended for the
 // step's "LLM thinking" gap; by default the next step's first request wakes
 // it through the atenet router (request parking), so the benchmark measures
 // the user-visible wake latency Substrate's oversubscription story rests on.
@@ -55,6 +56,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
@@ -100,8 +102,7 @@ func initAgentSession(cfg *userclass.Config) (taskFn func(), shutdown func(conte
 	if cfg.Tracer == nil {
 		cfg.Tracer = otel.Tracer("substrate-boomer/agentsession")
 	}
-	rt := &runtime{cfg: cfg, steps: Session()}
-	rt.ingestBuf = makeIngestBuf(rt.steps)
+	rt := &runtime{cfg: cfg}
 	return rt.iterate, rt.shutdown
 }
 
@@ -132,10 +133,101 @@ func makeIngestBuf(steps []Step) []byte {
 // goroutine keeps its own session in users, keyed by goroutine ID, because
 // boomer offers no per-VU context.
 type runtime struct {
-	cfg       *userclass.Config
-	steps     []Step
-	ingestBuf []byte   // shared read-only ingest payload, sized to the largest ingest op
-	users     sync.Map // goroutineID -> *sessionUser
+	cfg   *userclass.Config
+	users sync.Map // goroutineID -> *sessionUser
+
+	// script is resolved by loadScript on the first iteration and fixed for
+	// the worker's lifetime; ingestBuf is sized to it.
+	scriptMu  sync.Mutex
+	script    *Script
+	ingestBuf []byte // shared read-only ingest payload, sized to the largest ingest op
+
+	// The template memory check runs once per worker. A fetch failure
+	// leaves it unanswered so the next startUser retries; a verdict is
+	// final until the workloads are redeployed.
+	templateMu  sync.Mutex
+	templateOK  bool
+	templateErr error
+}
+
+// loadScript resolves the run's script on first use. It cannot happen at
+// Init: the operator's knob values arrive with the first spawn message,
+// after Init, so a load there would only ever see --config-json. A failed
+// load is retried on the next iteration, so correcting the knob in the web
+// UI and starting a new swarm recovers without a pod restart.
+func (r *runtime) loadScript() (*Script, error) {
+	r.scriptMu.Lock()
+	defer r.scriptMu.Unlock()
+	if r.script != nil {
+		return r.script, nil
+	}
+	name := r.cfg.Dyn.Load().AgentSessionScript
+	if name == "" {
+		name = DefaultScript
+	}
+	s, err := Load(name)
+	if err != nil {
+		return nil, err
+	}
+	b := Budgets(s.Steps)
+	slog.Info("agentsession: loaded script",
+		slog.String("script", s.Name),
+		slog.Int("steps", len(s.Steps)),
+		slog.String("declared_ram", formatSize(b.RAM)),
+		slog.String("declared_disk", formatSize(b.Disk)),
+		slog.String("min_actor_memory", formatSize(s.MinActorMemory)))
+	r.script = s
+	r.ingestBuf = makeIngestBuf(s.Steps)
+	return s, nil
+}
+
+// checkTemplateMemory refuses to start sessions against a template whose
+// memory limit is below the script's min_actor_memory. A too-small actor
+// OOMs partway through the script and shows up as flaky steps, which is far
+// harder to read than a refusal at start. A template with no memory limit
+// is allowed through with a warning.
+func (r *runtime) checkTemplateMemory(ctx context.Context) error {
+	r.templateMu.Lock()
+	defer r.templateMu.Unlock()
+	if r.templateOK {
+		return nil
+	}
+	if r.templateErr != nil {
+		return r.templateErr
+	}
+	ref := &ateapipb.ObjectRef{Atespace: templateNS, Name: templateName}
+	tmpl, err := r.cfg.APIStub.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{ActorTemplate: ref})
+	if err != nil {
+		return fmt.Errorf("GetActorTemplate %s/%s: %w", templateNS, templateName, err)
+	}
+	limit, ok := memoryLimit(tmpl)
+	switch {
+	case !ok:
+		slog.Warn("agentsession: template sets no memory limit; cannot check it against the script",
+			slog.String("template", templateName),
+			slog.String("min_actor_memory", formatSize(r.script.MinActorMemory)))
+	case limit < r.script.MinActorMemory:
+		r.templateErr = fmt.Errorf("template %s/%s memory limit %s is below script %q min_actor_memory %s; redeploy the workloads with --actor-memory %s",
+			templateNS, templateName, formatSize(limit), r.script.Name, formatSize(r.script.MinActorMemory), formatSize(r.script.MinActorMemory))
+		return r.templateErr
+	}
+	r.templateOK = true
+	return nil
+}
+
+// memoryLimit reads the template's memory limit in bytes, if it has one.
+func memoryLimit(tmpl *ateapipb.ActorTemplate) (int64, bool) {
+	for _, l := range tmpl.GetResources().GetLimits() {
+		if l.GetName() != "memory" {
+			continue
+		}
+		q, err := resource.ParseQuantity(l.GetQuantity())
+		if err != nil {
+			return 0, false
+		}
+		return q.AsInt64()
+	}
+	return 0, false
 }
 
 // think returns the suspended "LLM thinking" gap before step s, which is the
@@ -155,6 +247,15 @@ func (r *runtime) think(s Step) time.Duration {
 // script completes, so one actor keeps producing suspend/resume cycles for
 // the whole run.
 func (r *runtime) iterate() {
+	script, err := r.loadScript()
+	if err != nil {
+		slog.Error("agentsession: cannot load script; goroutine will retry next iter",
+			slog.String("err", err.Error()))
+		time.Sleep(2 * time.Second)
+		return
+	}
+	steps := script.Steps
+
 	gid := boomerutil.GoroutineID()
 	val, loaded := r.users.Load(gid)
 	if !loaded {
@@ -169,13 +270,13 @@ func (r *runtime) iterate() {
 	}
 	u := val.(*sessionUser)
 
-	step := r.steps[u.stepIndex]
+	step := steps[u.stepIndex]
 
 	// The LLM is "thinking": the actor stays suspended for the gap.
 	time.Sleep(r.think(step))
 
 	if u.runStep(context.Background(), step) {
-		u.stepIndex = (u.stepIndex + 1) % len(r.steps)
+		u.stepIndex = (u.stepIndex + 1) % len(steps)
 		if u.stepIndex == 0 {
 			slog.Info("agent session completed the full script; starting over",
 				slog.String("actor", u.actorName))
@@ -195,6 +296,9 @@ func (r *runtime) iterate() {
 // then suspends it so the first scripted step begins — like every later
 // step — with a wake from suspension.
 func (r *runtime) startUser(ctx context.Context) (*sessionUser, error) {
+	if err := r.checkTemplateMemory(ctx); err != nil {
+		return nil, err
+	}
 	u := &sessionUser{
 		cfg:       r.cfg,
 		actorName: "agent-" + uuid.NewString(),
