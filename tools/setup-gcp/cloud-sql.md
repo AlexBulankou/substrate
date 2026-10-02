@@ -121,7 +121,7 @@ users need a separate migration of ownership and grants.
 ```sh
 export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=<project>:<region>:<instance>
 export ATE_API_POSTGRES_CLOUDSQL_GSA=ate-api-server@<project>.iam.gserviceaccount.com
-./hack/install-ate.sh --deploy-ate-system
+./hack/install-ate.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
 # Existing installation: --deploy-ate-apiserver instead of --deploy-ate-system
 ```
 

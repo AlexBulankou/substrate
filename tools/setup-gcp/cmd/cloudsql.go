@@ -406,7 +406,7 @@ Cloud SQL is provisioned. Two steps remain:
 
      export ATE_API_POSTGRES_CLOUDSQL_INSTANCE=%s:%s:%s
      export ATE_API_POSTGRES_CLOUDSQL_GSA=%s
-     ./hack/install-ate.sh --deploy-ate-system
+     ./hack/install-ate.sh --deploy-ate-system --credential-provider='{"name":"k8s.io"}'
 
 See tools/setup-gcp/cloud-sql.md for details and verification steps.
 `, cfg.ProjectID, cfg.Region, cfg.CloudSQLInstance, gsa)
