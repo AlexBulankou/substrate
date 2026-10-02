@@ -328,6 +328,10 @@ Note that controller-runtime enables native histograms on `controller_runtime_re
 
 A queue that has never processed an item bridges as an exponential histogram with no positive buckets, which the Telemetry API (the Cloud Monitoring OTLP endpoint) rejects on ingest. atecontroller gives each such data point one positive bucket with a count of 0 before the OTLP push (`cmd/atecontroller/metrics.go`), so an idle queue no longer causes an error every tick. The padding carries no observations, so other backends are unaffected.
 
+### Scraping instead of pushing
+
+ateapi, atelet, atenet-router and the credential provider also serve every instrument on their Prometheus `/metrics` endpoint. A cluster that scrapes those endpoints sets `OTEL_METRICS_EXPORTER=none` on the components, so each series reaches the backend once. With `none` the components install no OTLP metric reader and keep the Prometheus one; traces and logs are unaffected. atecontroller then registers its instruments (`ate.workerpool.*`) on controller-runtime's registry, so the manager's `:8080` serves them next to the controller-runtime families. ateom serves no endpoint of its own, so leave the variable unset on the worker pods, or it exports no metrics at all. The variable accepts `otlp` (the default) and `none`, the same values as `OTEL_LOGS_EXPORTER`; any other value logs a warning and keeps the OTLP export.
+
 ### Local Metrics with Prometheus (Kind Cluster)
 
 For local development inside a `kind` cluster, Agent Substrate automatically provisions a Prometheus server in the `otel-system` namespace.
