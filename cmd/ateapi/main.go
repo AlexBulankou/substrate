@@ -77,7 +77,11 @@ var (
 	authenticationConfigFile = pflag.String("authentication-config", "", "YAML file configuring trusted JWT providers.")
 	postgresConnectionString = pflag.String("postgres-connection-string", "", "PostgreSQL connection string (libpq DSN or URI).")
 	postgresSchema           = pflag.String("postgres-schema", "public", "PostgreSQL schema for Substrate tables. This overrides a search_path connection parameter.")
-	experimentalEnableAuthz  = pflag.Bool("experimental-enable-authz", false, "Enable OpenFGA authorization checks (experimental).")
+	experimentalEnableAuthz  = pflag.Bool("experimental-enable-authz", false, "Enforce OpenFGA authorization checks on all registered RPCs (experimental). AccessPolicy RPCs are always checked.")
+	// TODO: Move the authz settings into the hot-reloadable config proto
+	// (agent-substrate/substrate#2021) once it lands, so bootstrap owner
+	// changes take effect without a restart.
+	authzBootstrapOwners = pflag.StringSlice("authz-bootstrap-owners", nil, "Principal IDs that are always global owners while listed, independent of the stored global AccessPolicy. Removing an ID revokes its access on restart. At least one is required when --experimental-enable-authz is set.")
 
 	actorIDJWTPoolFile          = pflag.String("actor-id-jwt-pool", "", "The file that contains the serialized JWT authority pool for signing actor JWTs")
 	actorJWTIssuer              = pflag.String("actor-jwt-issuer", "", "Issuer URL placed in the iss claim of actor JWTs. Relying parties fetch <issuer>/.well-known/openid-configuration to verify them. Must be https with no query or fragment. Empty means https://"+installdefaults.IDPServiceName+".<pod namespace>.svc.")
@@ -172,21 +176,24 @@ func main() {
 	// (atepg's outbox maintenance loop); stop it on shutdown before closing pool.
 	defer persistence.Close()
 
-	var authorizer *authz.Authorizer
-	if *experimentalEnableAuthz {
-		fgaServer, err := authz.NewOpenFGAServer(pool)
-		if err != nil {
-			serverboot.Fatal(ctx, "Failed to create OpenFGA server", err)
-		}
-		defer fgaServer.Close()
-
-		var policyManager *authz.PolicyManager
-		authorizer, policyManager, err = authz.New(shutdownCtx, pool, fgaServer)
-		if err != nil {
-			serverboot.Fatal(ctx, "Failed to initialize OpenFGA authz", err)
-		}
-		persistence.SetPolicyManager(policyManager)
+	// The authz stack is always wired so policy tuples stay in sync with the
+	// store; --experimental-enable-authz only controls enforcement in the
+	// interceptor.
+	if *experimentalEnableAuthz && len(*authzBootstrapOwners) == 0 {
+		// Without a bootstrap owner, nobody could create the global
+		// AccessPolicy, so the enforced API would be unusable.
+		serverboot.Fatal(ctx, "Invalid flags", fmt.Errorf("--authz-bootstrap-owners must list at least one principal when --experimental-enable-authz is set"))
 	}
+	fgaServer, err := authz.NewOpenFGAServer(pool)
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to create OpenFGA server", err)
+	}
+	defer fgaServer.Close()
+	authorizer, policyManager, err := authz.New(shutdownCtx, pool, fgaServer, *authzBootstrapOwners)
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to initialize OpenFGA authz", err)
+	}
+	persistence.SetPolicyManager(policyManager)
 
 	clientset, ateClient, err := newKubeClients()
 	if err != nil {
@@ -302,13 +309,9 @@ func main() {
 		apiauthn.UnaryServerInterceptor(authCfg),
 		ateinterceptors.MaxDeadlineUnaryInterceptor(maxRPCDeadline),
 		ateinterceptors.ServerUnaryInterceptor,
-	}
-	if *experimentalEnableAuthz {
-		unaryInterceptors = append(unaryInterceptors, authz.UnaryServerInterceptor(authorizer))
-	}
-	unaryInterceptors = append(unaryInterceptors,
+		authz.UnaryServerInterceptor(authorizer, *experimentalEnableAuthz),
 		ateinterceptors.RejectUnknownFieldsUnaryInterceptor,
-	)
+	}
 
 	mux := grpc.NewServer(
 		grpc.Creds(serverCreds),
@@ -400,6 +403,7 @@ func logFlagValues(ctx context.Context) {
 		postgresConnectionAttr(*postgresConnectionString),
 		slog.String("postgres-schema", *postgresSchema),
 		slog.Bool("experimental-enable-authz", *experimentalEnableAuthz),
+		slog.Any("authz-bootstrap-owners", *authzBootstrapOwners),
 		slog.String("actor-id-jwt-pool", *actorIDJWTPoolFile),
 		slog.String("actor-jwt-issuer", *actorJWTIssuer),
 		slog.String("actor-id-ca-pool", *actorIDCAPoolFile),
