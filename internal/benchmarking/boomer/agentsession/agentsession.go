@@ -383,11 +383,32 @@ func (r *runtime) startUser(ctx context.Context, loaded *loadedScript) (*session
 	return u, nil
 }
 
+// shutdownConcurrency bounds how many sessions suspendAndDelete at once.
+// Boomer gives the hook about a minute; at thousands of sessions a serial
+// sweep leaks most of the actors, while this many in flight clears them
+// without flooding ateapi.
+const shutdownConcurrency = 64
+
+// shutdown suspends and deletes every session's actor, shutdownConcurrency
+// at a time, until done or ctx expires.
 func (r *runtime) shutdown(ctx context.Context) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, shutdownConcurrency)
 	r.users.Range(func(_, val any) bool {
-		val.(*sessionUser).suspendAndDelete(ctx)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return false
+		}
+		wg.Add(1)
+		go func(u *sessionUser) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			u.suspendAndDelete(ctx)
+		}(val.(*sessionUser))
 		return true
 	})
+	wg.Wait()
 }
 
 // sessionUser is one coding-agent session: a single actor plus its progress
