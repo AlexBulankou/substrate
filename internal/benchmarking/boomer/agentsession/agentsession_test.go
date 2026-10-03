@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -697,8 +698,39 @@ func TestRunStep_KeepsActorThroughCapacityShortage(t *testing.T) {
 	}
 }
 
-// HTTP failures carry no gRPC code, so they count toward the threshold: an
-// actor whose sandbox is dead but whose record looks healthy is replaced
+// A router 503 is the fleet being full or the control plane being busy,
+// the HTTP face of ResourceExhausted and Unavailable. Replacing the actor
+// would ask for the room that is missing, so it must not count.
+func TestRunStep_KeepsActorThroughRouterCapacityErrors(t *testing.T) {
+	for _, status := range []int{503, 504, 429} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ctl := &fakeControlClient{}
+			u := newTestUser(t, &fake.Server{Status: status}, ctl, dynconfig.Config{})
+			for range maxConsecutiveStepFailures + 2 {
+				if u.runStep(context.Background(), pingStep) {
+					t.Fatal("runStep = true with a failing router")
+				}
+			}
+			if u.broken || u.consecutiveFailures != 0 {
+				t.Errorf("HTTP %d: broken=%v consecutiveFailures=%d, want false/0", status, u.broken, u.consecutiveFailures)
+			}
+		})
+	}
+}
+
+// A router 404 means the actor record is gone; nothing the driver can call
+// brings it back, so it is replaced on the first failure.
+func TestRunStep_ReplacesActorOnRouterNotFound(t *testing.T) {
+	ctl := &fakeControlClient{}
+	u := newTestUser(t, &fake.Server{Status: 404}, ctl, dynconfig.Config{})
+	u.runStep(context.Background(), pingStep)
+	if !u.broken {
+		t.Error("broken = false after a 404 wake; want immediate replacement")
+	}
+}
+
+// Other HTTP failures carry no verdict, so they count toward the threshold:
+// an actor whose sandbox is dead but whose record looks healthy is replaced
 // after maxConsecutiveStepFailures steps.
 func TestRunStep_ReplacesActorAfterRepeatedStepFailures(t *testing.T) {
 	ctl := &fakeControlClient{}
