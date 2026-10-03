@@ -154,7 +154,7 @@ type stubSigner struct {
 
 	signerName string
 
-	desiredCTBs    []*certsv1beta1.ClusterTrustBundle
+	desiredCTBs    []*certsv1.ClusterTrustBundle
 	desiredCTBsErr error
 
 	makeCertErr error
@@ -172,7 +172,7 @@ func (f *stubSigner) certs() []string {
 	return append([]string(nil), f.madeCerts...)
 }
 
-func (f *stubSigner) DesiredClusterTrustBundles() ([]*certsv1beta1.ClusterTrustBundle, error) {
+func (f *stubSigner) DesiredClusterTrustBundles() ([]*certsv1.ClusterTrustBundle, error) {
 	return f.desiredCTBs, f.desiredCTBsErr
 }
 
@@ -218,12 +218,24 @@ func newTestController(t *testing.T, signer *stubSigner, hasher *fakeHasher, cac
 	kc := fake.NewSimpleClientset()
 	kc.Resources = []*metav1.APIResourceList{{
 		GroupVersion: certsv1.SchemeGroupVersion.String(),
-		APIResources: []metav1.APIResource{{Name: "podcertificaterequests", Namespaced: true}},
+		APIResources: []metav1.APIResource{
+			{Name: "podcertificaterequests", Namespaced: true},
+			{Name: "clustertrustbundles", Namespaced: false},
+		},
 	}}
 
 	pcrClient, err := podcertificate.NewClient(kc)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
+	}
+	// The controller reaches bundles through this client, not through kc
+	// directly, and the client picks its API version by discovery — which is
+	// why the resource list above has to advertise clustertrustbundles too.
+	// Live Get/Create/Update go straight to the tracker, so nothing here needs
+	// the bundle informer started.
+	trustBundles, err := clustertrustbundle.NewClient(kc, nil)
+	if err != nil {
+		t.Fatalf("clustertrustbundle.NewClient: %v", err)
 	}
 	for _, pcr := range cached {
 		if err := pcrClient.Informer().GetIndexer().Add(pcr); err != nil {
@@ -231,7 +243,7 @@ func newTestController(t *testing.T, signer *stubSigner, hasher *fakeHasher, cac
 		}
 	}
 
-	return New(clock.RealClock{}, signer, kc, hasher, pcrClient), kc
+	return New(clock.RealClock{}, signer, hasher, pcrClient, trustBundles), kc
 }
 
 func pcrWithConditions(namespace, name, signerName string, condTypes ...string) *certsv1.PodCertificateRequest {
@@ -524,23 +536,23 @@ func waitForKey(t *testing.T, c *Controller, event string) {
 }
 
 func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
-	wantCTB := func(name, bundle string, labels map[string]string) *certsv1beta1.ClusterTrustBundle {
-		return &certsv1beta1.ClusterTrustBundle{
+	wantCTB := func(name, bundle string, labels map[string]string) *certsv1.ClusterTrustBundle {
+		return &certsv1.ClusterTrustBundle{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
-			Spec:       certsv1beta1.ClusterTrustBundleSpec{SignerName: testSignerName, TrustBundle: bundle},
+			Spec:       certsv1.ClusterTrustBundleSpec{SignerName: testSignerName, TrustBundle: bundle},
 		}
 	}
 
 	t.Run("creates a missing bundle", func(t *testing.T) {
 		signer := &stubSigner{
 			signerName:  testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
+			desiredCTBs: []*certsv1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
 		}
 		c, kc := newTestController(t, signer, &fakeHasher{})
 
 		c.ensureBundles(t.Context())
 
-		got, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{})
+		got, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get ctb-a: %v", err)
 		}
@@ -556,7 +568,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// and every relying party that needed it fails closed in the meantime.
 		signer := &stubSigner{
 			signerName: testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{
+			desiredCTBs: []*certsv1.ClusterTrustBundle{
 				wantCTB("ctb-a", "PEM-A", nil),
 				wantCTB("ctb-b", "PEM-B", nil),
 			},
@@ -566,7 +578,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		c.ensureBundles(t.Context())
 
 		for name, bundle := range map[string]string{"ctb-a": "PEM-A", "ctb-b": "PEM-B"} {
-			got, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), name, metav1.GetOptions{})
+			got, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), name, metav1.GetOptions{})
 			if err != nil {
 				t.Fatalf("get %s: %v", name, err)
 			}
@@ -579,17 +591,17 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 	t.Run("updates a bundle that has drifted", func(t *testing.T) {
 		signer := &stubSigner{
 			signerName:  testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-NEW", map[string]string{"want": "yes"})},
+			desiredCTBs: []*certsv1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-NEW", map[string]string{"want": "yes"})},
 		}
 		c, kc := newTestController(t, signer, &fakeHasher{})
-		if _, err := kc.CertificatesV1beta1().ClusterTrustBundles().Create(t.Context(),
+		if _, err := kc.CertificatesV1().ClusterTrustBundles().Create(t.Context(),
 			wantCTB("ctb-a", "PEM-OLD", map[string]string{"stale": "yes"}), metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed ctb-a: %v", err)
 		}
 
 		c.ensureBundles(t.Context())
 
-		got, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{})
+		got, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get ctb-a: %v", err)
 		}
@@ -612,9 +624,9 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// watching ClusterTrustBundles — including the kubelet's, on every
 		// node — for a change that is not there.
 		want := wantCTB("ctb-a", "PEM-A", map[string]string{"k": "v"})
-		signer := &stubSigner{signerName: testSignerName, desiredCTBs: []*certsv1beta1.ClusterTrustBundle{want}}
+		signer := &stubSigner{signerName: testSignerName, desiredCTBs: []*certsv1.ClusterTrustBundle{want}}
 		c, kc := newTestController(t, signer, &fakeHasher{})
-		if _, err := kc.CertificatesV1beta1().ClusterTrustBundles().Create(t.Context(), want.DeepCopy(), metav1.CreateOptions{}); err != nil {
+		if _, err := kc.CertificatesV1().ClusterTrustBundles().Create(t.Context(), want.DeepCopy(), metav1.CreateOptions{}); err != nil {
 			t.Fatalf("seed ctb-a: %v", err)
 		}
 		kc.ClearActions()
@@ -634,7 +646,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// would fight over the same object.
 		signer := &stubSigner{
 			signerName:  testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
+			desiredCTBs: []*certsv1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
 		}
 		hasher := &fakeHasher{assigned: map[string]bool{}}
 		c, kc := newTestController(t, signer, hasher)
@@ -658,7 +670,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// test could not tell "stopped" from "found nothing to do".
 		signer := &stubSigner{
 			signerName:     testSignerName,
-			desiredCTBs:    []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-partial", "PEM-PARTIAL", nil)},
+			desiredCTBs:    []*certsv1.ClusterTrustBundle{wantCTB("ctb-partial", "PEM-PARTIAL", nil)},
 			desiredCTBsErr: errors.New("CA unreadable"),
 		}
 		c, kc := newTestController(t, signer, &fakeHasher{})
@@ -678,7 +690,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// but it is a choice, and this test will fail loudly if it changes.
 		signer := &stubSigner{
 			signerName: testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{
+			desiredCTBs: []*certsv1.ClusterTrustBundle{
 				wantCTB("ctb-a", "PEM-A", nil),
 				wantCTB("ctb-b", "PEM-B", nil),
 			},
@@ -693,7 +705,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 
 		c.ensureBundles(t.Context())
 
-		if _, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), "ctb-b", metav1.GetOptions{}); err == nil {
+		if _, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), "ctb-b", metav1.GetOptions{}); err == nil {
 			t.Error("ctb-b was reconciled after ctb-a's get failed; current behaviour abandons the pass")
 		}
 	})
@@ -704,7 +716,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// bundle is believed present. Asserted by the absence of the object.
 		signer := &stubSigner{
 			signerName:  testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
+			desiredCTBs: []*certsv1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A", nil)},
 		}
 		c, kc := newTestController(t, signer, &fakeHasher{})
 		kc.PrependReactor("create", "clustertrustbundles", func(ktesting.Action) (bool, runtime.Object, error) {
@@ -713,7 +725,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 
 		c.ensureBundles(t.Context())
 
-		if _, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{}); err == nil {
+		if _, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), "ctb-a", metav1.GetOptions{}); err == nil {
 			t.Error("ctb-a exists after its create failed")
 		}
 	})
@@ -725,19 +737,19 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 		// anchor and a stalled rotation.
 		signer := &stubSigner{
 			signerName: testSignerName,
-			desiredCTBs: []*certsv1beta1.ClusterTrustBundle{
+			desiredCTBs: []*certsv1.ClusterTrustBundle{
 				wantCTB("ctb-a", "PEM-A-NEW", nil),
 				wantCTB("ctb-b", "PEM-B-NEW", nil),
 			},
 		}
 		c, kc := newTestController(t, signer, &fakeHasher{})
-		for _, seed := range []*certsv1beta1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A-OLD", nil), wantCTB("ctb-b", "PEM-B-OLD", nil)} {
-			if _, err := kc.CertificatesV1beta1().ClusterTrustBundles().Create(t.Context(), seed, metav1.CreateOptions{}); err != nil {
+		for _, seed := range []*certsv1.ClusterTrustBundle{wantCTB("ctb-a", "PEM-A-OLD", nil), wantCTB("ctb-b", "PEM-B-OLD", nil)} {
+			if _, err := kc.CertificatesV1().ClusterTrustBundles().Create(t.Context(), seed, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("seed %s: %v", seed.Name, err)
 			}
 		}
 		kc.PrependReactor("update", "clustertrustbundles", func(action ktesting.Action) (bool, runtime.Object, error) {
-			if action.(ktesting.UpdateAction).GetObject().(*certsv1beta1.ClusterTrustBundle).Name == "ctb-a" {
+			if action.(ktesting.UpdateAction).GetObject().(*certsv1.ClusterTrustBundle).Name == "ctb-a" {
 				return true, nil, fmt.Errorf("conflict")
 			}
 			return false, nil, nil
@@ -745,7 +757,7 @@ func TestEnsureBundlesMultiBundleAndErrors(t *testing.T) {
 
 		c.ensureBundles(t.Context())
 
-		got, err := kc.CertificatesV1beta1().ClusterTrustBundles().Get(t.Context(), "ctb-b", metav1.GetOptions{})
+		got, err := kc.CertificatesV1().ClusterTrustBundles().Get(t.Context(), "ctb-b", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get ctb-b: %v", err)
 		}
