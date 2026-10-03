@@ -32,6 +32,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	corev1 "k8s.io/api/core/v1"
@@ -53,8 +54,10 @@ type ateletConn struct {
 // AteletDialer handles gRPC connections to Atelet pods.
 type AteletDialer struct {
 	ateletIndexer cache.Indexer
-	// mu makes the lookup, stale eviction and insert in DialForAteletOnNode
-	// atomic, so concurrent callers cannot evict each other's fresh conn.
+	// mu makes each cache lookup, stale eviction and insert atomic, so
+	// concurrent callers cannot evict each other's fresh conn. It is held for
+	// cache access only, never across a dial — serializing the dial itself is
+	// what dialFlight does, per atelet rather than per dialer.
 	mu sync.Mutex
 	// ateletConns holds one *ateletConn per atelet pod UID.
 	ateletConns *lru.Cache
@@ -62,6 +65,14 @@ type AteletDialer struct {
 	// atelet, keyed on the atelet's expected pod UID. Production wires this to
 	// per-atelet mTLS; tests can override it with insecure credentials.
 	dialCredentials func(expectedPodUID string) (credentials.TransportCredentials, error)
+	// dialFlight collapses concurrent cache misses for the same atelet onto a
+	// single dial. One dialer serves every node in the process, so the
+	// exclusion has to be keyed on the atelet rather than held on the dialer:
+	// a cold dial reads and parses the CA bundle off disk, and under a
+	// dialer-wide lock every other node's callers — including cache hits —
+	// wait behind it. Keyed on pod UID and IP together, so a pod that kept its
+	// UID but moved IP is not handed an in-flight dial to its old address.
+	dialFlight singleflight.Group
 }
 
 // DialerOption customizes an AteletDialer built by NewAteletDialer.
@@ -138,34 +149,74 @@ func (d *AteletDialer) DialForAteletOnNode(nodeName string) (*grpc.ClientConn, e
 	ateletKey := string(selectedAtelet.ObjectMeta.UID)
 	ateletIP := selectedAtelet.Status.PodIPs[0].IP
 
+	if conn, ok := d.cachedConn(ateletKey, ateletIP); ok {
+		return conn, nil
+	}
+
+	// One dial per atelet, however many callers miss together; misses on other
+	// atelets take other keys and dial in parallel.
+	dialed, err, _ := d.dialFlight.Do(ateletKey+"\x00"+ateletIP, func() (any, error) {
+		// A caller that missed just as an earlier flight was finishing is
+		// served from the cache here rather than dialing a second time.
+		if conn, ok := d.cachedConn(ateletKey, ateletIP); ok {
+			return conn, nil
+		}
+
+		creds, err := d.dialCredentials(ateletKey)
+		if err != nil {
+			return nil, fmt.Errorf("while building atelet credentials: %w", err)
+		}
+
+		conn, err := grpc.NewClient(
+			net.JoinHostPort(ateletIP, strconv.Itoa(atelet.DefaultPort)),
+			grpc.WithTransportCredentials(creds),
+			grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("while creating atelet gRPC client connection: %w", err)
+		}
+
+		d.storeConn(ateletKey, ateletIP, conn)
+
+		return conn, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return dialed.(*grpc.ClientConn), nil
+}
+
+// cachedConn returns the connection cached for ateletKey if it was dialed on
+// ateletIP. A connection cached on a different IP belongs to a pod that kept
+// its UID and moved, so it is evicted — which closes it — and reported as a
+// miss.
+func (d *AteletDialer) cachedConn(ateletKey, ateletIP string) (*grpc.ClientConn, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if cached, ok := d.ateletConns.Get(ateletKey); ok {
-		if c := cached.(*ateletConn); c.ip == ateletIP {
-			return c.conn, nil
-		}
-		// Remove closes the stale connection.
-		d.ateletConns.Remove(ateletKey)
+	cached, ok := d.ateletConns.Get(ateletKey)
+	if !ok {
+		return nil, false
 	}
-
-	creds, err := d.dialCredentials(string(selectedAtelet.ObjectMeta.UID))
-	if err != nil {
-		return nil, fmt.Errorf("while building atelet credentials: %w", err)
+	if c := cached.(*ateletConn); c.ip == ateletIP {
+		return c.conn, true
 	}
+	// Remove closes the stale connection.
+	d.ateletConns.Remove(ateletKey)
+	return nil, false
+}
 
-	conn, err := grpc.NewClient(
-		net.JoinHostPort(ateletIP, strconv.Itoa(atelet.DefaultPort)),
-		grpc.WithTransportCredentials(creds),
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("while creating atelet gRPC client connection: %w", err)
-	}
+// storeConn caches conn as the connection for ateletKey on ateletIP.
+func (d *AteletDialer) storeConn(ateletKey, ateletIP string, conn *grpc.ClientConn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
+	// Remove first: Add over an existing key replaces the value without
+	// running the eviction func, so a connection displaced that way would
+	// never be closed.
+	d.ateletConns.Remove(ateletKey)
 	d.ateletConns.Add(ateletKey, &ateletConn{ip: ateletIP, conn: conn})
-
-	return conn, nil
 }
 
 func buildTLSConfig(ateletSPIFFEID, clientBundlePath, serverCAPath, expectedPodUID string) (*tls.Config, error) {
