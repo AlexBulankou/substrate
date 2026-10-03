@@ -426,34 +426,28 @@ func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 	}
 }
 
-// TestNewUpdateMetadataLeavesItsInputAlone guards the clone.  The caller holds
-// the stored metadata while the update is in flight, so mutating it in place
-// would corrupt the value a retry or an error path reads back.
-func TestNewUpdateMetadataLeavesItsInputAlone(t *testing.T) {
-	current := &ateapipb.ResourceMetadata{Uid: "uid-1", Version: 4, CreateTime: timestamppb.Now()}
-	before := proto.Clone(current).(*ateapipb.ResourceMetadata)
+// TestSetUpdateMetadataLeavesOldMetaAlone guards the read-only half of the
+// signature.  The caller holds the stored metadata while the update is in
+// flight, so writing back through oldMeta would corrupt the value a retry or
+// an error path reads back.
+//
+// Note that CreateTime is carried forward by pointer, not cloned, so newMeta
+// and oldMeta share one timestamp after the call.  Copying the pointer is not
+// a mutation of oldMeta and this test does not treat it as one — but it does
+// mean a caller that edits newMeta.CreateTime in place would be seen through
+// oldMeta.  Every caller today replaces the field rather than editing it.
+func TestSetUpdateMetadataLeavesOldMetaAlone(t *testing.T) {
+	oldMeta := &ateapipb.ResourceMetadata{Uid: "uid-1", Version: 4, CreateTime: timestamppb.Now()}
+	before := proto.Clone(oldMeta).(*ateapipb.ResourceMetadata)
+	newMeta := &ateapipb.ResourceMetadata{}
 
-	updated := newUpdateMetadata(current)
+	setUpdateMetadata(newMeta, oldMeta)
 
-	if !proto.Equal(current, before) {
-		t.Errorf("newUpdateMetadata mutated its argument: %v, want %v", current, before)
+	if !proto.Equal(oldMeta, before) {
+		t.Errorf("setUpdateMetadata mutated oldMeta: %v, want %v", oldMeta, before)
 	}
-	if got := updated.GetVersion(); got != 5 {
+	if got := newMeta.GetVersion(); got != 5 {
 		t.Errorf("Version = %d, want 5", got)
-	}
-}
-
-func TestNewCreateMetadata(t *testing.T) {
-	metadata := newCreateMetadata("space-1", "actor-1")
-
-	if metadata.GetAtespace() != "space-1" || metadata.GetName() != "actor-1" {
-		t.Errorf("atespace/name = %q/%q, want space-1/actor-1", metadata.GetAtespace(), metadata.GetName())
-	}
-	if metadata.GetUid() == "" {
-		t.Error("Uid is empty")
-	}
-	if got := metadata.GetVersion(); got != 1 {
-		t.Errorf("Version = %d, want 1", got)
 	}
 }
 
