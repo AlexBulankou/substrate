@@ -15,7 +15,6 @@
 package csi
 
 import (
-	"crypto/tls"
 	"fmt"
 	"net/url"
 
@@ -58,16 +57,16 @@ func parseEndpoint(endpoint string) (string, string, error) {
 
 // NewCSIClient establishes a gRPC connection to the CSI driver over UDS or TCP
 // and returns a client initialized with Identity, Controller, and Node service clients.
-func NewCSIClient(endpoint string, tlsCfg *tls.Config) (*Client, error) {
+//
+// A nil creds dials without transport security, for the unix-socket case where
+// the kubelet plugin directory is the boundary.
+func NewCSIClient(endpoint string, creds credentials.TransportCredentials) (*Client, error) {
 	_, target, err := parseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	var creds credentials.TransportCredentials
-	if tlsCfg != nil {
-		creds = credentials.NewTLS(tlsCfg)
-	} else {
+	if creds == nil {
 		creds = insecure.NewCredentials()
 	}
 
