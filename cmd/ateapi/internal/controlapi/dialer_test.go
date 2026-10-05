@@ -24,7 +24,9 @@ import (
 	"errors"
 	"math/big"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -462,6 +464,197 @@ func TestDialForAteletOnNode(t *testing.T) {
 
 		if got := first.GetState(); got != connectivity.Shutdown {
 			t.Errorf("evicted conn state = %v, want %v (closed on eviction)", got, connectivity.Shutdown)
+		}
+	})
+}
+
+// TestDialForAteletOnNodeDialExclusion pins the shape of the exclusion around
+// the dial: one dial per atelet, and no waiting on a dial of a different one.
+// A single AteletDialer serves every node in the process, so an exclusion held
+// on the dialer rather than on the atelet makes an unrelated cold dial — which
+// reads and parses the CA bundle off disk — block every other node's callers,
+// cache hits included.
+func TestDialForAteletOnNodeDialExclusion(t *testing.T) {
+	ateletPod := func(name, uid, node, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "ate-system", Name: name, UID: types.UID(uid)},
+			Spec:       corev1.PodSpec{NodeName: node},
+			Status:     corev1.PodStatus{PodIPs: []corev1.PodIP{{IP: ip}}},
+		}
+	}
+	// blockingDialer returns a dialer whose dial of blockUID parks until the
+	// returned release func is called, reporting arrival on entered. Dials of
+	// every other atelet return immediately.
+	blockingDialer := func(t *testing.T, blockUID string, pods ...*corev1.Pod) (d *AteletDialer, entered <-chan struct{}, dials *atomic.Int64, release func()) {
+		t.Helper()
+		d = NewAteletDialer(newTestAteletIndexer(t, pods...),
+			installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace), "", "")
+		arrived := make(chan struct{})
+		unblock := make(chan struct{})
+		var once sync.Once
+		dials = &atomic.Int64{}
+		d.dialCredentials = func(podUID string) (credentials.TransportCredentials, error) {
+			if podUID == blockUID {
+				dials.Add(1)
+				once.Do(func() { close(arrived) })
+				<-unblock
+			}
+			return insecure.NewCredentials(), nil
+		}
+		return d, arrived, dials, sync.OnceFunc(func() { close(unblock) })
+	}
+	// awaitConn waits out the dial a goroutine is running, and fails rather
+	// than hanging the suite if the exclusion is dialer-wide.
+	awaitConn := func(t *testing.T, what string, done <-chan error) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("DialForAteletOnNode(%s): %v", what, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("DialForAteletOnNode(%s) did not return while an unrelated dial was in flight", what)
+		}
+	}
+
+	t.Run("an unrelated atelet dials while another dial is in flight", func(t *testing.T) {
+		d, entered, _, release := blockingDialer(t, "uid-1",
+			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
+			ateletPod("atelet-2", "uid-2", "node2", "10.0.0.2"),
+		)
+		t.Cleanup(release)
+
+		blocked := make(chan error, 1)
+		go func() {
+			_, err := d.DialForAteletOnNode("node1")
+			blocked <- err
+		}()
+		<-entered
+
+		// node2 shares nothing with the in-flight node1 dial but the dialer.
+		free := make(chan error, 1)
+		go func() {
+			_, err := d.DialForAteletOnNode("node2")
+			free <- err
+		}()
+		awaitConn(t, "node2", free)
+
+		release()
+		awaitConn(t, "node1", blocked)
+	})
+
+	t.Run("a cache hit does not wait for an unrelated dial", func(t *testing.T) {
+		d, entered, _, release := blockingDialer(t, "uid-1",
+			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
+			ateletPod("atelet-2", "uid-2", "node2", "10.0.0.2"),
+		)
+		t.Cleanup(release)
+
+		cached, err := d.DialForAteletOnNode("node2")
+		if err != nil {
+			t.Fatalf("DialForAteletOnNode(node2): %v", err)
+		}
+
+		blocked := make(chan error, 1)
+		go func() {
+			_, err := d.DialForAteletOnNode("node1")
+			blocked <- err
+		}()
+		<-entered
+
+		hit := make(chan error, 1)
+		go func() {
+			conn, err := d.DialForAteletOnNode("node2")
+			if err == nil && conn != cached {
+				err = errors.New("returned a different connection than the cached one")
+			}
+			hit <- err
+		}()
+		awaitConn(t, "node2 (cached)", hit)
+
+		release()
+		awaitConn(t, "node1", blocked)
+	})
+
+	t.Run("a pod that moved IP is not served the in-flight dial to its old address", func(t *testing.T) {
+		moved := ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1")
+		d, entered, dials, release := blockingDialer(t, "uid-1", moved)
+		t.Cleanup(release)
+
+		old := make(chan *grpc.ClientConn, 1)
+		go func() {
+			conn, err := d.DialForAteletOnNode("node1")
+			if err != nil {
+				t.Errorf("DialForAteletOnNode(node1) at the old IP: %v", err)
+			}
+			old <- conn
+		}()
+		// The first dial has read the pod and is parked in dialCredentials, so
+		// re-IPing the pod now cannot race its lookup.
+		<-entered
+		moved.Status.PodIPs[0].IP = "10.0.0.2"
+
+		fresh := make(chan *grpc.ClientConn, 1)
+		go func() {
+			conn, err := d.DialForAteletOnNode("node1")
+			if err != nil {
+				t.Errorf("DialForAteletOnNode(node1) at the new IP: %v", err)
+			}
+			fresh <- conn
+		}()
+
+		// The pod kept its UID, so an exclusion keyed on the UID alone would
+		// park the second caller on the first dial rather than dialing the new
+		// IP — observable as a second dial that never starts.
+		deadline := time.After(30 * time.Second)
+		for dials.Load() < 2 {
+			select {
+			case <-deadline:
+				release()
+				<-old
+				<-fresh
+				t.Fatal("the caller that arrived after the pod moved never dialed, want its own dial to the new IP")
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+
+		release()
+		oldConn, freshConn := <-old, <-fresh
+		if oldConn == freshConn {
+			t.Error("the caller that arrived after the pod moved was handed the conn to the old IP, want one to the new IP")
+		}
+		if got := freshConn.Target(); !strings.Contains(got, "10.0.0.2") {
+			t.Errorf("conn dialed after the pod moved targets %q, want the new IP 10.0.0.2", got)
+		}
+	})
+
+	t.Run("concurrent misses for one atelet dial once", func(t *testing.T) {
+		d, entered, dials, release := blockingDialer(t, "uid-1",
+			ateletPod("atelet-1", "uid-1", "node1", "10.0.0.1"),
+		)
+		t.Cleanup(release)
+
+		conns := make(chan *grpc.ClientConn, 2)
+		dial := func() {
+			conn, err := d.DialForAteletOnNode("node1")
+			if err != nil {
+				t.Errorf("DialForAteletOnNode(node1): %v", err)
+			}
+			conns <- conn
+		}
+		go dial()
+		<-entered
+		// The second caller arrives while the first dial is in flight, so it
+		// must be served by that dial rather than starting its own.
+		go dial()
+
+		release()
+		first, second := <-conns, <-conns
+		if got := dials.Load(); got != 1 {
+			t.Errorf("dialed %d times for one atelet, want 1", got)
+		}
+		if first != second {
+			t.Error("concurrent callers got different connections for one atelet, want the single dialed one")
 		}
 	})
 }
