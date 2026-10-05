@@ -132,7 +132,7 @@ func trustBundle(name, signer string, live bool, pemData []byte) *certsv1.Cluste
 	return ctb
 }
 
-func TestServerTLSConfig(t *testing.T) {
+func TestServerTrustPoolAndTLSTemplate(t *testing.T) {
 	servicednsCA1 := testCAPEM(t, "servicedns-ca-1")
 	servicednsCA2 := testCAPEM(t, "servicedns-ca-2")
 	podidentityCA := testCAPEM(t, "podidentity-ca")
@@ -155,11 +155,12 @@ func TestServerTLSConfig(t *testing.T) {
 			}
 			clientset := fake.NewSimpleClientset(native...)
 			clientset.Resources = []*metav1.APIResourceList{{GroupVersion: "certificates.k8s.io/" + version, APIResources: []metav1.APIResource{{Name: "clustertrustbundles"}}}}
-			cfg, err := serverTLSConfig(context.Background(), clientset)
+			pool, err := serverTrustPool(context.Background(), clientset)
 			if err != nil {
-				t.Fatalf("serverTLSConfig: %v", err)
+				t.Fatalf("serverTrustPool: %v", err)
 			}
 
+			cfg := serverTLSTemplate()
 			if got, want := cfg.ServerName, "api.ate-system.svc"; got != want {
 				t.Errorf("ServerName=%q want %q", got, want)
 			}
@@ -175,14 +176,14 @@ func TestServerTLSConfig(t *testing.T) {
 			wantPool := x509.NewCertPool()
 			wantPool.AppendCertsFromPEM(servicednsCA1)
 			wantPool.AppendCertsFromPEM(servicednsCA2)
-			if !cfg.RootCAs.Equal(wantPool) {
+			if !pool.Equal(wantPool) {
 				t.Error("RootCAs does not match the live servicedns trust bundle")
 			}
 		})
 	}
 }
 
-func TestServerTLSConfigErrors(t *testing.T) {
+func TestServerTrustPoolErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		objects []runtime.Object
@@ -204,8 +205,8 @@ func TestServerTLSConfigErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			clientset := fake.NewSimpleClientset(tc.objects...)
 			clientset.Resources = []*metav1.APIResourceList{{GroupVersion: "certificates.k8s.io/v1", APIResources: []metav1.APIResource{{Name: "clustertrustbundles"}}}}
-			if _, err := serverTLSConfig(context.Background(), clientset); err == nil {
-				t.Error("serverTLSConfig: want error, got nil")
+			if _, err := serverTrustPool(context.Background(), clientset); err == nil {
+				t.Error("serverTrustPool: want error, got nil")
 			}
 		})
 	}
