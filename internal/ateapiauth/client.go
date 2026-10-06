@@ -16,14 +16,11 @@ package ateapiauth
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"fmt"
 
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/k8sresolver"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -66,30 +63,21 @@ func DialOptions(cfg ClientConfig) ([]grpc.DialOption, error) {
 	if _, err := loadRootCAs(); err != nil {
 		return nil, fmt.Errorf("ateapiauth: loading CA file: %w", err)
 	}
+	// Everything the dial needs except the trust anchors, which rotate and so
+	// are supplied per handshake by the credentials below.
+	//
+	// There is deliberately no InsecureSkipVerify and no VerifyConnection here.
+	// Reloading the anchors does not need either, and a hand-rolled verifier
+	// that forwards ServerName into x509.VerifyOptions.DNSName silently skips
+	// the hostname check whenever ServerName is unset -- which is the
+	// documented default, and what cmd/atecontroller and the cmd/atenet router
+	// both ship.
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		// Chain verification happens in VerifyConnection against the
-		// reloadable pool, so a CA rotation applies without a redial.
-		InsecureSkipVerify: true, //nolint:gosec
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			pool, err := loadRootCAs()
-			if err != nil {
-				return err
-			}
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("ateapiauth: server presented no certificate")
-			}
-			inter := x509.NewCertPool()
-			for _, c := range cs.PeerCertificates[1:] {
-				inter.AddCert(c)
-			}
-			_, err = cs.PeerCertificates[0].Verify(x509.VerifyOptions{
-				Roots:         pool,
-				Intermediates: inter,
-				DNSName:       cfg.ServerName,
-			})
-			return err
-		},
+		// ServerName is optional. Left empty, grpc-go fills it from the
+		// address being dialled, so the standard path verifies against that;
+		// set, it both selects SNI and becomes the name verified.
+		ServerName: cfg.ServerName,
 	}
 
 	opts := []grpc.DialOption{
@@ -100,6 +88,6 @@ func DialOptions(cfg ClientConfig) ([]grpc.DialOption, error) {
 	}
 
 	tlsCfg.GetClientCertificate = credbundle.ClientLoader(cfg.ClientCredBundle)
-	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	opts = append(opts, grpc.WithTransportCredentials(newReloadingRootCredentials(tlsCfg, loadRootCAs)))
 	return opts, nil
 }
