@@ -392,6 +392,18 @@ func validateActorDirs(actorDirs *ateompb.ActorDirs) error {
 	return nil
 }
 
+// validateRuntimeAssetPaths ensures we only run assets from the static files dir
+func validateRuntimeAssetPaths(paths map[string]string) error {
+	var errs field.ErrorList
+	for name, p := range paths {
+		errs = append(errs, resources.ValidateRuntimeAssetPath(nodepath.StaticFilesDir, p, field.NewPath("runtime_asset_paths").Key(name))...)
+	}
+	if len(errs) > 0 {
+		return resources.ToAPIError(errs)
+	}
+	return nil
+}
+
 // rejectIfDraining returns a codes.Unavailable error if ateom has begun graceful
 // shutdown, so the control plane reschedules the actor onto a live worker.
 func (s *AteomService) rejectIfDraining() error {
