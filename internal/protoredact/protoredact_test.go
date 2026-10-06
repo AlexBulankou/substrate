@@ -15,12 +15,13 @@
 package protoredact_test
 
 import (
-	"errors"
+	"sync"
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/protoredact"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/agent-substrate/substrate/pkg/proto/credproviderpb"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -28,10 +29,10 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// TestForLogRecursesIntoRealMapFields walks real messages whose maps hold
+// TestRedactedRecursesIntoRealMapFields walks real messages whose maps hold
 // messages (atelet sandbox assets) and strings (ateapi selectors): map values
 // are visited without panicking and non-sensitive content is left intact.
-func TestForLogRecursesIntoRealMapFields(t *testing.T) {
+func TestRedactedRecursesIntoRealMapFields(t *testing.T) {
 	run := &ateletpb.RunRequest{
 		SandboxAssets: &ateletpb.SandboxAssets{
 			SandboxClass: "gvisor",
@@ -46,7 +47,8 @@ func TestForLogRecursesIntoRealMapFields(t *testing.T) {
 			Env:  []*ateletpb.EnvEntry{{Name: "API_KEY", Value: "sk-secret"}},
 		}}},
 	}
-	got := protoredact.ForLog(run).(*ateletpb.RunRequest)
+	redacted, _ := protoredact.Redacted(run)
+	got := redacted.(*ateletpb.RunRequest)
 	if v := got.GetSpec().GetContainers()[0].GetEnv()[0].GetValue(); v != protoredact.Placeholder {
 		t.Fatalf("env value = %q, want placeholder", v)
 	}
@@ -63,7 +65,8 @@ func TestForLogRecursesIntoRealMapFields(t *testing.T) {
 			Name: "c", Env: []*ateapipb.EnvVar{{Name: "TOKEN", Value: "t0p"}},
 		}},
 	}
-	gotTpl := protoredact.ForLog(tpl).(*ateapipb.ActorTemplate)
+	redactedTpl, _ := protoredact.Redacted(tpl)
+	gotTpl := redactedTpl.(*ateapipb.ActorTemplate)
 	if gotTpl.GetWorkerSelector().GetMatchLabels()["workload"] != "agent" {
 		t.Fatal("string map was altered")
 	}
@@ -159,7 +162,7 @@ func redactTestSchema(t *testing.T) protoreflect.MessageDescriptor {
 	return fd.Messages().ByName("Outer")
 }
 
-func TestRedactCoversEveryFieldShape(t *testing.T) {
+func TestRedactedCoversEveryFieldShape(t *testing.T) {
 	outerDesc := redactTestSchema(t)
 	innerDesc := outerDesc.ParentFile().Messages().ByName("Inner")
 	newInner := func(secret, name string) protoreflect.Message {
@@ -185,7 +188,8 @@ func TestRedactCoversEveryFieldShape(t *testing.T) {
 	outer.Mutable(f("secret_many")).List().Append(protoreflect.ValueOfMessage(newInner("s5", "n5")))
 	outer.Set(f("secret_choice"), protoreflect.ValueOfString("chosen-secret"))
 
-	protoredact.Redact(outer)
+	redacted, _ := protoredact.Redacted(outer)
+	outer = redacted.(*dynamicpb.Message)
 
 	secretOf := func(m protoreflect.Message) string { return m.Get(innerDesc.Fields().ByName("secret")).String() }
 	nameOf := func(m protoreflect.Message) string { return m.Get(innerDesc.Fields().ByName("name")).String() }
@@ -227,7 +231,7 @@ func TestRedactCoversEveryFieldShape(t *testing.T) {
 	}
 }
 
-func TestRedactLeavesUnsetFieldsUnset(t *testing.T) {
+func TestRedactedLeavesUnsetFieldsUnset(t *testing.T) {
 	outerDesc := redactTestSchema(t)
 	innerDesc := outerDesc.ParentFile().Messages().ByName("Inner")
 	// Inner with no secret set, nested under an unlabeled field.
@@ -237,7 +241,8 @@ func TestRedactLeavesUnsetFieldsUnset(t *testing.T) {
 	outer.Set(outerDesc.Fields().ByName("one"), protoreflect.ValueOfMessage(inner))
 	// A labeled oneof left unselected.
 
-	protoredact.Redact(outer)
+	redacted, _ := protoredact.Redacted(outer)
+	outer = redacted.(*dynamicpb.Message)
 
 	got := outer.Get(outerDesc.Fields().ByName("one")).Message()
 	if got.Has(innerDesc.Fields().ByName("secret")) {
@@ -254,17 +259,141 @@ func TestRedactLeavesUnsetFieldsUnset(t *testing.T) {
 	}
 }
 
-func TestForLogPassesThroughNonProtoValues(t *testing.T) {
-	for _, v := range []any{nil, "a string", 42, errors.New("boom"), struct{ X int }{1}} {
-		if got := protoredact.ForLog(v); got != v {
-			t.Errorf("protoredact.ForLog(%#v) = %#v, want the value unchanged", v, got)
+func TestRedactedHandlesTypedNilWithoutPanicking(t *testing.T) {
+	// A typed nil proto pointer, as a handler returns alongside an error and
+	// the interceptor then logs, must come back as a nil message of the same
+	// type, for a redactable type and for a clean one alike.
+	var jwt *ateapipb.MintActorJWTResponse
+	if r, changed := protoredact.Redacted(jwt); changed {
+		t.Errorf("typed nil redactable: reported changed, got %#v", r)
+	} else if m, ok := r.(*ateapipb.MintActorJWTResponse); !ok || m != nil {
+		t.Errorf("typed nil redactable: got %#v", r)
+	}
+	var ref *ateapipb.ObjectRef
+	if r, changed := protoredact.Redacted(ref); changed {
+		t.Errorf("typed nil clean: reported changed, got %#v", r)
+	} else if m, ok := r.(*ateapipb.ObjectRef); !ok || m != nil {
+		t.Errorf("typed nil clean: got %#v", r)
+	}
+}
+
+func TestRedactedReturnsMessagesWithNothingToMaskWithoutCopying(t *testing.T) {
+	// Types with no path to a debug_redact field, and messages of a labeled
+	// type whose labeled fields are all unset, come back as the same pointer:
+	// nothing to mask, nothing to copy.
+	for _, m := range []proto.Message{
+		&ateapipb.ListActorsResponse{Actors: []*ateapipb.Actor{{Metadata: &ateapipb.ResourceMetadata{Name: "a"}}}},
+		&ateapipb.ObjectRef{Atespace: "s", Name: "n"},
+		&ateapipb.Worker{},
+		&ateapipb.ActorTemplate{Containers: []*ateapipb.Container{{Name: "c", Image: "img"}}},
+		&ateapipb.ListActorTemplatesResponse{ActorTemplates: []*ateapipb.ActorTemplate{{Containers: []*ateapipb.Container{{Name: "c"}}}}},
+		&ateapipb.MintActorJWTResponse{},
+		&ateletpb.RunRequest{Spec: &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Env: []*ateletpb.EnvEntry{{Name: "K"}}}}}},
+	} {
+		if protoredact.NeedsRedaction(m) {
+			t.Errorf("%T: NeedsRedaction should be false", m)
+		}
+		if got, changed := protoredact.Redacted(m); changed || got != m {
+			t.Errorf("%T: expected the same message back and changed=false, got changed=%v", m, changed)
 		}
 	}
-	// A typed nil proto pointer, as a handler may return alongside an error,
-	// must not panic and must come back as a nil message.
-	var typedNil *ateapipb.MintActorJWTResponse
-	got := protoredact.ForLog(typedNil)
-	if m, ok := got.(*ateapipb.MintActorJWTResponse); !ok || m != nil {
-		t.Errorf("typed nil: got %#v", got)
+	// A populated labeled field, however deep, forces a masked copy.
+	for _, m := range []proto.Message{
+		&ateapipb.MintActorJWTResponse{ActorJwt: "t"},
+		&ateapipb.ActorTemplate{Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "K", Value: "v"}}}}},
+		&ateapipb.ListActorTemplatesResponse{ActorTemplates: []*ateapipb.ActorTemplate{{}, {Containers: []*ateapipb.Container{{}, {Env: []*ateapipb.EnvVar{{Name: "K", Value: "v"}}}}}}},
+		&ateletpb.RunRequest{Spec: &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Env: []*ateletpb.EnvEntry{{Name: "K", Value: "v"}}}}}},
+	} {
+		if !protoredact.NeedsRedaction(m) {
+			t.Errorf("%T: NeedsRedaction should be true", m)
+		}
+		if got, changed := protoredact.Redacted(m); !changed || got == m {
+			t.Errorf("%T: expected a copy and changed=true, got changed=%v", m, changed)
+		}
+	}
+	if r, changed := protoredact.Redacted(nil); protoredact.NeedsRedaction(nil) || changed || r != nil {
+		t.Error("nil message should be reported clean and returned as nil")
+	}
+}
+
+func TestNeedsRedactionToleratesTypedNilOfAnyImplementation(t *testing.T) {
+	// A typed nil generated message answers ProtoReflect safely; a typed nil
+	// dynamicpb.Message returns the nil receiver, which faults on use. Both
+	// must be reported clean and returned unchanged.
+	var gen *ateapipb.MintActorJWTResponse
+	var dyn *dynamicpb.Message
+	for _, m := range []proto.Message{gen, dyn} {
+		if protoredact.NeedsRedaction(m) {
+			t.Errorf("%T typed nil: NeedsRedaction should be false", m)
+		}
+		if got, changed := protoredact.Redacted(m); changed || got != m {
+			t.Errorf("%T typed nil: got %#v (changed=%v), want the same value back", m, got, changed)
+		}
+	}
+}
+
+func TestNeedsRedactionIsSafeUnderConcurrentFirstUse(t *testing.T) {
+	// The per-type answer is memoized on first sight; many goroutines
+	// meeting several types at once must agree and not race.
+	msgs := []proto.Message{
+		&ateapipb.MintActorJWTResponse{ActorJwt: "t"},
+		&ateapipb.ListActorsResponse{},
+		&ateapipb.ActorTemplate{Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "K", Value: "v"}}}}},
+		&ateapipb.Worker{},
+		&ateletpb.RunRequest{Spec: &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Env: []*ateletpb.EnvEntry{{Name: "K", Value: "v"}}}}}},
+	}
+	want := []bool{true, false, true, false, true}
+	var wg sync.WaitGroup
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i, m := range msgs {
+				if got := protoredact.NeedsRedaction(m); got != want[i] {
+					t.Errorf("%T: NeedsRedaction = %v, want %v", m, got, want[i])
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestDebugRedactFieldsArePinned lists every field across our protos that
+// carries debug_redact. It fails when a label is added or removed so the
+// change is reviewed as a deliberate decision about what the logs may show.
+func TestDebugRedactFieldsArePinned(t *testing.T) {
+	want := map[string]bool{
+		"ateapi.EnvVar.value":                           true,
+		"ateapi.MintActorJWTResponse.actor_jwt":         true,
+		"atelet.EnvEntry.value":                         true,
+		"credprovider.FetchSecretResponse.opaque_bytes": true,
+	}
+	got := map[string]bool{}
+	var walk func(protoreflect.MessageDescriptors)
+	walk = func(mds protoreflect.MessageDescriptors) {
+		for i := 0; i < mds.Len(); i++ {
+			md := mds.Get(i)
+			fds := md.Fields()
+			for j := 0; j < fds.Len(); j++ {
+				fd := fds.Get(j)
+				if opts, ok := fd.Options().(*descriptorpb.FieldOptions); ok && opts.GetDebugRedact() {
+					got[string(fd.FullName())] = true
+				}
+			}
+			walk(md.Messages())
+		}
+	}
+	for _, file := range []protoreflect.FileDescriptor{ateapipb.File_ateapi_proto, ateletpb.File_atelet_proto, credproviderpb.File_credprovider_proto} {
+		walk(file.Messages())
+	}
+	for name := range want {
+		if !got[name] {
+			t.Errorf("%s lost its debug_redact label; the log handler would write it in clear", name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("%s is newly marked debug_redact; add it to this list if that is intended", name)
+		}
 	}
 }
