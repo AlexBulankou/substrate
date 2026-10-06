@@ -133,6 +133,9 @@ type Config struct {
 	KODockerRepo string
 	// KODefaultPlatforms constrains ko's build platforms.
 	KODefaultPlatforms string
+	// DockerBuildFlags are extra docker buildx build flags for the images ko
+	// cannot build (DOCKER_BUILD_FLAGS, whitespace-separated).
+	DockerBuildFlags []string
 
 	// Images selects where container images come from. Its zero value builds
 	// them from source with ko, which is what a developer install does.
@@ -353,6 +356,7 @@ func Load(opts Options) (*Config, error) {
 		BucketName:                        env["BUCKET_NAME"],
 		KODockerRepo:                      env["KO_DOCKER_REPO"],
 		KODefaultPlatforms:                env["KO_DEFAULTPLATFORMS"],
+		DockerBuildFlags:                  strings.Fields(env["DOCKER_BUILD_FLAGS"]),
 		Images:                            loadImageSource(opts, env),
 		PostgresReadWriteConnectionString: readWriteConnectionString,
 		PostgresOwnerConnectionString:     ownerConnectionString,
