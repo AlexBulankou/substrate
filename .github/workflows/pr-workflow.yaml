@@ -125,7 +125,7 @@ jobs:
   e2e-test:
     name: ${{ matrix.dataplane == 'envoy' && 'e2e-test' || format('e2e-test ({0})', matrix.dataplane) }}
     runs-on: ubuntu-latest
-    # Cluster bring-up, image builds and four sequential lanes; generous, but far
+    # Cluster bring-up, image builds and two sequential lanes; generous, but far
     # short of the six-hour platform default a hung lane would otherwise consume.
     timeout-minutes: 120
     continue-on-error: ${{ matrix.experimental }} # TODO: Make AgentGateway required once tests show stability
@@ -218,8 +218,7 @@ jobs:
     - name: Run E2E tests (gVisor)
       env:
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-gvisor.xml
-      # The identity suite runs last and alone (see below), not here.
-      run: hack/run-e2e-kind.sh -skip '^TestActorIdentity' -v -args --no-color
+      run: hack/run-e2e-kind.sh -v -args --no-color
     - name: Run E2E tests (micro-VM)
       # The same suites again, with every fixture repointed at its micro-VM
       # variant by the single E2E_SANDBOX_CLASS knob (see internal/e2e/sandbox.go).
@@ -229,20 +228,7 @@ jobs:
       env:
         E2E_SANDBOX_CLASS: microvm
         E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-microvm.xml
-      run: hack/run-e2e-kind.sh -skip '^TestActorIdentity' -v -args --no-color
-    - name: Run E2E tests (identity, gVisor)
-      # The suite rotates the cluster-wide egress CA pool, and
-      # the gateway picks a rotation up only once kubelet has propagated the
-      # Secret into its pod, so until then it signs with a CA no actor trusts.
-      # Nothing that does TLS through the gateway can run alongside it.
-      env:
-        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-identity-gvisor.xml
-      run: hack/run-e2e-kind.sh ./internal/e2e/suites/identity -v -args --no-color
-    - name: Run E2E tests (identity, micro-VM)
-      env:
-        E2E_SANDBOX_CLASS: microvm
-        E2E_JUNIT_FILE: ${{ github.workspace }}/_artifacts/e2e-identity-microvm.xml
-      run: hack/run-e2e-kind.sh ./internal/e2e/suites/identity -v -args --no-color
+      run: hack/run-e2e-kind.sh -v -args --no-color
     # Every lane must have reported tests; a `-run` filter that stops matching
     # otherwise leaves its lane green and empty. The set comes from the manifest
     # each lane registers itself in, so adding a lane needs no change here, and
