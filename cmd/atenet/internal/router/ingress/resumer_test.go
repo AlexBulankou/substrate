@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -736,7 +737,7 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 			lot := newParkingLot(cfg, nil)
 			// Fill the only slot: any lot entry would shed, so success proves
 			// the fast path never asked.
-			release, ok := lot.enter(context.Background())
+			release, ok := lot.enter(context.Background(), ateattr.RouterOutcomeUnavailable)
 			if !ok {
 				t.Fatal("priming enter should be admitted")
 			}
@@ -808,7 +809,7 @@ func TestActorResumer_LotAdmission(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			cfg := ParkedRequestConfig{Max: 1, Budget: 500 * time.Millisecond}
 			lot := newParkingLot(cfg, nil)
-			release, ok := lot.enter(context.Background())
+			release, ok := lot.enter(context.Background(), ateattr.RouterOutcomeUnavailable)
 			if !ok {
 				t.Fatal("priming enter should be admitted")
 			}
