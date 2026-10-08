@@ -42,8 +42,9 @@ var envoyAdminManifests = []struct {
 }
 
 type socketAddress struct {
-	Address   string `json:"address"`
-	PortValue int32  `json:"port_value"`
+	Address    string `json:"address"`
+	PortValue  int32  `json:"port_value"`
+	IPv4Compat bool   `json:"ipv4_compat"`
 }
 
 type envoyAdminBootstrap struct {
@@ -54,8 +55,11 @@ type envoyAdminBootstrap struct {
 	} `json:"admin"`
 	StaticResources struct {
 		Listeners []struct {
-			Name         string `json:"name"`
-			StatPrefix   string `json:"stat_prefix"`
+			Name       string `json:"name"`
+			StatPrefix string `json:"stat_prefix"`
+			Address    struct {
+				SocketAddress socketAddress `json:"socket_address"`
+			} `json:"address"`
 			FilterChains []struct {
 				Filters []struct {
 					TypedConfig struct {
@@ -166,36 +170,12 @@ func TestEnvoyAdminIsLoopbackOnly(t *testing.T) {
 func TestEnvoyAdminProxyIsAllowlisted(t *testing.T) {
 	for _, m := range envoyAdminManifests {
 		t.Run(m.deployment, func(t *testing.T) {
-			bootstrap := parseEnvoyAdminBootstrap(t, envoyConfigFrom(t, m.path, m.configMap))
-			admin := bootstrap.Admin.Address.SocketAddress
-			adminClusters := map[string]bool{}
-			for _, c := range bootstrap.StaticResources.Clusters {
-				for _, e := range c.LoadAssignment.Endpoints {
-					for _, lb := range e.LbEndpoints {
-						if lb.Endpoint.Address.SocketAddress == admin {
-							adminClusters[c.Name] = true
-						}
-					}
-				}
-			}
-
 			seen := map[string]bool{}
-			for _, l := range bootstrap.StaticResources.Listeners {
-				for _, fc := range l.FilterChains {
-					for _, f := range fc.Filters {
-						for _, vh := range f.TypedConfig.RouteConfig.VirtualHosts {
-							for _, r := range vh.Routes {
-								if !adminClusters[r.Route.Cluster] {
-									continue
-								}
-								seen[r.Match.Path] = true
-								checkEnvoyAdminRoute(t, l.Name, r)
-								if !strings.Contains(l.StatPrefix, "admin") || !strings.Contains(f.TypedConfig.StatPrefix, "admin") {
-									t.Errorf("listener %q forwards to the admin API but its stat prefixes (listener %q, HCM %q) lack \"admin\", so envoyDrainer counts its connections and the drain may never reach zero", l.Name, l.StatPrefix, f.TypedConfig.StatPrefix)
-								}
-							}
-						}
-					}
+			for _, r := range envoyAdminProxyRoutes(parseEnvoyAdminBootstrap(t, envoyConfigFrom(t, m.path, m.configMap))) {
+				seen[r.route.Match.Path] = true
+				checkEnvoyAdminRoute(t, r.listener, r.route)
+				if !strings.Contains(r.listenerStatPrefix, "admin") || !strings.Contains(r.hcmStatPrefix, "admin") {
+					t.Errorf("listener %q forwards to the admin API but its stat prefixes (listener %q, HCM %q) lack \"admin\", so envoyDrainer counts its connections and the drain may never reach zero", r.listener, r.listenerStatPrefix, r.hcmStatPrefix)
 				}
 			}
 			if !seen[m.requiredPath] {
@@ -203,6 +183,111 @@ func TestEnvoyAdminProxyIsAllowlisted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnvoyReadinessProbeAsksEnvoy checks that each gateway's envoy container
+// has a readiness probe on Envoy's /ready, reached through a listener that
+// forwards it to the admin API. Without that probe, the Service sends traffic
+// to the pod while Envoy is still starting and refuses every connection.
+func TestEnvoyReadinessProbeAsksEnvoy(t *testing.T) {
+	for _, m := range envoyAdminManifests {
+		t.Run(m.deployment, func(t *testing.T) {
+			readyPorts := map[int32]bool{}
+			for _, r := range envoyAdminProxyRoutes(parseEnvoyAdminBootstrap(t, envoyConfigFrom(t, m.path, m.configMap))) {
+				if r.route.Match.Path == "/ready" && reachableOnPodIP(r.address) {
+					readyPorts[r.address.PortValue] = true
+				}
+			}
+
+			var envoy *corev1.Container
+			pod := findDeployment(t, m.path, m.deployment).Spec.Template.Spec
+			for i := range pod.Containers {
+				if pod.Containers[i].Name == "envoy" {
+					envoy = &pod.Containers[i]
+				}
+			}
+			if envoy == nil {
+				t.Fatalf("%s has no container named envoy", m.deployment)
+			}
+			probe := envoy.ReadinessProbe
+			if probe == nil || probe.HTTPGet == nil {
+				t.Fatal("the envoy container has no HTTP readiness probe, so the pod can be Ready before Envoy is")
+			}
+			if probe.HTTPGet.Path != "/ready" {
+				t.Errorf("the envoy readiness probe asks %q; it must ask Envoy's /ready", probe.HTTPGet.Path)
+			}
+			if probe.HTTPGet.Host != "" || probe.HTTPGet.Scheme == corev1.URISchemeHTTPS {
+				t.Errorf("the envoy readiness probe sets host %q and scheme %q; it must dial the pod IP over plain HTTP", probe.HTTPGet.Host, probe.HTTPGet.Scheme)
+			}
+			port := probe.HTTPGet.Port.IntVal
+			if probe.HTTPGet.Port.Type == intstr.String {
+				port = 0
+				for _, p := range envoy.Ports {
+					if p.Name == probe.HTTPGet.Port.StrVal {
+						port = p.ContainerPort
+					}
+				}
+			}
+			if !readyPorts[port] {
+				t.Errorf("the envoy readiness probe dials port %s, but no static listener reachable on the pod IP at that port forwards /ready to the admin API", probe.HTTPGet.Port.String())
+			}
+		})
+	}
+}
+
+// reachableOnPodIP reports whether the kubelet, which probes the pod IP, can
+// reach a listener bound to a. Envoy binds a bare "::" IPv6-only, so on an
+// IPv4 cluster it also needs ipv4_compat.
+func reachableOnPodIP(a socketAddress) bool {
+	ip := net.ParseIP(a.Address)
+	if ip == nil || !ip.IsUnspecified() {
+		return false
+	}
+	return ip.To4() != nil || a.IPv4Compat
+}
+
+// envoyAdminProxyRoute is one static-listener route whose cluster is the admin
+// API, with the listener details the tests above check.
+type envoyAdminProxyRoute struct {
+	listener, listenerStatPrefix, hcmStatPrefix string
+	address                                     socketAddress
+	route                                       envoyAdminRoute
+}
+
+func envoyAdminProxyRoutes(b envoyAdminBootstrap) []envoyAdminProxyRoute {
+	admin := b.Admin.Address.SocketAddress
+	adminClusters := map[string]bool{}
+	for _, c := range b.StaticResources.Clusters {
+		for _, e := range c.LoadAssignment.Endpoints {
+			for _, lb := range e.LbEndpoints {
+				if lb.Endpoint.Address.SocketAddress == admin {
+					adminClusters[c.Name] = true
+				}
+			}
+		}
+	}
+
+	var routes []envoyAdminProxyRoute
+	for _, l := range b.StaticResources.Listeners {
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				for _, vh := range f.TypedConfig.RouteConfig.VirtualHosts {
+					for _, r := range vh.Routes {
+						if adminClusters[r.Route.Cluster] {
+							routes = append(routes, envoyAdminProxyRoute{
+								listener:           l.Name,
+								listenerStatPrefix: l.StatPrefix,
+								hcmStatPrefix:      f.TypedConfig.StatPrefix,
+								address:            l.Address.SocketAddress,
+								route:              r,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+	return routes
 }
 
 func checkEnvoyAdminRoute(t *testing.T, listener string, r envoyAdminRoute) {

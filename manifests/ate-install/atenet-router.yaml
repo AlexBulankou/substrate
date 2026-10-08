@@ -98,9 +98,10 @@ data:
     static_resources:
       # envoy_metrics is the only pod-IP-reachable view of the admin API: it
       # proxies GET /stats/prometheus (the PodMonitoring in
-      # atenet-router-monitoring.yaml) and GET /ready to the loopback-only
-      # admin listener and 404s everything else. The stat prefixes contain
-      # "admin" so envoyDrainer.activeConnections excludes scrapes from the
+      # atenet-router-monitoring.yaml) and GET /ready (the envoy container's
+      # readiness probe) to the loopback-only admin listener and 404s
+      # everything else. The stat prefixes contain "admin" so
+      # envoyDrainer.activeConnections excludes probes and scrapes from the
       # downstream connection count it waits on to reach zero.
       listeners:
       - name: envoy_metrics
@@ -327,6 +328,12 @@ spec:
         # admin API itself (9901) is loopback-only and deliberately not listed.
         - name: envoy-metrics
           containerPort: 9902
+        # Keeps the pod out of the Service until Envoy is ready.
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: envoy-metrics
+          periodSeconds: 2
         volumeMounts:
         - name: envoy-config
           mountPath: /etc/envoy
