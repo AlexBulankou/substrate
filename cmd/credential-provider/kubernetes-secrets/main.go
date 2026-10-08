@@ -203,10 +203,10 @@ func buildServerCreds(ctx context.Context) (credentials.TransportCredentials, er
 	}
 
 	cfg, err := credbundle.PrepareServerTLSConfig(credbundle.ServerConfig{
-		GetCertificate: credbundle.Loader(*serverBundle),
-		ClientCAPath:   *clientCAFile,
-		ClientAuth:     tls.RequireAndVerifyClientCert,
-		VerifyPeer:     verifyClientSAN(*injectorIdentity),
+		CertPath:     *serverBundle,
+		ClientCAPath: *clientCAFile,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		VerifyPeer:   verifyClientSAN(*injectorIdentity),
 	})
 	if err != nil {
 		return nil, err

@@ -579,9 +579,9 @@ func buildServerTLSConfig(ctx context.Context, credBundlePath, caCertsPath strin
 	}
 
 	cfg, err := credbundle.PrepareServerTLSConfig(credbundle.ServerConfig{
-		GetCertificate: credbundle.Loader(credBundlePath),
-		ClientCAPath:   caCertsPath,
-		ClientAuth:     clientAuth,
+		CertPath:     credBundlePath,
+		ClientCAPath: caCertsPath,
+		ClientAuth:   clientAuth,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("load pod-identity CA: %w", err)
