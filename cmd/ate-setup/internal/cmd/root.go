@@ -146,12 +146,21 @@ func recordRun(cmd *cobra.Command, runErr error) {
 	}
 	context := resolved.ClusterKey()
 
+	// Recorded so the file says what the cluster runs. Left out when the run
+	// failed before it had an environment to ask.
+	var version string
+	if env != nil {
+		if v, _, err := env.SubstrateVersion(); err == nil {
+			version = v
+		}
+	}
+
 	var path string
 	var omitted []string
 	if runErr == nil {
-		path, omitted, err = config.RecordSuccess(dir, context, resolved)
+		path, omitted, err = config.RecordSuccess(dir, context, version, resolved)
 	} else {
-		path, omitted, err = config.RecordFailure(dir, context, resolved, cmd.CommandPath())
+		path, omitted, err = config.RecordFailure(dir, context, version, resolved, cmd.CommandPath())
 	}
 	if err != nil {
 		log.Warnf("not recording this run: %v", err)

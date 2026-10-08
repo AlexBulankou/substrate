@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	"sigs.k8s.io/yaml"
+
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/config"
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
 )
@@ -148,5 +150,24 @@ func TestRecordRunWritesAFailureArtifact(t *testing.T) {
 	}
 	if installs, _ := filepath.Glob(filepath.Join(dir, "installs", "*.yaml")); len(installs) != 0 {
 		t.Errorf("a failed run wrote an install record: %v", installs)
+	}
+}
+
+// The record names the release the run installed, so a later reader can tell
+// what the cluster runs without asking the cluster.
+func TestRecordNamesTheInstalledVersion(t *testing.T) {
+	t.Setenv("VERSION", "v0.9.1")
+	raw, err := os.ReadFile(recordFor(t, t.TempDir(), nil))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var doc struct {
+		Cluster config.DocumentMetadata `json:"cluster"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got := doc.Cluster.SubstrateVersion; got != "v0.9.1" {
+		t.Errorf("cluster.substrateVersion = %q, want %q", got, "v0.9.1")
 	}
 }

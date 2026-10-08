@@ -242,6 +242,7 @@ kind: SubstrateInstall
 cluster:
   context: prod
   outcome: succeeded
+  substrateVersion: v0.4.1
   writtenAt: "2026-09-29T23:14:38Z"
   writtenBy: ate-setup v0.4.1
 atenet:
@@ -249,6 +250,10 @@ atenet:
 context: prod
 namespace: ate-prod
 ```
+
+`cluster.substrateVersion` is the Substrate release the run installed: the
+version stamped into the binaries it built, or the image tag of a prebuilt
+install. `cluster.writtenBy` is the `ate-setup` that wrote the file.
 
 Only settings something supplied are recorded. A setting left on its default
 is left out on purpose, so it keeps following the default if a later release
