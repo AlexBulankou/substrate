@@ -167,10 +167,12 @@ benchmark:
   workerCount: 4
 ```
 
-## Every run records what it used
+## Install runs record what they used
 
-A `deploy` command writes the settings it resolved to a file, so a later run
-can reproduce it without anyone remembering what was typed:
+A `deploy` command that installs Substrate writes the settings it resolved to
+a file, so a later run can reproduce it without anyone remembering what was
+typed. `deploy demo` and `deploy benchmarks` write nothing: they deploy on top
+of the system with only their own settings.
 
 ```
 recorded this configuration in ~/.cache/ate-setup/installs/prod.yaml

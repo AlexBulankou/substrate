@@ -25,19 +25,19 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ate-setup/internal/steps"
 )
 
-// A record describes how a cluster was configured, so only the commands that
-// configure one write it. The annotation is inherited, which is what keeps a
-// demo added later from quietly missing it -- and what makes it worth checking
-// that it has not spread to commands that install nothing.
-func TestOnlyDeployCommandsRecordTheirRun(t *testing.T) {
+// A record describes how the system was installed, so only the commands that
+// install it write it. Demos and benchmarks deploy on top of the system with
+// their own settings, and recording them would replace the system's record.
+func TestOnlySystemDeploysRecordTheirRun(t *testing.T) {
 	for _, tc := range []struct {
 		path string
 		want bool
 	}{
 		{path: "deploy ate-system", want: true},
 		{path: "deploy atenet", want: true},
-		{path: "deploy benchmarks", want: true},
-		{path: "deploy demo counter", want: true},
+		{path: "deploy apiserver", want: true},
+		{path: "deploy benchmarks", want: false},
+		{path: "deploy demo counter", want: false},
 		{path: "delete ate-system", want: false},
 		{path: "delete benchmarks", want: false},
 		{path: "setup csi", want: false},
