@@ -93,6 +93,11 @@ func handleAteletError(ctx context.Context, st crashActorStore, actorRef resourc
 		return fmt.Errorf("actor %s crashed: %w", actorRef, err)
 	}
 
+	// The caller went away or its deadline passed: report that, not atelet's
+	// error. The actor keeps its assignment, so a retry can finish the operation.
+	if ctx.Err() != nil {
+		return fmt.Errorf("while calling atelet %s: %w: %w", rpc, err, ctx.Err())
+	}
 	if status.Code(err) == codes.Unavailable {
 		return apierror.Unavailable("while calling atelet %s: %w", rpc, err)
 	}

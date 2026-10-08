@@ -3400,60 +3400,87 @@ func TestResumeActor_AteletFailureCrashesActor(t *testing.T) {
 	}
 }
 
-// TestResumeActor_AteletUnavailableLeavesActorResuming: an Unavailable from
-// atelet, such as atelet restarting, does not crash the actor. It stays
-// RESUMING on its worker, and the next resume finishes.
-func TestResumeActor_AteletUnavailableLeavesActorResuming(t *testing.T) {
-	ns := namespaceForTest("ns-resume-atelet-unavailable")
-	tc := setupTest(t, ns)
-	defer tc.cleanup()
+// A transient atelet failure, or a caller whose deadline passes during the
+// restore, leaves the actor RESUMING on its worker, and the next resume finishes.
+// Only Unavailable and the caller's own deadline reach the caller with their
+// code. Atelet's own Canceled or DeadlineExceeded reach it as Internal.
+func TestResumeActor_AteletTransportErrorLeavesActorResuming(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		fail     error
+		delay    time.Duration
+		deadline time.Duration
+		wantCode codes.Code
+	}{
+		{name: "Unavailable", fail: status.Error(codes.Unavailable, "restore reply lost"), wantCode: codes.Unavailable},
+		{name: "atelet Canceled", fail: status.Error(codes.Canceled, "restore reply lost"), wantCode: codes.Internal},
+		{name: "atelet DeadlineExceeded", fail: status.Error(codes.DeadlineExceeded, "restore reply lost"), wantCode: codes.Internal},
+		{name: "caller deadline", delay: time.Second, deadline: 200 * time.Millisecond, wantCode: codes.DeadlineExceeded},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := namespaceForTest("ns-resume-atelet-" + strings.ReplaceAll(strings.ToLower(tt.name), " ", "-"))
+			tc := setupTest(t, ns)
+			defer tc.cleanup()
 
-	createTemplate(t, tc, ns)
-	podUID := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+			createTemplate(t, tc, ns)
+			podUID := createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
 
-	name := "id1"
-	ref := &ateapipb.ObjectRef{Atespace: testAtespace, Name: name}
-	actorRef := resources.ActorRef{Atespace: testAtespace, Name: name}
-	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
-	}}); err != nil {
-		t.Fatalf("CreateActor failed: %v", err)
-	}
+			name := "id1"
+			ref := &ateapipb.ObjectRef{Atespace: testAtespace, Name: name}
+			actorRef := resources.ActorRef{Atespace: testAtespace, Name: name}
+			if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+				Metadata:      &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+				ActorTemplate: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "tmpl1"},
+			}}); err != nil {
+				t.Fatalf("CreateActor failed: %v", err)
+			}
 
-	tc.fakeAtelet.FailRestore = status.Error(codes.Unavailable, "connection refused")
-	_, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: ref})
-	if got := status.Code(err); got != codes.Unavailable {
-		t.Fatalf("ResumeActor status code = %v, want %v (err: %v)", got, codes.Unavailable, err)
-	}
+			tc.fakeAtelet.FailRestore = tt.fail
+			tc.fakeAtelet.RestoreDelay = tt.delay
+			ctx := context.Background()
+			if tt.deadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.deadline)
+				defer cancel()
+			}
+			_, err := tc.client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: ref})
+			if got := status.Code(err); got != tt.wantCode {
+				t.Fatalf("ResumeActor status code = %v, want %v (err: %v)", got, tt.wantCode, err)
+			}
 
-	actor, err := tc.persistence.GetActor(context.Background(), actorRef)
-	if err != nil {
-		t.Fatalf("failed to get actor from store: %v", err)
-	}
-	if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RESUMING {
-		t.Fatalf("state after Unavailable = %v, want RESUMING", got)
-	}
-	if crash := actor.GetStatus().GetCrash(); crash != nil {
-		t.Errorf("crash recorded after Unavailable: %v", crash)
-	}
-	if got := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); got != podUID {
-		t.Errorf("assigned worker = %q, want %q kept for the retry", got, podUID)
-	}
+			actor, err := tc.persistence.GetActor(context.Background(), actorRef)
+			if err != nil {
+				t.Fatalf("failed to get actor from store: %v", err)
+			}
+			if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RESUMING {
+				t.Fatalf("state after %s = %v, want RESUMING", tt.name, got)
+			}
+			if crash := actor.GetStatus().GetCrash(); crash != nil {
+				t.Errorf("crash recorded after %s: %v", tt.name, crash)
+			}
+			if got := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); got != podUID {
+				t.Errorf("assigned worker = %q, want %q kept for the retry", got, podUID)
+			}
 
-	tc.fakeAtelet.FailRestore = nil
-	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: ref}); err != nil {
-		t.Fatalf("retried ResumeActor failed: %v", err)
-	}
-	actor, err = tc.persistence.GetActor(context.Background(), actorRef)
-	if err != nil {
-		t.Fatalf("failed to get actor from store: %v", err)
-	}
-	if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
-		t.Errorf("state after retry = %v, want RUNNING", got)
-	}
-	if got := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); got != podUID {
-		t.Errorf("assigned worker after retry = %q, want %q", got, podUID)
+			// The fake still holds its lock while a delayed restore sleeps.
+			tc.fakeAtelet.Lock.Lock()
+			tc.fakeAtelet.FailRestore = nil
+			tc.fakeAtelet.RestoreDelay = 0
+			tc.fakeAtelet.Lock.Unlock()
+			if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: ref}); err != nil {
+				t.Fatalf("retried ResumeActor failed: %v", err)
+			}
+			actor, err = tc.persistence.GetActor(context.Background(), actorRef)
+			if err != nil {
+				t.Fatalf("failed to get actor from store: %v", err)
+			}
+			if got := actor.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+				t.Errorf("state after retry = %v, want RUNNING", got)
+			}
+			if got := actor.GetStatus().GetWorkerAssignment().GetWorker().GetName(); got != podUID {
+				t.Errorf("assigned worker after retry = %q, want %q", got, podUID)
+			}
+		})
 	}
 }
 
@@ -3484,8 +3511,8 @@ func TestResumeActor_LocalRestoreFailureCrashesActor(t *testing.T) {
 
 	tc.fakeAtelet.Reset()
 	tc.fakeAtelet.FailRestore = status.Error(codes.Internal, "injected restore failure")
-	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: ref}); err == nil {
-		t.Fatal("ResumeActor succeeded despite failing restore")
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{Actor: ref}); status.Code(err) != codes.Internal {
+		t.Fatalf("ResumeActor status code = %v, want Internal (err: %v)", status.Code(err), err)
 	}
 	if got := tc.fakeAtelet.RestoreRequest.GetType(); got != ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL {
 		t.Fatalf("restore type = %v, want LOCAL", got)

@@ -352,6 +352,8 @@ func TestAteletCrashMessage(t *testing.T) {
 func TestHandleAteletError(t *testing.T) {
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Unix(0, 0))
+	defer cancelExpired()
 
 	tests := []struct {
 		name string
@@ -397,11 +399,27 @@ func TestHandleAteletError(t *testing.T) {
 			wantState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
 		},
 		{
+			name:      "cancelled caller gets Canceled and leaves the actor as it was",
+			ctx:       ended,
+			rpc:       "Restore",
+			err:       fmt.Errorf("while restoring actor: %w", status.Error(codes.Canceled, "connection closing")),
+			wantCode:  codes.Canceled,
+			wantState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		},
+		{
+			name:      "expired caller deadline gets DeadlineExceeded and leaves the actor as it was",
+			ctx:       expired,
+			rpc:       "Restore",
+			err:       fmt.Errorf("while restoring actor: %w", status.Error(codes.DeadlineExceeded, "restore reply timed out")),
+			wantCode:  codes.DeadlineExceeded,
+			wantState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		},
+		{
 			name:      "ended workflow context leaves the actor as it was",
 			ctx:       ended,
 			rpc:       "Restore",
 			err:       status.Error(codes.Internal, "context canceled"),
-			wantCode:  codes.Internal,
+			wantCode:  codes.Canceled,
 			wantState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
 		},
 		{
@@ -450,6 +468,16 @@ func TestHandleAteletError(t *testing.T) {
 			err := handleAteletError(tt.ctx, st, actorRef, ateattr.OperationResume, tt.rpc, tt.isTerminateRPC, tt.err)
 			if got := apierror.Code(err); got != tt.wantCode {
 				t.Errorf("apierror.Code(handleAteletError()) = %v, want %v (err: %v)", got, tt.wantCode, err)
+			}
+
+			if !errors.Is(err, tt.err) {
+				t.Errorf("original atelet error was lost: %v", err)
+			}
+			if tt.wantCode == codes.Canceled && !errors.Is(err, context.Canceled) {
+				t.Errorf("error does not wrap context.Canceled: %v", err)
+			}
+			if tt.wantCode == codes.DeadlineExceeded && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("error does not wrap context.DeadlineExceeded: %v", err)
 			}
 
 			actor, err := st.GetActor(ctx, actorRef)
