@@ -270,7 +270,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	if len(containers) > maxActorContainers {
 		return apierror.Unimplemented("ateom-microvm supports at most %d containers, got %d", maxActorContainers, len(containers))
 	}
-	ctrs, err := s.buildActorContainers(p.actorDirs, containers)
+	ctrs, err := s.buildActorContainers(p.actorUID, p.actorDirs, containers)
 	if err != nil {
 		return err
 	}

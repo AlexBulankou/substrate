@@ -548,9 +548,10 @@ func (s *AteomHerder) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *
 	if registration, err = s.systemInfoVolumes.Register(actorUID, actorRef, systemInfoVolumesFor(actorUID, req.GetSpec())); err != nil {
 		return nil, err
 	}
-	if err := s.prepareOCIBundles(ctx, actorUID, actorRef,
+	containerSpecs, err := s.prepareOCIBundles(ctx, actorUID, actorRef,
 		req.GetSpec(), sandboxRec.PauseImage, req.GetTargetAteomUid(),
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 
@@ -559,7 +560,7 @@ func (s *AteomHerder) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *
 		return nil, err
 	}
 
-	spec, err := buildAteomWorkloadSpec(req.GetSpec())
+	spec, err := buildAteomWorkloadSpec(req.GetSpec(), containerSpecs)
 	if err != nil {
 		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 	}
@@ -692,7 +693,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// Tell ateom to take the checkpoint and delete containers. ateom reports the
 	// exact files it wrote so we ship precisely that set (gVisor's image files,
 	// cloud-hypervisor's snapshot set, ...) rather than a hardcoded list.
-	spec, err := buildAteomWorkloadSpec(req.GetSpec())
+	spec, err := buildAteomWorkloadSpec(req.GetSpec(), nil)
 	if err != nil {
 		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 	}
@@ -1160,6 +1161,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// fetch + image unpack hides whichever leg is shorter, and on a cold node
 	// (uncached assets + image, ~2.5s unpack) that overlap is large.
 	var assetPaths map[string]string
+	var containerSpecs []*ateompb.ContainerSpec
 	// One per leg: a single field written from both goroutines would race.
 	var downloadErr, prepErr error
 	var prepFailedPhase string
@@ -1199,7 +1201,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 			return err
 		}
 		t := time.Now()
-		err = s.prepareOCIBundles(gctx, actorUID, actorRef, req.GetSpec(), runtimeRec.PauseImage, req.GetTargetAteomUid())
+		containerSpecs, err = s.prepareOCIBundles(gctx, actorUID, actorRef, req.GetSpec(), runtimeRec.PauseImage, req.GetTargetAteomUid())
 		dBundles = time.Since(t)
 		if err != nil {
 			prepFailedPhase = ateattr.SnapshotPhaseOCIUnpack
@@ -1224,7 +1226,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 
 	// Tell ateom to do runsc create + runsc restore for pause container and
 	// all application containers.
-	spec, err := buildAteomWorkloadSpec(req.GetSpec())
+	spec, err := buildAteomWorkloadSpec(req.GetSpec(), containerSpecs)
 	if err != nil {
 		return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 	}
@@ -1295,7 +1297,7 @@ func (s *AteomHerder) Terminate(ctx context.Context, req *ateletpb.TerminateRequ
 			return nil, fmt.Errorf("failed to dial ateom for terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
 		}
 
-		spec, err := buildAteomWorkloadSpec(req.GetSpec())
+		spec, err := buildAteomWorkloadSpec(req.GetSpec(), nil)
 		if err != nil {
 			return nil, apierror.InvalidArgument("invalid workload spec: %v", err)
 		}
@@ -1454,7 +1456,8 @@ func (s *AteomHerder) downloadExternalCheckpoint(ctx context.Context, snapshotUR
 // comes from the sandbox record, not the workload spec: it is sandbox
 // configuration, and on a restore it must be the image the snapshot was taken
 // with. It is empty for sandboxes without a pause container, which get no
-// pause bundle.
+// pause bundle. It returns each application container's spec, indexed like
+// spec.GetContainers().
 func (s *AteomHerder) prepareOCIBundles(
 	ctx context.Context,
 	actorUID string,
@@ -1462,14 +1465,14 @@ func (s *AteomHerder) prepareOCIBundles(
 	spec *ateletpb.WorkloadSpec,
 	pauseImage string,
 	targetAteomUid string,
-) error {
+) ([]*ateompb.ContainerSpec, error) {
 	// Prepare host folders for volume types that need them.
 	for _, vol := range spec.GetVolumes() {
 		switch vol.GetSource().(type) {
 		case *ateletpb.Volume_DurableDir:
 			volPath := ateletpath.DurableDirVolumeMountPoint(actorUID, vol.GetName())
 			if err := os.MkdirAll(volPath, 0o700); err != nil {
-				return fmt.Errorf("while creating %q: %w", volPath, err)
+				return nil, fmt.Errorf("while creating %q: %w", volPath, err)
 			}
 		}
 	}
@@ -1478,21 +1481,8 @@ func (s *AteomHerder) prepareOCIBundles(
 
 	if pauseImage != "" {
 		g.Go(func() error {
-			if err := prepareOCIDirectory(
-				gCtx,
-				s.imageCache,
-				actorUID,
-				ocispec.PauseContainer,
-				pauseImage,
-				[]string{"/pause"},
-				nil,
-				nil,
-				nodepath.ActorNetNSPath(actorUID),
-				nil, // pause is sandbox infra; it mounts no volumes.
-				nil,
-				nil, // pause only reaps; it needs no capabilities.
-				nil, // pause carries no user-declared limits.
-			); err != nil {
+			// pause is sandbox infra; it mounts no volumes.
+			if _, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ocispec.PauseContainer, pauseImage, nil, nil); err != nil {
 				return wrapFileSystemErr("while creating pause OCI bundle", err)
 			}
 			return nil
@@ -1500,35 +1490,34 @@ func (s *AteomHerder) prepareOCIBundles(
 	}
 
 	// Application containers.
-	for _, ctr := range spec.GetContainers() {
-		ctr := ctr
+	containerSpecs := make([]*ateompb.ContainerSpec, len(spec.GetContainers()))
+	for i, ctr := range spec.GetContainers() {
 		var envs []string
 		for _, env := range ctr.GetEnv() {
 			envs = append(envs, fmt.Sprintf("%s=%s", env.GetName(), env.GetValue()))
 		}
 		g.Go(func() error {
-			if err := prepareOCIDirectory(
-				gCtx,
-				s.imageCache,
-				actorUID,
-				ctr.GetName(),
-				ctr.GetImage(),
-				ctr.GetCommand(),
-				ctr.GetArgs(),
-				envs,
-				nodepath.ActorNetNSPath(actorUID),
-				spec.GetVolumes(),
-				ctr.GetVolumeMounts(),
-				resolveCapabilities(ctr.GetSecurityContext().GetCapabilities()),
-				ctr.GetResources(),
-			); err != nil {
+			imageConfig, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ctr.GetName(), ctr.GetImage(), spec.GetVolumes(), ctr.GetVolumeMounts())
+			if err != nil {
 				return wrapFileSystemErr(fmt.Sprintf("while creating %q OCI bundle", ctr.GetName()), err)
+			}
+			args, err := resolveProcessArgs(imageConfig, ctr.GetCommand(), ctr.GetArgs())
+			if err != nil {
+				return fmt.Errorf("while resolving process args for container %q: %w", ctr.GetName(), err)
+			}
+			containerSpecs[i] = &ateompb.ContainerSpec{
+				Args:         args,
+				Env:          resolveActorEnv(imageConfig, envs),
+				Capabilities: resolveCapabilities(ctr.GetSecurityContext().GetCapabilities()),
+				Resources:    toAteomResourceLimits(ctr.GetResources()),
 			}
 			return nil
 		})
 	}
-
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return containerSpecs, nil
 }
 
 // dialAteom opens (or reuses) the gRPC connection to the target ateom
@@ -1542,8 +1531,10 @@ func (s *AteomHerder) dialAteom(ctx context.Context, targetAteomUid string) (ate
 }
 
 // buildAteomWorkloadSpec projects the atelet-facing workload spec onto
-// the ateom-facing one.
-func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec) (*ateompb.WorkloadSpec, error) {
+// the ateom-facing one. containerSpecs holds each container's spec from
+// prepareOCIBundles, indexed like spec.GetContainers(); it is nil for RPCs that
+// start no process.
+func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec, containerSpecs []*ateompb.ContainerSpec) (*ateompb.WorkloadSpec, error) {
 	volumes := make(map[string]*ateletpb.Volume)
 	for _, vol := range spec.GetVolumes() {
 		name := vol.GetName()
@@ -1554,7 +1545,7 @@ func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec) (*ateompb.WorkloadSpec,
 	}
 
 	out := &ateompb.WorkloadSpec{}
-	for _, ctr := range spec.GetContainers() {
+	for i, ctr := range spec.GetContainers() {
 		var ddMounts []*ateompb.DurableDirVolumeMount
 		var csiMounts []*ateompb.VolumeMount
 		var siMounts []*ateompb.SystemInfoVolumeMount
@@ -1591,16 +1582,27 @@ func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec) (*ateompb.WorkloadSpec,
 				return nil, fmt.Errorf("container %q mounts volume %q with unsupported source %T", ctr.GetName(), volName, vol.GetSource())
 			}
 		}
-		out.Containers = append(out.Containers, &ateompb.Container{
+		container := &ateompb.Container{
 			Name:                   ctr.GetName(),
 			DurableDirVolumeMounts: ddMounts,
 			CsiVolumeMounts:        csiMounts,
 			SystemInfoVolumeMounts: siMounts,
 			ImageVolumeMounts:      imgMounts,
 			WakeupProbe:            toAteomWakeupProbe(ctr.GetWakeupProbe()),
-		})
+		}
+		if containerSpecs != nil {
+			container.ContainerSpec = containerSpecs[i]
+		}
+		out.Containers = append(out.Containers, container)
 	}
 	return out, nil
+}
+
+func toAteomResourceLimits(limits *ateletpb.ResourceLimits) *ateompb.ResourceLimits {
+	if limits == nil {
+		return nil
+	}
+	return &ateompb.ResourceLimits{MemoryBytes: limits.GetMemoryBytes(), CpuMillis: limits.GetCpuMillis()}
 }
 
 func toAteomEgressGateway(gateway *ateletpb.EgressGateway) *ateompb.EgressGateway {
