@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/apierror"
+	"github.com/agent-substrate/substrate/internal/ateomphaselog"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 
 	"github.com/agent-substrate/substrate/internal/ateomnet"
@@ -188,8 +189,8 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			slog.String("id", p.actorUID), slog.Duration("total", dTotal))
 		// A cold boot has none of the full-scope phases, so the total is the
 		// only observation on its record.
-		logSnapshotPhases(ctx, "Restore timing breakdown", attribution, scope,
-			restoreDurationKey, nil, []phase{{phaseTotal, dTotal}})
+		ateomphaselog.LogSnapshotPhases(ctx, "Restore timing breakdown", attribution, scope,
+			ateomphaselog.RestoreDurationKey, nil, []ateomphaselog.Phase{{Name: phaseTotal, D: dTotal}})
 	default:
 		return nil, apierror.InvalidArgument("unsupported snapshot scope: %v", scope)
 	}
@@ -444,18 +445,18 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// The joinable per-actor record the benchmarking tooling aggregates. The
 	// durable delta is not carried: tDurable is pinned to tLowers today, so it
 	// would always be the zero a record skips.
-	logSnapshotPhases(ctx, "Restore timing breakdown", p.actorAttribution(), scope,
-		restoreDurationKey, nil, []phase{
-			{phasePrep, tPrep.Sub(tStart)},
-			{phaseBundles, tBundles.Sub(tPrep)},
-			{phaseUpperJoin, tUpper.Sub(tBundles)},
-			{phaseLowers, tLowers.Sub(tUpper)},
-			{phaseTap, tTap.Sub(tDurable)},
-			{phaseVMMLaunch, tLaunch.Sub(tTap)},
-			{phaseVMRestore, tVMRestore.Sub(tLaunch)},
-			{phaseResume, tResume.Sub(tVMRestore)},
-			{phaseWakeupProbe, dWakeupProbe},
-			{phaseTotal, dTotal},
+	ateomphaselog.LogSnapshotPhases(ctx, "Restore timing breakdown", p.actorAttribution(), scope,
+		ateomphaselog.RestoreDurationKey, nil, []ateomphaselog.Phase{
+			{Name: phasePrep, D: tPrep.Sub(tStart)},
+			{Name: phaseBundles, D: tBundles.Sub(tPrep)},
+			{Name: phaseUpperJoin, D: tUpper.Sub(tBundles)},
+			{Name: phaseLowers, D: tLowers.Sub(tUpper)},
+			{Name: phaseTap, D: tTap.Sub(tDurable)},
+			{Name: phaseVMMLaunch, D: tLaunch.Sub(tTap)},
+			{Name: phaseVMRestore, D: tVMRestore.Sub(tLaunch)},
+			{Name: phaseResume, D: tResume.Sub(tVMRestore)},
+			{Name: phaseWakeupProbe, D: dWakeupProbe},
+			{Name: phaseTotal, D: dTotal},
 		})
 
 	ra := &runningActor{

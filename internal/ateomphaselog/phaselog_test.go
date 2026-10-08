@@ -1,5 +1,3 @@
-//go:build linux
-
 // Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package ateomphaselog
 
 import (
 	"bytes"
@@ -55,15 +53,15 @@ func renderPhaseRecord(t *testing.T, attrs []slog.Attr) map[string]any {
 func TestSnapshotPhaseAttrs(t *testing.T) {
 	t.Parallel()
 
-	attrs := snapshotPhaseAttrs(phaseLogAttribution(), ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
-		checkpointDurationKey, nil, []phase{
-			{phasePrep, 40 * time.Millisecond},
-			{phasePause, 3 * time.Millisecond},
-			{phaseSnapshot, 850 * time.Millisecond},
+	attrs := SnapshotPhaseAttrs(phaseLogAttribution(), ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+		CheckpointDurationKey, nil, []Phase{
+			{Name: "prep", D: 40 * time.Millisecond},
+			{Name: "pause", D: 3 * time.Millisecond},
+			{Name: "snapshot", D: 850 * time.Millisecond},
 			// A capture that did not run stays off the record.
-			{phaseDurableDir, 0},
-			{phaseTeardown, 230 * time.Millisecond},
-			{phaseTotal, 1250 * time.Millisecond},
+			{Name: "durable_dir", D: 0},
+			{Name: "teardown", D: 230 * time.Millisecond},
+			{Name: ateattr.SnapshotPhaseTotal, D: 1250 * time.Millisecond},
 		})
 
 	// json.Unmarshal keeps the last of a repeated key, so a duplicate is
@@ -141,9 +139,13 @@ func TestSnapshotPhaseAttrsFailure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			rec := renderPhaseRecord(t, snapshotPhaseAttrs(phaseLogAttribution(),
-				ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL, checkpointDurationKey, tt.err,
-				[]phase{{phasePrep, 40 * time.Millisecond}, {phasePause, 3 * time.Millisecond}, {phaseTotal, 30 * time.Second}}))
+			rec := renderPhaseRecord(t, SnapshotPhaseAttrs(phaseLogAttribution(),
+				ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL, CheckpointDurationKey, tt.err,
+				[]Phase{
+					{Name: "prep", D: 40 * time.Millisecond},
+					{Name: "pause", D: 3 * time.Millisecond},
+					{Name: ateattr.SnapshotPhaseTotal, D: 30 * time.Second},
+				}))
 			if got := rec["error.type"]; got != tt.want {
 				t.Errorf("error.type = %v, want %q", got, tt.want)
 			}
@@ -174,8 +176,38 @@ func TestScopeLogValue(t *testing.T) {
 		{ateompb.SnapshotScope(99), ateattr.SnapshotScopeUnknown},
 	}
 	for _, tt := range tests {
-		if got := scopeLogValue(tt.scope); got != tt.want {
-			t.Errorf("scopeLogValue(%v) = %q, want %q", tt.scope, got, tt.want)
+		if got := ScopeLogValue(tt.scope); got != tt.want {
+			t.Errorf("ScopeLogValue(%v) = %q, want %q", tt.scope, got, tt.want)
 		}
+	}
+}
+
+// TestLogSnapshotPhases: the record goes out under the caller's message and
+// at Info, through the default logger the ateoms write to.
+func TestLogSnapshotPhases(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	LogSnapshotPhases(context.Background(), "Restore timing breakdown", phaseLogAttribution(),
+		ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA, RestoreDurationKey, nil,
+		[]Phase{{Name: ateattr.SnapshotPhaseTotal, D: 2 * time.Second}})
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("unmarshal record %q: %v", buf.String(), err)
+	}
+	if rec["msg"] != "Restore timing breakdown" {
+		t.Errorf("msg = %v, want %q", rec["msg"], "Restore timing breakdown")
+	}
+	if rec["level"] != "INFO" {
+		t.Errorf("level = %v, want INFO", rec["level"])
+	}
+	if rec["ate.snapshot.scope"] != ateattr.SnapshotScopeData {
+		t.Errorf("ate.snapshot.scope = %v, want %q", rec["ate.snapshot.scope"], ateattr.SnapshotScopeData)
+	}
+	if got := rec["ateom.actor.restore.duration.total"]; got != 2.0 {
+		t.Errorf("ateom.actor.restore.duration.total = %v, want 2", got)
 	}
 }
