@@ -333,7 +333,7 @@ A queue that has never processed an item bridges as an exponential histogram wit
 
 ### Scraping instead of pushing
 
-ateapi, atelet, atenet-router and the credential provider also serve every instrument on their Prometheus `/metrics` endpoint. A cluster that scrapes those endpoints sets `OTEL_METRICS_EXPORTER=none` on the components, so each series reaches the backend once. With `none` the components install no OTLP metric reader and keep the Prometheus one; traces and logs are unaffected. atecontroller then registers its instruments (`ate.workerpool.*`) on controller-runtime's registry, so the manager's `:8080` serves them next to the controller-runtime families. ateom serves no endpoint of its own, so leave the variable unset on the worker pods, or it exports no metrics at all. The variable accepts `otlp` (the default) and `none`; unlike `OTEL_LOGS_EXPORTER`, it takes no list and no `console`. Any other value logs a warning and keeps the OTLP export.
+ateapi, atelet, atenet-router and the credential provider also serve every instrument on their Prometheus `/metrics` endpoint. A cluster that scrapes those endpoints sets `OTEL_METRICS_EXPORTER=none` on the components, so each series reaches the backend once. With `none` the components install no OTLP metric reader and keep the Prometheus one; traces and logs are unaffected. atecontroller then registers its instruments (`ate.workerpool.*`) on controller-runtime's registry, so the manager's `:8080` serves them next to the controller-runtime families. ateom serves no endpoint of its own, so leave the variable unset on the worker pods, or it exports no metrics at all. The variable takes a comma-separated list, with the same rules as `OTEL_LOGS_EXPORTER`. `otlp` (the default) keeps the push, and `prometheus` or `none` stops it. `/metrics` stays on for each value. ateom serves no `/metrics`, so there `prometheus` is skipped as unknown with a warning, and the push stays on unless the variable is `none`.
 
 ### Local Metrics with Prometheus (Kind Cluster)
 
@@ -362,6 +362,8 @@ To explore metrics locally:
 Distributed tracing tracks the end-to-end flow of requests as they pass through the Agent Substrate gateway, router, worker pods, and external services.
 
 Agent Substrate samples traces by default. Each component roots parentless requests at a per-component ratio (10% on the control plane components, 1% at the atenet router), overridable per component through the standard `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` environment variables. Every component uses a parent based sampler, so a client can also force a request to be traced end to end (e.g. via the `--trace` flag). Agent Substrate leverages OpenTelemetry (OTel) for context propagation across the call stack. Each traced request generates a unique trace hash/ID, which you can use to inspect the detailed request lifecycle and span hierarchy inside Google Cloud Trace or Jaeger. See the per-component defaults table in [Tracing Best Practices](dev/best-practices/tracing.md).
+
+A component with `OTEL_TRACES_EXPORTER=none` exports no spans. It still samples and propagates trace context, so the traces of the components around it stay whole. The variable takes a comma-separated list, with the same rules as `OTEL_LOGS_EXPORTER`, and knows `otlp` (the default) and `none`.
 
 ### Local Tracing with Jaeger (Kind Cluster)
 
