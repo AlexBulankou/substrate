@@ -46,9 +46,9 @@ var excludedTrees = []string{
 // layout, configure the rest), or a string nothing verifies against.
 var allowedLiterals = map[string][]string{
 	// Flag defaults, overridden by the deployment or the e2e manifest templates.
-	"cmd/atecontroller/main.go":                       {"k8s:///api.ate-system.svc:443"},
+	"cmd/atecontroller/main.go":                       {"k8s:///api.ate-system.svc:443", "api.ate-system.svc"},
 	"cmd/atelet/main.go":                              {"k8s:///api.ate-system.svc:443", "api.ate-system.svc"},
-	"cmd/atenet/internal/router/cmd.go":               {"k8s:///api.ate-system.svc:443", "spiffe://cluster.local/"},
+	"cmd/atenet/internal/router/cmd.go":               {"k8s:///api.ate-system.svc:443", "spiffe://cluster.local/", "api.ate-system.svc"},
 	"internal/e2e/fixtures/testserver/egressprobe.go": {"atenet-egress.ate-system.svc:443"},
 	// Env-var defaults, overridden by ATE_* / E2E_* variables.
 	"internal/ateclient/builder.go": {"api.ate-system.svc"},

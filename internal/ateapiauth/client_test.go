@@ -93,6 +93,10 @@ func TestDialOptionsMTLSHandshake(t *testing.T) {
 			K8sClient:        fake.NewSimpleClientset(),
 			CAFile:           caFile,
 			ClientCredBundle: clientBundle,
+			// The test server certificate carries 127.0.0.1 as an IP SAN and
+			// no DNS name; naming it keeps hostname verification on, which
+			// PrepareClientTLSConfig now requires.
+			ServerName: "127.0.0.1",
 		})
 		if err != nil {
 			t.Fatalf("DialOptions() error = %v", err)
@@ -146,6 +150,7 @@ func TestDialOptionsReloadsCAFile(t *testing.T) {
 		K8sClient:        fake.NewSimpleClientset(),
 		CAFile:           caFile,
 		ClientCredBundle: clientBundle,
+		ServerName:       "127.0.0.1",
 	})
 	if err != nil {
 		t.Fatalf("DialOptions() error = %v", err)
