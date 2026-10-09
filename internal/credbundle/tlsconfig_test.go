@@ -44,8 +44,15 @@ func TestPrepareClientTLSConfigRequiresFields(t *testing.T) {
 		name string
 		cfg  ClientConfig
 	}{
-		{"no GetClientCertificate", ClientConfig{TrustBundlePath: trustPath}},
-		{"no TrustBundlePath", ClientConfig{GetClientCertificate: ClientLoader(trustPath)}},
+		{"no GetClientCertificate", ClientConfig{TrustBundlePath: trustPath, ServerName: "server.test"}},
+		{"no TrustBundlePath", ClientConfig{GetClientCertificate: ClientLoader(trustPath), ServerName: "server.test"}},
+		// Neither a DNS name to check nor a peer verifier: nothing binds the
+		// server's identity, and the VerifyConnection below would accept any
+		// certificate chaining to the trust bundle from any host.
+		{"neither ServerName nor VerifyPeer", ClientConfig{
+			GetClientCertificate: ClientLoader(trustPath),
+			TrustBundlePath:      trustPath,
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -57,12 +64,83 @@ func TestPrepareClientTLSConfigRequiresFields(t *testing.T) {
 }
 
 func TestPrepareClientTLSConfigRejectsUnreadableTrustBundle(t *testing.T) {
+	// ServerName is set so the identity-binding check cannot be what fails:
+	// this test is about the unreadable bundle, and an assertion that only
+	// looks for "some error" would still pass if an earlier guard tripped.
 	cfg := ClientConfig{
 		GetClientCertificate: ClientLoader(writeBundle(t, makeTrustBundle(t, 1))),
 		TrustBundlePath:      filepath.Join(t.TempDir(), "absent.pem"),
+		ServerName:           "server.test",
 	}
 	if _, err := PrepareClientTLSConfig(cfg); err == nil {
 		t.Fatalf("PrepareClientTLSConfig() error = nil, want a missing-file error")
+	}
+}
+
+// An empty ServerName is passed straight through to x509.VerifyOptions.DNSName,
+// where it means "do not check the hostname" -- so without the identity-binding
+// guard this handshake succeeds against a certificate issued for an entirely
+// different host, as long as it chains to the trust bundle. Standard crypto/tls
+// refuses the same combination outright; a hand-rolled VerifyConnection has to
+// refuse it itself.
+func TestPrepareClientTLSConfigRefusesUnboundServerIdentity(t *testing.T) {
+	serverCA := newTestCA(t, "server-ca")
+	clientTrust := writeBundle(t, serverCA.certPEM)
+	clientCA := newTestCA(t, "client-ca")
+	clientBundle := writeCredBundle(t, clientCA.issue(t, certOpts{}))
+
+	_, err := PrepareClientTLSConfig(ClientConfig{
+		GetClientCertificate: ClientLoader(clientBundle),
+		TrustBundlePath:      clientTrust,
+	})
+	if err == nil {
+		t.Fatal("PrepareClientTLSConfig() with no ServerName and no VerifyPeer: error = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "ServerName is required") {
+		t.Fatalf("PrepareClientTLSConfig() error = %v, want it to name the missing ServerName", err)
+	}
+
+	// VerifyPeer is the documented alternative for a caller with no DNS name
+	// to check -- a node-local SPIFFE dial, say -- so it must still build.
+	if _, err := PrepareClientTLSConfig(ClientConfig{
+		GetClientCertificate: ClientLoader(clientBundle),
+		TrustBundlePath:      clientTrust,
+		VerifyPeer:           func(tls.ConnectionState) error { return nil },
+	}); err != nil {
+		t.Fatalf("PrepareClientTLSConfig() with VerifyPeer and no ServerName: error = %v, want it to build", err)
+	}
+}
+
+// The gap the guard closes, end to end: a server presenting a certificate for
+// "other.test" completes a handshake with a client that named no host at all.
+// Skipped once the guard is in place, since the config no longer builds -- the
+// point is that this is what the guard is preventing, not a behaviour to keep.
+func TestUnboundClientWouldAcceptAnyHostname(t *testing.T) {
+	serverCA := newTestCA(t, "server-ca")
+	serverBundle := writeCredBundle(t, serverCA.issue(t, certOpts{dnsNames: []string{"other.test"}}))
+	clientTrust := writeBundle(t, serverCA.certPEM)
+	clientCA := newTestCA(t, "client-ca")
+	clientBundle := writeCredBundle(t, clientCA.issue(t, certOpts{}))
+	serverTrust := writeBundle(t, clientCA.certPEM)
+
+	serverCfg, err := PrepareServerTLSConfig(ServerConfig{
+		CertPath:     serverBundle,
+		ClientCAPath: serverTrust,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	})
+	if err != nil {
+		t.Fatalf("PrepareServerTLSConfig() error = %v", err)
+	}
+
+	clientCfg, err := PrepareClientTLSConfig(ClientConfig{
+		GetClientCertificate: ClientLoader(clientBundle),
+		TrustBundlePath:      clientTrust,
+	})
+	if err != nil {
+		t.Skipf("unbound client config is refused at construction, which is the fix: %v", err)
+	}
+	if serverErr, clientErr := handshake(t, serverCredentials(serverCfg), clientCfg); !failed(serverErr, clientErr) {
+		t.Fatal("handshake against a certificate for an unrelated host succeeded: hostname verification is off")
 	}
 }
 
