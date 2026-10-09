@@ -409,6 +409,85 @@ func TestPrepareServerTLSConfigWithoutClientCA(t *testing.T) {
 	}
 }
 
+func TestPrepareServerTLSConfigRefusesUncheckableClientAuth(t *testing.T) {
+	serverCA := newTestCA(t, "server-ca")
+	serverBundle := writeCredBundle(t, serverCA.issue(t, certOpts{uris: []string{testServerID}, dnsNames: []string{"server.test"}}))
+
+	// Both of these ask for a check the no-pinned-pool path cannot perform.
+	for _, tc := range []struct {
+		name string
+		cfg  ServerConfig
+		want string
+	}{
+		{
+			name: "VerifyPeer with no client pool",
+			cfg:  ServerConfig{CertPath: serverBundle, ClientAuth: tls.VerifyClientCertIfGiven, VerifyPeer: verifyPeerURI(testClientID)},
+			want: "VerifyPeer",
+		},
+		{
+			name: "RequireAndVerifyClientCert with no client pool",
+			cfg:  ServerConfig{CertPath: serverBundle, ClientAuth: tls.RequireAndVerifyClientCert},
+			want: "RequireAndVerifyClientCert",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := PrepareServerTLSConfig(tc.cfg)
+			if err == nil {
+				t.Fatalf("PrepareServerTLSConfig() error = nil, want a refusal")
+			}
+			if !strings.Contains(err.Error(), "ClientCAPath") || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("PrepareServerTLSConfig() error = %q, want it to name ClientCAPath and %s", err, tc.want)
+			}
+		})
+	}
+
+	// The deliberate no-pinned-pool mode — advisory client certificates, no
+	// VerifyPeer — must keep building, or the guard above has broken a real
+	// caller rather than a mistake.
+	if _, err := PrepareServerTLSConfig(ServerConfig{
+		CertPath:   serverBundle,
+		ClientAuth: tls.VerifyClientCertIfGiven,
+	}); err != nil {
+		t.Fatalf("PrepareServerTLSConfig() with advisory client certs and no VerifyPeer: error = %v, want it to build", err)
+	}
+}
+
+// TestUnpooledServerWouldSkipVerifyPeer demonstrates the gap the VerifyPeer
+// half of the guard closes. The no-pinned-pool path builds no
+// VerifyConnection, so a VerifyPeer that rejects every peer is never
+// consulted and the handshake completes — the identity check is not failed
+// open by a lenient callback, it is not run at all.
+func TestUnpooledServerWouldSkipVerifyPeer(t *testing.T) {
+	serverCA := newTestCA(t, "server-ca")
+	serverBundle := writeCredBundle(t, serverCA.issue(t, certOpts{uris: []string{testServerID}, dnsNames: []string{"server.test"}}))
+
+	called := false
+	serverCfg, err := PrepareServerTLSConfig(ServerConfig{
+		CertPath:   serverBundle,
+		ClientAuth: tls.VerifyClientCertIfGiven,
+		VerifyPeer: func(tls.ConnectionState) error {
+			called = true
+			return errors.New("no peer is acceptable")
+		},
+	})
+	if err != nil {
+		t.Skipf("guard in place: PrepareServerTLSConfig() refused the unpooled VerifyPeer config (%v)", err)
+	}
+
+	client := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    rootsOf(serverCA),
+		ServerName: "server.test",
+	}
+	if serverErr, clientErr := handshake(t, serverCredentials(serverCfg), client); failed(serverErr, clientErr) {
+		t.Fatalf("handshake failed for an unrelated reason: (%v, %v)", serverErr, clientErr)
+	}
+	if called {
+		t.Fatal("VerifyPeer ran: the gap this test documents is not present")
+	}
+	t.Fatal("handshake succeeded with a VerifyPeer that rejects every peer: the identity check was never run")
+}
+
 // verifyPeerURI returns a VerifyPeer callback requiring expected among the
 // peer leaf certificate's URI SANs, mirroring the SPIFFE-identity checks the
 // real call sites layer on top of chain verification.

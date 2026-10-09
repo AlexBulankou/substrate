@@ -133,6 +133,10 @@ type ServerConfig struct {
 	// presented client certificate (if any) chains against the platform root
 	// CAs instead of a pinned pool — crypto/tls's own behavior for a nil
 	// ClientCAs, not a check this package adds.
+	//
+	// Required when ClientAuth is tls.RequireAndVerifyClientCert, and required
+	// when VerifyPeer is set: see PrepareServerTLSConfig. Leaving it empty is
+	// a mode only for a server that deliberately does not pin a client pool.
 	ClientCAPath string
 
 	// ClientAuth is the client certificate policy, e.g.
@@ -157,9 +161,33 @@ type ServerConfig struct {
 // PoolLoader) there and lets the standard library verify the client
 // certificate's chain against it — no InsecureSkipVerify or manual
 // verification needed. VerifyPeer layers on any identity check beyond that.
+//
+// An empty ClientCAPath takes the no-pinned-pool path below, which builds
+// neither ClientCAs nor VerifyConnection. That is a legitimate mode for a
+// server whose client certificates are advisory, but it silently removes two
+// checks a caller may believe it asked for: tls.RequireAndVerifyClientCert
+// then verifies against the platform roots rather than a pinned pool, and
+// VerifyPeer is never called at all, because the one input that skips chain
+// verification also skips the hook meant to express what the chain cannot.
+// Both combinations are refused below, so the failure is a startup error
+// naming the missing path instead of a quietly weaker handshake.
 func PrepareServerTLSConfig(cfg ServerConfig) (*tls.Config, error) {
 	if cfg.CertPath == "" {
 		return nil, fmt.Errorf("credbundle: CertPath is required")
+	}
+	if cfg.ClientCAPath == "" {
+		if cfg.VerifyPeer != nil {
+			return nil, fmt.Errorf("credbundle: ClientCAPath is required when " +
+				"VerifyPeer is set: without a client pool there is no " +
+				"VerifyConnection to run VerifyPeer from, so the identity " +
+				"check would be skipped rather than enforced")
+		}
+		if cfg.ClientAuth == tls.RequireAndVerifyClientCert {
+			return nil, fmt.Errorf("credbundle: ClientCAPath is required when " +
+				"ClientAuth is RequireAndVerifyClientCert: with ClientCAs " +
+				"left nil the client certificate is verified against the " +
+				"platform root CAs, not a pinned pool")
+		}
 	}
 
 	getCertificate := Loader(cfg.CertPath)
