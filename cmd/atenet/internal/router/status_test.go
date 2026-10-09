@@ -71,6 +71,11 @@ func TestStatuszEndpoint(t *testing.T) {
 		Auth: authConfig{
 			AteapiCAFile:         caPath,
 			AteapiClientCertPath: clientCertPath,
+			// PrepareClientTLSConfig refuses a config that binds no server
+			// identity, and Run() builds one before the status server binds.
+			// The dial itself is never completed by this test, so any name
+			// serves; use the one the flag now defaults to.
+			AteapiServerName: "api.ate-system.svc",
 		},
 	}
 
