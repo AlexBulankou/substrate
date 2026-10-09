@@ -32,12 +32,17 @@ type ClientConfig struct {
 	TrustBundlePath string
 
 	// ServerName, if set, is checked against the server certificate's DNS SANs
-	// as part of chain verification.
+	// as part of chain verification. Required unless VerifyPeer is set: see
+	// PrepareClientTLSConfig.
 	ServerName string
 
 	// VerifyPeer, if set, runs after the server certificate has chained to
 	// TrustBundlePath, to check an identity chain verification cannot express
 	// — a SPIFFE URI SAN, for example. Returning an error fails the handshake.
+	//
+	// Supplying it is how a caller that has no DNS name to check — a
+	// node-local dial over a SPIFFE identity, say — satisfies the
+	// identity-binding requirement PrepareClientTLSConfig enforces.
 	VerifyPeer func(tls.ConnectionState) error
 
 	NextProtos []string
@@ -52,12 +57,28 @@ type ClientConfig struct {
 // VerifyConnection, reloading the trust pool (via PoolLoader) on every
 // handshake: an unchanged file costs a stat, and a rotated one is picked up on
 // the next connection without a restart.
+//
+// Because that reimplementation passes ServerName through as
+// x509.VerifyOptions.DNSName, an EMPTY ServerName does not fall back to some
+// weaker hostname check — it disables hostname verification outright, and the
+// handshake then accepts any certificate that chains to the trust bundle,
+// whichever host presented it. Standard crypto/tls refuses that combination
+// ("either ServerName or InsecureSkipVerify must be specified"); a hand-rolled
+// VerifyConnection has to refuse it itself, which is what the check below
+// does. Callers with no DNS name to check supply VerifyPeer instead: that
+// binds the peer's identity some other way, so the config is still closed.
 func PrepareClientTLSConfig(cfg ClientConfig) (*tls.Config, error) {
 	if cfg.GetClientCertificate == nil {
 		return nil, fmt.Errorf("credbundle: GetClientCertificate is required")
 	}
 	if cfg.TrustBundlePath == "" {
 		return nil, fmt.Errorf("credbundle: TrustBundlePath is required")
+	}
+	if cfg.ServerName == "" && cfg.VerifyPeer == nil {
+		return nil, fmt.Errorf("credbundle: ServerName is required unless " +
+			"VerifyPeer is set: with neither, nothing binds the server's " +
+			"identity and any certificate chaining to the trust bundle is " +
+			"accepted from any host")
 	}
 
 	loadRoots := PoolLoader(cfg.TrustBundlePath)
