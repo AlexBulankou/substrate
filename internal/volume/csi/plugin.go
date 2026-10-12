@@ -462,6 +462,17 @@ func resolveTLSConfig(cfg *v1alpha1.CSIDriverConfig, paths tlsPaths) (*tls.Confi
 		return nil, fmt.Errorf("only pod identity TLS is supported in this configuration")
 	}
 
+	// serverName is the only thing that binds the connection to a particular
+	// driver: VerifyConnection below passes it as x509.VerifyOptions.DNSName,
+	// and crypto/x509 checks the name only when DNSName is non-empty. Left
+	// unset, the handshake would accept any certificate the trusted CA has
+	// ever issued -- including one for an unrelated workload. Refuse the
+	// config rather than silently serve an unauthenticated channel.
+	if tlsCfg.ServerName == "" {
+		return nil, fmt.Errorf("spec.tls.serverName must be set when TLS is enabled: " +
+			"without it the server certificate's identity is not verified")
+	}
+
 	caCache := newCAPoolCache(paths.caCert)
 
 	// Verify CA pool exists, is readable, and populate the initial cache.

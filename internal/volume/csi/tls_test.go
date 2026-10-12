@@ -298,6 +298,24 @@ func TestResolveTLSConfigRejectsManualCerts(t *testing.T) {
 	}
 }
 
+// TestResolveTLSConfigRequiresServerName pins the refusal that keeps an
+// unset serverName from silently disabling identity verification: it is
+// passed to x509.VerifyOptions.DNSName, and crypto/x509 checks the name only
+// when DNSName is non-empty, so an empty one accepts any certificate the
+// trusted CA has issued.
+func TestResolveTLSConfigRequiresServerName(t *testing.T) {
+	t.Parallel()
+	ca := newTestCA(t)
+	paths := writeCreds(t, ca.clientBundle(t), ca.certPEM())
+
+	if _, err := resolveTLSConfig(driverConfig("", &v1alpha1.CSIDriverTLSConfig{
+		Enabled:        true,
+		UsePodIdentity: true,
+	}), paths); err == nil {
+		t.Fatal("resolveTLSConfig accepted an empty serverName; the server certificate's identity would not be verified")
+	}
+}
+
 func TestResolveTLSConfigFields(t *testing.T) {
 	t.Parallel()
 	const serverName = "my-service.default.svc"
