@@ -49,6 +49,16 @@ const (
 	// eventActionResolveSandboxConfig is the action of every event the pool
 	// emits while resolving its SandboxConfigs.
 	eventActionResolveSandboxConfig = "ResolveSandboxConfig"
+	// eventReasonApplyFailed is the reason of the Warning event a pool emits
+	// when the apply of its managed Deployment fails.
+	eventReasonApplyFailed = "ApplyFailed"
+	// eventActionApplyDeployment is the action of every event the pool emits
+	// while reconciling its managed Deployment.
+	//
+	// Reasons and actions are stable identifiers operators filter on
+	// (`--field-selector reason=...`), so treat them as part of the surface:
+	// rename with the same care as a status field.
+	eventActionApplyDeployment = "ApplyDeployment"
 )
 
 type WorkerPoolReconciler struct {
@@ -79,8 +89,11 @@ type WorkerPoolReconciler struct {
 	SystemNamespace      string
 	AteletServiceAccount string
 	RouterServiceAccount string
-	// Recorder emits a Normal event each time a pool's SandboxConfig
-	// changes, and a Warning event when a class stops resolving.
+	// Recorder publishes the reconciler's events onto the WorkerPool, which is
+	// where an operator reading `kubectl describe` looks first: a Normal event
+	// each time a pool's SandboxConfig changes, a Warning when a class stops
+	// resolving, a Warning when the managed Deployment fails to apply, and a
+	// Normal on each status transition.
 	Recorder events.EventRecorder
 	// APIReader reads a SandboxConfig straight from the API server, not from
 	// the cache. It confirms a config the pool switches to, once status has
@@ -324,6 +337,12 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
 		LogsExporter:         r.OTelLogsExporter,
 	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount)
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
+		// The failure path is the one an operator most needs a breadcrumb for:
+		// without it, a Deployment that never appears is only visible in the
+		// controller's own logs, which assumes cluster-log access. Emitted
+		// here rather than at the call sites so both of them are covered.
+		r.Recorder.Eventf(wp, nil, corev1.EventTypeWarning, eventReasonApplyFailed, eventActionApplyDeployment,
+			"failed to apply Deployment %s: %v", wp.Name, err)
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
 	return nil
@@ -368,6 +387,14 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
 		return fmt.Errorf("failed to update WorkerPool status: %w", err)
 	}
 
+	// No Normal event on this path. A "synced" event would fire on every
+	// persisted status change, including replica churn, which says nothing
+	// `kubectl get` does not say better -- and the two questions it would
+	// answer are already answered elsewhere: recordSandboxConfigEvents emits
+	// on the transition an operator cares about, and status.observedGeneration
+	// reports whether the controller has acted on the current spec as a level
+	// field rather than an edge. What this reconciler was missing is the
+	// failure breadcrumb, which applyDeployment emits.
 	return nil
 }
 
@@ -428,6 +455,13 @@ func (r *WorkerPoolReconciler) InitMetrics(meter metric.Meter) error {
 // WorkerPool is reconciled when it changes, when its Deployment changes, and
 // when a SandboxConfig that can change its resolution changes.
 func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Refuse to start rather than run with events silently disabled. A nil
+	// Recorder is the exact failure this instrumentation exists to fix -- a
+	// controller that reconciles fine and emits nothing -- so it fails closed
+	// at startup instead of being discovered from an empty `kubectl describe`.
+	if r.Recorder == nil {
+		return fmt.Errorf("WorkerPoolReconciler: Recorder must be set")
+	}
 	if err := r.InitMetrics(otel.Meter("atecontroller")); err != nil {
 		return fmt.Errorf("failed to initialize workerpool metrics: %w", err)
 	}

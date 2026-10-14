@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -88,7 +89,7 @@ func rootPEM(t *testing.T, pool *localca.ConcretePool) string {
 
 func reconcilePool(t *testing.T, c client.Client) error {
 	t.Helper()
-	r := &EgressMITMTrustReconciler{Client: c, SystemNamespace: installdefaults.SystemNamespace, bundleV1: true}
+	r := &EgressMITMTrustReconciler{Client: c, SystemNamespace: installdefaults.SystemNamespace, bundleV1: true, Recorder: events.NewFakeRecorder(10)}
 	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: EgressMITMCAPoolRef(installdefaults.SystemNamespace)})
 	return err
 }
@@ -313,7 +314,7 @@ func TestEgressMITMTrustAPIVersions(t *testing.T) {
 			ctx := t.Context()
 			secret, pool := caPoolSecret(t, "initial")
 			c := fake.NewClientBuilder().WithScheme(egressMITMScheme(t)).WithObjects(secret).Build()
-			r := &EgressMITMTrustReconciler{Client: c, SystemNamespace: installdefaults.SystemNamespace, bundleV1: stable}
+			r := &EgressMITMTrustReconciler{Client: c, SystemNamespace: installdefaults.SystemNamespace, bundleV1: stable, Recorder: events.NewFakeRecorder(10)}
 			reconcile := func() {
 				t.Helper()
 				if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: EgressMITMCAPoolRef(r.SystemNamespace)}); err != nil {
