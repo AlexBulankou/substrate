@@ -32,6 +32,8 @@ import (
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/internal/volume"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -676,6 +678,11 @@ func canRelaxRuntime(actor *ateapipb.Actor, constraints scheduling.Constraints) 
 	if snap.GetLocality() == "" {
 		return true
 	}
+	// Its node was deleted, so it restores from its upload, as a durable
+	// snapshot does.
+	if localElsewhere(snap, status.GetAssignedNode()) {
+		return true
+	}
 	return snap.GetDurableSnapshot().GetStatus() == ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
 }
 
@@ -810,7 +817,7 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 
 	slog.InfoContext(ctx, "Actor has snapshot; Restoring from snapshot", slog.String("snapshot_uuid", snap.GetUuid()))
 	tele.SnapshotKind = ateattr.SnapshotKindLatest
-	if snap.GetLocality() != "" {
+	if snap.GetLocality() != "" && snap.GetLocality() == assignment.GetNodeName() {
 		tele.SnapshotKind = ateattr.SnapshotKindLocal
 	}
 
@@ -857,6 +864,13 @@ func (w *ActorWorkflow) ensureAteletRestored(ctx context.Context, actorRef resou
 	}
 	resp, err := client.Restore(ctx, req)
 	if err != nil {
+		// The snapshot's node is gone, and atelet found no upload of it.
+		if ctx.Err() == nil && status.Code(err) == codes.NotFound && localElsewhere(snap, assignment.GetNodeName()) {
+			slog.LogAttrs(ctx, slog.LevelError, "Setting Actor to crashed due to Atelet error",
+				append(ateattr.ActorRefLogAttrs(actorRef), slog.Any("err", err))...)
+			message := fmt.Sprintf("%s: %s", crashMessageLocalSnapshotNodeGone, ateletCrashMessage("Restore", err))
+			return tele, 0, crashActorAndFail(ctx, w.store, actorRef, ateattr.OperationResume, message)
+		}
 		return tele, 0, handleAteletError(ctx, w.store, actorRef, ateattr.OperationResume, "Restore", false, err)
 	}
 	return tele, resp.GetWorkerEpoch(), nil
@@ -922,6 +936,12 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
 		toUpdate.Status.WorkerAssignment.WorkerEpoch = workerEpoch
 		toUpdate.Status.WorkerAssignment.WorkerPodIps = slices.Clone(worker.GetStatus().GetIps())
+		// The workload already runs, so a record that can't take the upload
+		// doesn't hold the actor in RESUMING. The next suspend prunes the entry.
+		if err := recordRestoredUpload(ctx, toUpdate.Status); err != nil {
+			slog.WarnContext(ctx, "Restored a snapshot from its upload but could not record the upload",
+				slog.Any("actor", actorRef), slog.Any("err", err))
+		}
 		return nil
 	})
 	if err != nil {
@@ -932,4 +952,25 @@ func (w *ActorWorkflow) finalizeRunning(ctx context.Context, actorRef resources.
 	}
 	logActorStateChanged(ctx, storedActor, ateattr.OperationResume)
 	return storedActor, nil
+}
+
+// recordRestoredUpload records the upload of a snapshot that resume restored
+// on another node after its own node was deleted. The restore proved the
+// upload complete, and the deleted node no longer holds a copy. On an error
+// it leaves status unchanged.
+func recordRestoredUpload(ctx context.Context, status *ateapipb.ActorStatus) error {
+	snap := snapshotToResume(status)
+	if !localElsewhere(snap, status.GetAssignedNode()) {
+		return nil
+	}
+	node := snap.GetLocality()
+	if err := applyLatestDurable(ctx, status, &ateapipb.SnapshotReport{
+		Uuid:       snap.GetUuid(),
+		Generation: snap.GetGeneration(),
+		Fidelity:   snap.GetFidelity(),
+		Object:     snap.GetDurableSnapshot().GetObject(),
+	}); err != nil {
+		return err
+	}
+	return applyDetach(status, node, snap.GetGeneration())
 }
