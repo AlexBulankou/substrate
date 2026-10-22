@@ -96,7 +96,7 @@ func TestActorEgressMITMTrust(t *testing.T) {
 
 	const id = "probe-mitm"
 	createAndResumeActor(t, ctx, clients, id, mitm, passthrough)
-	waitForActorState(t, ctx, clients, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	waitForActorState(t, ctx, clients, probeNamespace, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
 
 	rc, err := e2e.NewRouterClient(t, ctx)
 	if err != nil {
@@ -371,12 +371,12 @@ func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Client
 	}
 }
 
-func waitForActorState(t *testing.T, ctx context.Context, clients *e2e.Clients, actorName string, want ateapipb.ActorState) {
+func waitForActorState(t *testing.T, ctx context.Context, clients *e2e.Clients, atespace, actorName string, want ateapipb.ActorState) {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-			Actor: &ateapipb.ObjectRef{Atespace: probeNamespace, Name: actorName},
+			Actor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
 		})
 		if err == nil && resp.GetStatus().GetState() == want {
 			return

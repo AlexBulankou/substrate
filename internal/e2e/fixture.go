@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +88,24 @@ func decodeSubstrateTemplates(t *testing.T, rendered []byte) []*ateapipb.ActorTe
 	return templates
 }
 
+// FixtureOption adjusts what DeploySubstrateFixture installs.
+type FixtureOption func(*fixtureConfig)
+
+type fixtureConfig struct {
+	templateValues map[string]string
+}
+
+// WithTemplateValue replaces the inline placeholder ${name} in the fixture's
+// ActorTemplate manifest with value.
+func WithTemplateValue(name, value string) FixtureOption {
+	return func(c *fixtureConfig) {
+		if c.templateValues == nil {
+			c.templateValues = map[string]string{}
+		}
+		c.templateValues["${"+name+"}"] = value
+	}
+}
+
 // SubstrateFixtureManifests names the two manifest templates a substrate
 // fixture is built from (both repo-relative, under internal/e2e/fixtures).
 type SubstrateFixtureManifests struct {
@@ -115,8 +134,13 @@ type SubstrateFixtureManifests struct {
 //
 // Returns the fixture's atespace (the same string that names the k8s
 // namespace holding the pool) and the created templates.
-func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients, manifests SubstrateFixtureManifests, bucket, name string, trustBundles []string) (string, []*ateapipb.ActorTemplate) {
+func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients, manifests SubstrateFixtureManifests, bucket, name string, trustBundles []string, opts ...FixtureOption) (string, []*ateapipb.ActorTemplate) {
 	t.Helper()
+
+	var cfg fixtureConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 
 	// The pool manifest also carries the namespace. Its cleanup is registered
 	// first so it runs last (t.Cleanup is LIFO), after the templates that
@@ -133,6 +157,7 @@ func DeploySubstrateFixture(t *testing.T, ctx context.Context, clients *Clients,
 	})
 
 	tmplInline, tmplBlocks := substrateTemplateSubstitutions(bucket, name, trustBundles)
+	maps.Copy(tmplInline, cfg.templateValues)
 	rendered := koResolve(t, renderManifest(t, manifests.Template, tmplInline, tmplBlocks))
 	templates := decodeSubstrateTemplates(t, rendered)
 
