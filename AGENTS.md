@@ -105,7 +105,8 @@ The dev entry points are the scripts under `hack/` and the `cmd/ate-setup` insta
 ### Building and Installing
 - **Install from source**: `go run ./cmd/ate-setup deploy ate-system` (or the `hack/install-ate.sh` shim) builds every image with ko as part of the install; see `cmd/ate-setup/README.md`
 - **Binaries**: `go build -o bin/kubectl-ate ./cmd/kubectl-ate`, `go build -o bin/ate-setup ./cmd/ate-setup`
-- **Release images**: `VERSION=TAG go run ./cmd/ate-setup publish release-images --ko-docker-repo REPO` (every image a pre-built install needs, all tagged `TAG`, including the docker-built `envoy-dataplane`)
+- **Release images**: `VERSION=TAG go run ./cmd/ate-setup publish release-images --ko-docker-repo REPO` (the release set, `images.ReleaseComponents`, all tagged `TAG`; see `docs/dev/releasing.md`)
+- **Release binaries**: `VERSION=TAG go run ./cmd/ate-setup publish release-binaries --out DIR` (`kubectl-ate` for linux and darwin, amd64 and arm64, with `.sha256` files)
 
 ### Testing and Verification
 - **Run Unit Tests**: `go test -race ./...`

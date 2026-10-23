@@ -1133,8 +1133,10 @@ func TestApplyOtelEndpointOverride(t *testing.T) {
 }
 
 // A pre-built install renders the envoy router, egress, and system manifests
-// without building anything: envoy-dataplane is pinned from the release like
-// every ko image, so neither docker nor KO_DOCKER_REPO is needed.
+// without building anything: envoy-dataplane is pinned from the image
+// repository like every ko image, so neither docker nor KO_DOCKER_REPO is
+// needed. Releases do not publish it, so this holds for a repository someone
+// published it to.
 func TestRenderAtenetEgressManifestPrebuilt(t *testing.T) {
 	const digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	src := images.Source{Repo: "example.com/substrate", Tag: "v1.2.3"}
@@ -1186,9 +1188,9 @@ func TestRenderAtenetEgressManifestPrebuilt(t *testing.T) {
 	}
 }
 
-// A release that did not publish envoy-dataplane fails the install with a
-// message naming the image and the command that publishes it, rather than a bare
-// registry error.
+// An install from release images that needs envoy-dataplane fails with a
+// message saying releases do not publish it and how to proceed, rather than a
+// bare registry error.
 func TestDockerfileImagePrebuiltNotPublished(t *testing.T) {
 	src := images.Source{Repo: "example.com/substrate", Tag: "v1.2.3"}
 	e := &Env{
@@ -1203,7 +1205,8 @@ func TestDockerfileImagePrebuiltNotPublished(t *testing.T) {
 		t.Fatal("dockerfileImage() error = nil, want one")
 	}
 	for _, want := range []string{
-		"ate-setup publish release-images",
+		"envoy-dataplane is built from a Dockerfile, and releases do not publish it",
+		"--atenet-dataplane=agentgateway",
 		"resolving example.com/substrate/envoy-dataplane:v1.2.3 to a digest: MANIFEST_UNKNOWN",
 	} {
 		if !strings.Contains(err.Error(), want) {
