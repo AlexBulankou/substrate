@@ -38,7 +38,7 @@ import (
 // During checkpoint, moving the sentry from <uid>-_sandbox into a sibling
 // <uid>-_ckpt cgroup (memory.max = "max", cpu.max copied from <uid>-_sandbox)
 // prevents newly written pages.img cache from evicting clean pages or
-// OOM-killing the sentry under the actor's memory.max. Removing <uid>-_ckpt
+// throttling the sentry under the actor's memory.high. Removing <uid>-_ckpt
 // after sandbox teardown reparents the cache to the worker scope for fast
 // local Resume, and dropActorCheckpointCacheAsync unlinks non-preserved files
 // in the restore dir or evicts preserved checkpoint page cache via

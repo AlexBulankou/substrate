@@ -159,7 +159,7 @@ continue to work.
 Unlike a Pod, an actor is sized by its **`limits`** (CPU and Memory): the size is a property of the template, baked into snapshots, so it lives on the immutable `ActorTemplate`. Both are required. Declared limits do two things:
 
 1. **Size the sandbox.** The limits are supplied to the sandbox over the actor RPCs (control plane → atelet → ateworker):
-   - **gVisor (`ateworker-gvisor`)** — applied to the container OCI spec: `limits.cpuMillicores` sets the cgroup v2 CPU quota (`cpu.max`) and the Sentry vCPU count (`--cpu-num-from-quota`); `limits.memoryBytes` sets the cgroup v2 memory limit (`memory.max`) and bounds the virtual total memory the sandbox reports (so JVM/Go do not over-allocate from host RAM).
+   - **gVisor (`ateworker-gvisor`)** — applied to the container OCI spec: `limits.cpuMillicores` sets the cgroup v2 CPU quota (`cpu.max`) and the Sentry vCPU count (`--cpu-num-from-quota`); `limits.memoryBytes` caps the sandbox's memory and bounds the virtual total memory it reports (so JVM/Go do not over-allocate from host RAM). When the node's kernel has cgroup memory pressure (PSI) enabled, an actor that stays over its limit is killed and reported crashed, and other actors on its worker keep running.
    - **microVM (`ateworker-microvm`)** — `limits.cpuMillicores` sets Cloud Hypervisor `BootVcpus` / `MaxVcpus` (rounded up to whole vCPUs); `limits.memoryBytes` sets guest RAM, reserving a small configurable margin (default 256 MiB, `--vmm-mem-reserve-mib`) for the VMM and virtiofsd so the pod cgroup does not OOM.
 2. **Gate scheduling.** An actor is only placed on a `WorkerPool` whose [worker capacity](#worker-capacity-spectemplateresources) is `>=` these limits.
 
