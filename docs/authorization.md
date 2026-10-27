@@ -229,6 +229,9 @@ certificate.
 
 - An RPC with no rule is denied, and a test fails the build if a served RPC
   has none.
+- gRPC reflection is open to any authenticated caller, like Kubernetes API
+  discovery, since it returns only the API schema, which is public in
+  `api/ateapi/v1/ateapi.proto`. Any other streaming RPC is denied.
 - An unauthenticated caller gets `Unauthenticated` before its request is read.
 - A missing or invalid resource name returns `InvalidArgument`; no check is
   skipped.
