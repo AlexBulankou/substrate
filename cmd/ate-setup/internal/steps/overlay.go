@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/kustomize"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
@@ -33,10 +34,6 @@ import (
 const (
 	// installDir is the manifest root, relative to the repository root.
 	installDir = "manifests/ate-install"
-	// Envoy dataplane image name
-	envoyDataplaneImage = "envoy-dataplane"
-	// Envoy dataplane Dockerfile path
-	envoyDataplaneDockefile = "cmd/dataplane/envoy"
 )
 
 // cordonControlPlaneComponent is the kustomize component that pins each
@@ -156,7 +153,7 @@ func (e *Env) renderSystemManifests(ctx context.Context) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		imageReference, err := e.dockerfileImage(ctx, envoyDataplaneImage, envoyDataplaneDockefile)
+		imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
 		if err != nil {
 			return nil, err
 		}
@@ -187,7 +184,7 @@ func (e *Env) renderAtenetRouterManifest(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	imageReference, err := e.dockerfileImage(ctx, envoyDataplaneImage, envoyDataplaneDockefile)
+	imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +242,7 @@ func (e *Env) renderAtenetEgressManifest(ctx context.Context, provider config.Cr
 		return e.ResolveManifestBytes(ctx, raw)
 	}
 
-	imageReference, err := e.dockerfileImage(ctx, envoyDataplaneImage, envoyDataplaneDockefile)
+	imageReference, err := e.dockerfileImage(ctx, images.EnvoyDataplane)
 	if err != nil {
 		return nil, err
 	}

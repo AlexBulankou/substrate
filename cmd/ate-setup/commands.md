@@ -69,13 +69,15 @@ unchanged.
 ```
 ate-setup deploy ate-system \
   --credential-provider='{"name":"k8s.io"}' \
+  --ingress-allowed-spiffe-ids=IDS \
   --image-repo REPO \
   --image-tag TAG
 ```
 
 installs images already published to `REPO` instead, and never invokes `ko`.
 The manifests still come from the checkout, so this needs one; what it removes
-is the build, the Go toolchain, and write access to a registry.
+is the build and write access to a registry. Releases ship no `ate-setup`
+binary, so running it from the checkout still needs Go.
 
 `REPO` has to hold every image the install deploys, all under `TAG`, including
 `envoy-dataplane`, which a build from source builds from a Dockerfile with
@@ -83,7 +85,7 @@ is the build, the Go toolchain, and write access to a registry.
 needs an image `REPO` lacks fails naming it.
 
 The images a release publishes to `ghcr.io/agent-substrate/substrate`, with
-`publish release-images`, are not a complete install; see
+`publish release-images`, leave out the demos and the benchmarking fakes; see
 [`docs/dev/releasing.md`](../../docs/dev/releasing.md#release-images). When an
 image releases do not publish is missing from `REPO`, the error says so.
 
