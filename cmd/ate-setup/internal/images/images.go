@@ -72,6 +72,7 @@ var released = []string{
 	"cmd/atenet",
 	"cmd/ateworker-gvisor",
 	"cmd/ateworker-microvm",
+	"cmd/credential-provider/kubernetes-secrets",
 	"cmd/objectstore-plugin",
 	"cmd/podcertcontroller",
 }
