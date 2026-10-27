@@ -172,8 +172,10 @@ curl -X POST \
    that ate-api-server and atelet depend on. See
    [what `create iam` actually grants](tools/setup-gcp/README.md#what-create-iam-actually-grants)
    to audit them or apply them manually. If you bring your own cluster instead,
-   note the required Kubernetes beta APIs can only be enabled **at cluster
-   creation** — see the [Create Cluster warning](tools/setup-gcp/README.md#2-create-cluster).
+   it needs the PodCertificateRequest and ClusterTrustBundle APIs, which GKE
+   1.37 and higher serve by default. On 1.36, enable them as beta APIs, then
+   replace any 1.36 node pools created before that. See the
+   [Create Cluster warning](tools/setup-gcp/README.md#2-create-cluster).
 
 4. Deploy the Agent Substrate system to your cluster:
    ```bash
