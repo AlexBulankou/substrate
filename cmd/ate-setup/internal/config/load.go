@@ -31,10 +31,6 @@ import (
 )
 
 // ConfigPathEnv names the configuration document when --config is not given.
-//
-// It exists so the file channel crosses hack/install-ate.sh, which forwards
-// only a fixed set of flags but passes the whole environment to the child
-// process. Every other setting reaches ate-setup that way already.
 const ConfigPathEnv = "ATE_CONFIG"
 
 // LoadOptions carries the inputs that select where configuration comes from,
@@ -85,11 +81,9 @@ func LoadFlags(fs *pflag.FlagSet, o LoadOptions) (*Config, error) {
 
 // configPathFrom picks the configuration document, flag over environment.
 //
-// A relative path resolves against the working directory, which is the
-// repository root when the shell installer invoked this: it does cd "$ROOT"
-// before running the binary. ParseFile reports the absolute path it tried, so
-// a path that meant something else from the caller's directory is visible in
-// the error rather than silently missing.
+// A relative path resolves against the working directory. ParseFile reports
+// the absolute path it tried, so a path that meant something else from the
+// caller's directory is visible in the error rather than silently missing.
 func configPathFrom(o LoadOptions) string {
 	if o.ConfigPath != "" {
 		return o.ConfigPath
@@ -143,9 +137,8 @@ func resolveKind(fs *pflag.FlagSet, file *File, env map[string]string) bool {
 
 // mergeDevEnv layers .ate-dev-env.sh underneath the process environment.
 //
-// Sourcing is skipped for Kind installs the same way the shell kind installer
-// exports NO_DEV_ENV: the GKE-shaped variables in a developer's file would
-// otherwise point a local install at a cloud project.
+// Sourcing is skipped for Kind installs: the GKE-shaped variables in a
+// developer's file would otherwise point a local install at a cloud project.
 func mergeDevEnv(root string, env map[string]string, noDevEnv, kind bool) error {
 	if noDevEnv || kind || os.Getenv("NO_DEV_ENV") != "" {
 		return nil

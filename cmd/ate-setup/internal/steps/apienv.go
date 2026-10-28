@@ -312,7 +312,7 @@ func (e *Env) EnsureEnvVarsSafeStandalone(ctx context.Context) error {
 	}
 	return fmt.Errorf("the running ate-api-server Deployment does not reference the %s Secret; "+
 		"rewriting the env vars alone would leave it without a DSN on its next restart. "+
-		"Run `ate-setup deploy ate-apiserver` instead, which also updates the Deployment", SecretAPIEnvVars)
+		"Run `ate-setup deploy apiserver` instead, which also updates the Deployment", SecretAPIEnvVars)
 }
 
 // annotateAPIServerEnvHash stamps the running Deployment's pod template with

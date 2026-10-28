@@ -118,12 +118,16 @@ To quickly set up the complete environment:
 # create cluster and local registry
 hack/create-kind-cluster.sh
 
+# make ate-setup target the kind cluster; set this in every shell that runs
+# ate-setup, including for the demo walkthroughs
+export ATE_INSTALL_KIND=true
+
 # install Substrate
-hack/install-ate-kind.sh deploy ate-system --credential-provider='{"name":"k8s.io"}' \
+go run ./cmd/ate-setup deploy ate-system --credential-provider='{"name":"k8s.io"}' \
   --ingress-allowed-spiffe-ids=spiffe://cluster.local/ns/ate-system/sa/atenet-client
 
 # install counter demo
-hack/install-ate-kind.sh deploy demo counter
+go run ./cmd/ate-setup deploy demo counter
 
 # install kubectl-ate
 go install ./cmd/kubectl-ate
@@ -215,8 +219,8 @@ go run ./tools/setup-gcp create bucket
 To run the PostgreSQL store backend on Cloud SQL — with IAM database
 authentication and no passwords — see [tools/setup-gcp/cloud-sql.md](tools/setup-gcp/cloud-sql.md).
 
-Similarly, you can deploy or cleanup specific Agent Substrate components using
-the installation script. See `go run ./cmd/ate-setup` for all options.
+Similarly, you can deploy or clean up specific Agent Substrate components with
+`ate-setup`. See `go run ./cmd/ate-setup --help` for all options.
 ```bash
 # Re-deploy only ate-apiserver of the ATE system
 go run ./cmd/ate-setup deploy apiserver

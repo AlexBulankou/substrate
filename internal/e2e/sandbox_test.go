@@ -231,7 +231,7 @@ func TestSubstrateCounterFixture(t *testing.T) {
 			Name:          "counter",
 			PoolNamespace: "ate-demo-counter",
 			PoolName:      "counter",
-			DeployWith:    "hack/install-ate-kind.sh --deploy-demo-counter",
+			DeployWith:    "go run ./cmd/ate-setup --kind deploy demo counter",
 		}
 		if got != want {
 			t.Errorf("SubstrateCounterFixture() = %+v, want %+v", got, want)
@@ -245,7 +245,7 @@ func TestSubstrateCounterFixture(t *testing.T) {
 			Name:          "counter-microvm",
 			PoolNamespace: "ate-demo-counter-microvm",
 			PoolName:      "counter-microvm",
-			DeployWith:    "hack/install-ate-kind.sh --deploy-demo-counter-microvm",
+			DeployWith:    "go run ./cmd/ate-setup --kind deploy demo counter-microvm",
 		}
 		if got != want {
 			t.Errorf("SubstrateCounterFixture() = %+v, want %+v", got, want)

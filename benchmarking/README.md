@@ -30,7 +30,7 @@ scenario ladder, read [observability.md](observability.md).
 > ```bash
 > ATE_API_AUTHZ_BOOTSTRAP_OWNERS=system:serviceaccount:ate-system:ate-client,spiffe://cluster.local/ns/benchmarking/sa/default \
 > ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/benchmarking/sa/default \
->   ./hack/install-ate.sh deploy ate-system
+>   go run ./cmd/ate-setup deploy ate-system
 > ```
 > The nightly automation sets both itself; see
 > [automation/README.md](automation/README.md).
@@ -154,7 +154,7 @@ and state restoration latency when a durable directory is attached to the actor.
   * `glutton-storage`: Attaches an external CSI volume instead of a durable
     directory. `deploy_locust.sh` and `workloads/deploy.sh` deploy it only
     when `--storage-class-name` names an existing StorageClass. To run it on
-    NFS, install with `hack/install-ate.sh setup csi nfs` and pass
+    NFS, install with `go run ./cmd/ate-setup setup csi nfs` and pass
     `--storage-class-name csi-nfs-sc`, the class the e2e tests also use.
 
 #### DurDir Reported Metrics
@@ -633,7 +633,7 @@ limits of ate-api-server and Postgres. Isolate mode takes the nodes out by
 installing substrate with a fake data plane:
 
 ```bash
-hack/install-ate.sh deploy ate-system --fake-data-plane
+go run ./cmd/ate-setup deploy ate-system --fake-data-plane
 ./benchmarking/workloads/deploy.sh --deploy --worker-count 200 \
   --fake-atelet-env FAKE_ATELET_DELAY=500ms
 ```
@@ -679,7 +679,7 @@ Fake actors need neither. fake-atelet takes the storage settings of atelet's
 objectstore-plugin sidecar, whose writes it takes over, so its snapshot
 placeholders go to the storage the install points atelet at. The install
 refuses a cluster whose WorkerPools still have worker pods, which would
-outlive ate-controller. A normal `hack/install-ate.sh deploy ate-system`
+outlive ate-controller. A normal `ate-setup deploy ate-system`
 puts the real data plane back, and `delete ate-system` removes the fakes
 either way. Never use the mode on a
 cluster that serves real actors: actors placed on fake Workers do not exist.

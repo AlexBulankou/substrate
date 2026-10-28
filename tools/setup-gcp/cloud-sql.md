@@ -21,7 +21,7 @@ authentication**](https://docs.cloud.google.com/sql/docs/postgres/iam-authentica
 - **Cloud-agnostic code** — ateapi itself knows nothing about Cloud SQL. The
   sidecar is a deployment-time patch
   (`manifests/ate-install/cloudsql/proxy-sidecar-patch.yaml`) applied by
-  `hack/install-ate.sh` only when a Cloud SQL instance is configured.
+  `ate-setup` only when a Cloud SQL instance is configured.
 
 ## 1. Provision
 
@@ -163,7 +163,7 @@ Optional environment variables:
   (default: `max(4, NumCPU)`). It does not affect the owner and watch pools, which are
   capped at 2 and 3 connections.
 
-Changing the installed configuration rolls ate-api-server: the install script
+Changing the installed configuration rolls ate-api-server: ate-setup
 stamps a hash of the rendered configuration into the pod template
 (`ate.dev/env-hash`).
 

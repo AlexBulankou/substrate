@@ -41,7 +41,7 @@ var bootFetchManifests = e2e.SubstrateFixtureManifests{
 // goldenEgressPolicy is a preview feature: install the cluster with its gate
 // and pass the gate to the suite, which skips the test otherwise.
 //
-//	ATE_PREVIEW=GoldenEgressPolicy hack/install-ate-kind.sh
+//	ATE_PREVIEW=GoldenEgressPolicy go run ./cmd/ate-setup --kind deploy ate-system --credential-provider='{"name":"k8s.io"}'
 //	hack/run-e2e-kind.sh ./internal/e2e/suites/egressmitm -run TestGoldenBootEgress -v -args --no-color --preview=GoldenEgressPolicy
 func TestGoldenBootEgress(t *testing.T) {
 	e2e.RequirePreview(t, preview.GateGoldenEgressPolicy)

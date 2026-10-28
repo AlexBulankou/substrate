@@ -859,9 +859,8 @@ func TestLoadOtlpEndpoint(t *testing.T) {
 	}
 }
 
-// hack/install-ate-kind.sh exports ATE_INSTALL_KIND rather than passing a flag,
-// so the environment has to select the Kind profile as completely as --kind
-// does; a Kind install that only half-applied would push images to the wrong
+// ATE_INSTALL_KIND has to select the Kind profile as completely as --kind does;
+// a Kind install that only half-applied would push images to the wrong
 // registry.
 func TestLoadKindFromEnvironment(t *testing.T) {
 	loadEnv(t)
@@ -1178,8 +1177,8 @@ func TestLoadEnvoyConcurrency(t *testing.T) {
 	}
 }
 
-// --kind must reproduce the exports in the shell kind installer, including
-// clearing the GKE coordinates and isolating the snapshot bucket name.
+// --kind must apply the whole Kind profile, including clearing the GKE
+// coordinates and isolating the snapshot bucket name.
 func TestLoadKindProfile(t *testing.T) {
 	loadEnv(t)
 	t.Setenv("PROJECT_ID", "some-gke-project")

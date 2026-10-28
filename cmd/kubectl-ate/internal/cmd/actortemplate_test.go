@@ -158,7 +158,7 @@ func TestActorTemplateFromManifest_DemoManifests(t *testing.T) {
 			if err != nil {
 				t.Fatalf("reading demo manifest: %v", err)
 			}
-			// The install scripts substitute the bucket and drop the unused
+			// ate-setup substitutes the bucket and drops the unused
 			// optional placeholder lines before applying.
 			rendered := strings.ReplaceAll(string(data), "${BUCKET_NAME}", "ate-snapshots")
 			var kept []string

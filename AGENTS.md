@@ -66,7 +66,7 @@ It takes the Kubernetes control-plane out of the critical path to achieve lower 
 Agent Substrate relies on the fact that agent-like applications tend to be idle most of the time to achieve heavy multiplexing.
 
 For development, it's recommended to read the `README.md` and `CONTRIBUTING.md` in the root folder.
-See `hack/install-ate.sh` and `tools/setup-gcp` for provisioning and deploying clusters and GCP resources.
+See `cmd/ate-setup` and `tools/setup-gcp` for provisioning and deploying clusters and GCP resources.
 
 ## Repository Layout
 
@@ -104,7 +104,7 @@ See `docs/dev/code-layout.md` for the full rationale and per-directory details.
 The dev entry points are the scripts under `hack/` and the `cmd/ate-setup` installer.
 
 ### Building and Installing
-- **Install from source**: `go run ./cmd/ate-setup deploy ate-system` (or the `hack/install-ate.sh` shim) builds every image with ko as part of the install; see `cmd/ate-setup/README.md`
+- **Install from source**: `go run ./cmd/ate-setup deploy ate-system` builds every image with ko as part of the install; see `cmd/ate-setup/README.md`
 - **Binaries**: `go build -o bin/kubectl-ate ./cmd/kubectl-ate`, `go build -o bin/ate-setup ./cmd/ate-setup`
 - **Release images**: `VERSION=TAG go run ./cmd/ate-setup publish release-images --ko-docker-repo REPO` (the release set, `images.ReleaseComponents`, all tagged `TAG`; see `docs/dev/releasing.md`)
 - **Release binaries**: `VERSION=TAG go run ./cmd/ate-setup publish release-binaries --out DIR` (`kubectl-ate` for linux and darwin, amd64 and arm64, with `.sha256` files)

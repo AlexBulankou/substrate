@@ -26,7 +26,8 @@ This guide assumes you know Kubernetes and the general shape of agent runtimes (
 
 ## Prerequisites
 
-- A Kubernetes cluster with **Agent Substrate** installed.
+- A k8s cluster with Agent Substrate installed as in the [Quickstart](../../README.md#quickstart-development)
+  (with `ATE_INSTALL_KIND=true` exported in your shell) or [GKE Quickstart](../../README.md#gke-quickstart-development).
 - `kubectl` configured against that cluster (the dashboard uses the operator's kubeconfig via [`client-go`](https://github.com/kubernetes/client-go) for pod-log reads).
 - Network reach to the substrate **api** gRPC service (`api.ate-system:443`). If you run the dashboard as a pod in the cluster, label its namespace `ate.dev/api-access=true`, because ate-system's NetworkPolicies admit API clients only from labeled namespaces (see [`ate-system-networkpolicies.yaml`](../../manifests/ate-install/ate-system-networkpolicies.yaml)). When running the dashboard from outside the cluster, port-forward it in a separate terminal (same convention as [`demos/sandbox/README.md`](../sandbox/README.md#3-port-forward-services)) and keep it running for the lifetime of the demo:
   ```bash
@@ -34,8 +35,7 @@ This guide assumes you know Kubernetes and the general shape of agent runtimes (
   kubectl port-forward svc/api 8080:443 -n ate-system
   ```
 - An **Anthropic API key** (the agents call Claude).
-- A GCS bucket for substrate state snapshots (configured during Substrate install).
-- `KO_DOCKER_REPO` set to a registry you can push to (e.g. `gcr.io/${PROJECT_ID}/ate-images`, same as `hack/ate-dev-env.sh.example`). The deploy step builds and pushes the workload image there with a sha256-pinned reference.
+- The snapshot bucket and image registry (`BUCKET_NAME`, `KO_DOCKER_REPO`) that your Substrate install uses. The deploy step builds and pushes the workload image to that registry with a sha256-pinned reference.
 - `docker buildx` (the deploy function builds the workload image — a Dockerfile-based Python + Claude Code wrapper, not a Go binary, so `ko` doesn't apply for the workload itself).
 
 ## Components
@@ -44,7 +44,7 @@ This guide assumes you know Kubernetes and the general shape of agent runtimes (
 |---|---|
 | `demos/claude-code-multiplex/claude-code-multiplex.yaml.tmpl` | Namespace and WorkerPool manifest |
 | `demos/claude-code-multiplex/agent-*-template.yaml.tmpl` | One protojson ActorTemplate per agent, created through the ate API with `kubectl ate create actor-template` |
-| `cmd/ate-setup/internal/demos/claudemultiplex/` | The installer's demo package, behind `--deploy-demo-claude-code-multiplex` / `--delete-demo-claude-code-multiplex` |
+| `cmd/ate-setup/internal/demos/claudemultiplex/` | The installer's demo package, behind `deploy demo claude-code-multiplex` / `delete demo claude-code-multiplex` |
 | `demos/claude-code-multiplex/workload/` | The agent container image source (Dockerfile + entrypoint that wires Claude Code; built and pushed by the deploy step) |
 | `demos/claude-code-multiplex/ui/` | Static dashboard (`index.html` + `server.go`) that talks to the cluster |
 
@@ -52,11 +52,10 @@ This guide assumes you know Kubernetes and the general shape of agent runtimes (
 
 ### 1. Deploy the demo
 
-From the repo root, with your Anthropic key and substrate bucket name in the environment:
+From the repo root, with your Anthropic key in the environment:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-... \
-BUCKET_NAME=your-substrate-bucket \
 go run ./cmd/ate-setup deploy demo claude-code-multiplex
 ```
 

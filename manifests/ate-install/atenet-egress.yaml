@@ -302,7 +302,7 @@ data:
       # policy ext_proc on every request. They also carry an
       # #ATE_MITM_EXTPROC_FILTER marker, with a matching
       # #ATE_MITM_EXTPROC_CLUSTER in the cluster list: inert comments until
-      # hack/install-ate.sh is run with
+      # ate-setup is run with
       # --experimental-additional-egress-extproc-service, which replaces each
       # with a generated block for an additional, external processor. The
       # marker sits below the policy filter, so that processor sees only

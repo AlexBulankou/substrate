@@ -429,10 +429,9 @@ func (c *Config) Path(parts ...string) string {
 	return filepath.Join(append([]string{c.Root}, parts...)...)
 }
 
-// kindUnsetVars are the GKE-specific variables the shell kind installer unset
-// before delegating, so that a developer who had already sourced
-// .ate-dev-env.sh into their shell did not end up pointing a local install at a
-// cloud project.
+// kindUnsetVars are the GKE-specific variables a Kind install drops, so that a
+// developer who has already sourced .ate-dev-env.sh into their shell does not
+// point a local install at a cloud project.
 var kindUnsetVars = []string{
 	"GCE_REGION", "CLUSTER_LOCATION", "NETWORK", "SUBNETWORK",
 	"MEMORYSTORE_INSTANCE", "PROJECT_ID",
