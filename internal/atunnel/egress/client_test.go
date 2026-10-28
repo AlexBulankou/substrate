@@ -1071,3 +1071,138 @@ func TestH2StreamConnWriteToHonorsReadDeadline(t *testing.T) {
 		t.Errorf("got %q, want delayed", got.String())
 	}
 }
+
+// newTrustRotationClient builds a client that trusts trustCA and presents a
+// certificate issued by certCA, and returns it with the path of its trust
+// bundle so a test can rotate what the client trusts. newTestClient uses one
+// CA for both and keeps the path to itself, which cannot express a gateway
+// whose CA has moved on ahead of the client's bundle.
+func newTrustRotationClient(t *testing.T, trustCA, certCA *testCA, opts ...clientOption) (*Client, string) {
+	t.Helper()
+	trustPath := filepath.Join(t.TempDir(), "trust.pem")
+	if err := os.WriteFile(trustPath, trustCA.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	certificate := certCA.issue(t,
+		"spiffe://substrate-actor.local/worker-for-actor/team/actor",
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	client, err := NewClient(ClientConfig{
+		GatewayAddress:       "127.0.0.1:1",
+		ServerName:           "egress.test",
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &certificate, nil },
+		TrustBundlePath:      trustPath,
+	}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, trustPath
+}
+
+// rotateTrustBundle replaces the projected trust bundle at path with ca's
+// certificate the way kubelet does it: write a sibling, then rename over the
+// target, so a reader never observes a partially written bundle.
+func rotateTrustBundle(t *testing.T, path string, ca *testCA) {
+	t.Helper()
+	staging := path + ".rotated"
+	if err := os.WriteFile(staging, ca.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staging, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// acceptingConnectGateway serves a front door that answers every CONNECT with
+// 200, for as many connections as the test makes.
+func acceptingConnectGateway(t *testing.T, ca *testCA) string {
+	t.Helper()
+	address, _ := serveTestH2ConnectGateway(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	return address
+}
+
+// TestClientDialContextFollowsATrustBundleRotation pins why RootCAs is
+// supplied per gateway dial rather than frozen into the client's config:
+// RootCAs is immutable once a config is in use, so a client built before a CA
+// rotation would refuse the gateway until its pod restarted -- with the
+// actor's own certificate already renewed under the new CA, which is the
+// state kubelet leaves it in.
+func TestClientDialContextFollowsATrustBundleRotation(t *testing.T) {
+	oldCA, rotatedCA := newTestCA(t), newTestCA(t)
+	gatewayAddress := acceptingConnectGateway(t, rotatedCA)
+	client, trustPath := newTrustRotationClient(t, oldCA, rotatedCA, withDialer(dialFixedAddress(gatewayAddress)))
+	t.Cleanup(func() { _ = client.Close() })
+
+	if _, err := client.DialContext(context.Background(), "192.0.2.10:443"); !errors.Is(err, ErrGatewayHandshake) {
+		t.Fatalf("DialContext() before the rotation: error = %v, want ErrGatewayHandshake", err)
+	}
+
+	rotateTrustBundle(t, trustPath, rotatedCA)
+
+	conn, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err != nil {
+		t.Fatalf("DialContext() after the rotation: %v", err)
+	}
+	_ = conn.Close()
+}
+
+// TestClientDialContextFailsClosedOnAnUnreadableTrustBundle pins the reload's
+// failure mode, and that it is ordered ahead of the dial.
+func TestClientDialContextFailsClosedOnAnUnreadableTrustBundle(t *testing.T) {
+	ca := newTestCA(t)
+	gatewayAddress := acceptingConnectGateway(t, ca)
+	var dialed atomic.Bool
+	dial := dialFixedAddress(gatewayAddress)
+	client, trustPath := newTrustRotationClient(t, ca, ca, withDialer(
+		func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialed.Store(true)
+			return dial(ctx, network, address)
+		}))
+	t.Cleanup(func() { _ = client.Close() })
+
+	if err := os.Remove(trustPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err == nil {
+		t.Fatal("DialContext() error = nil after the trust bundle disappeared, want a refusal")
+	}
+	// Asserting the reason, not just the refusal: a discarded reload error
+	// leaves RootCAs nil, and a nil RootCAs means "verify against the system
+	// trust store" -- which also refuses this gateway, but by widening the
+	// trust set rather than holding it.
+	if !strings.Contains(err.Error(), "reloading trust bundle") {
+		t.Errorf("DialContext() error = %q, want the trust-bundle reload failure", err)
+	}
+	// The reload happens before the dial, so a bundle that has gone away does
+	// not leave a connected socket with no owner.
+	if dialed.Load() {
+		t.Error("DialContext() connected to the gateway before reading the trust bundle, leaving the socket unowned")
+	}
+}
+
+// TestNewClientRejectsAnUnreadableTrustBundle pins the startup read. Loading
+// the bundle lazily per dial would otherwise let a client with a misprojected
+// volume construct successfully and fail only when an actor first tries to
+// reach the internet, which reports the misconfiguration as an egress outage.
+func TestNewClientRejectsAnUnreadableTrustBundle(t *testing.T) {
+	certificate := newTestCA(t).issue(t,
+		"spiffe://substrate-actor.local/worker-for-actor/team/actor",
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	if _, err := NewClient(ClientConfig{
+		GatewayAddress:       "127.0.0.1:1",
+		ServerName:           "egress.test",
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &certificate, nil },
+		TrustBundlePath:      filepath.Join(t.TempDir(), "absent.pem"),
+	}); err == nil {
+		t.Fatal("NewClient() error = nil for a trust bundle that does not exist, want a refusal")
+	}
+}
