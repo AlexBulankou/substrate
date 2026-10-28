@@ -95,7 +95,7 @@ tools/        # Standalone Go tools (go run ./tools/<name>) for Dev/CI
 | Internal proto (atelet / ateworker) | `internal/proto/<name>` |
 | Dev/CI scripts | `hack/` |
 | Standalone Go dev/CI tools | `tools/<name>` with its own `go.mod` |
-| Self-contained plugin that nothing in the repo depends on | `internal/plugins/<name>` with its own `go.mod`, importing only `api/` and `pkg/`; see `internal/plugins/README.md` |
+| Plugin for a specific backend, implementing a plugin API like `api/credprovider` | Its own repository in the `agent-substrate-plugins` org; see "Plugins" in `docs/dev/code-layout.md` |
 
 See `docs/dev/code-layout.md` for the full rationale and per-directory details.
 

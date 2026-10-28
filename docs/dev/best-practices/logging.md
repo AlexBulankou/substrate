@@ -24,11 +24,6 @@ builds its own handler gets no masking. These processes build their own today:
 - `podcertcontroller`
 - `atenet sdsmint`
 - `boomer-worker`
-- plugins under `internal/plugins/`, such as `gsm-credential-provider`. A
-  plugin there imports only `pkg/` (see its README), so it cannot call
-  `serverboot`. If `gsm-credential-provider` logged the
-  `FetchSecretResponse` it serves, `opaque_bytes` would show in clear. The
-  plugins under `cmd/` use `serverboot` and are masked.
 
 The handler masks labeled fields in a proto it is handed as an attribute value
 (`slog.Any("resp", resp)`), inside a `slog.Group`, as the result of a

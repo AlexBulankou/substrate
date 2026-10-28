@@ -114,7 +114,7 @@ interpret. A URI the provider refuses denies the request with 403.
   [The reference provider](#the-reference-provider).
 * **Google Cloud Secret Manager** (provider class
   `secretmanager.googleapis.com`) — see its
-  [README](../internal/plugins/gcp-secret-manager/README.md#credential-uris).
+  [README](https://github.com/agent-substrate-plugins/credprovider-gcp-secret-manager#credential-uris).
 
 ### Actor JWTs
 
@@ -319,7 +319,7 @@ wrong provider.
 The gateway reads only the URI host, to confirm the URI targets the provider it
 serves. Everything after the host is the provider's to interpret.
 
-`internal/plugins/gcp-secret-manager` is such a provider for Google Cloud Secret Manager.
+[credprovider-gcp-secret-manager](https://github.com/agent-substrate-plugins/credprovider-gcp-secret-manager) is such a provider for Google Cloud Secret Manager.
 
 **Trust model.** The gateway dials the provider over mTLS with its own pod
 identity, `spiffe://cluster.local/ns/ate-system/sa/atenet-egress`, and every
