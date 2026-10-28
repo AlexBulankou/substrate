@@ -110,7 +110,7 @@ goals in the near term.
 
 To quickly set up the complete environment:
 
-1. Make sure you have [Go](https://go.dev/doc/install), [`kubectl`](https://kubernetes.io/docs/tasks/tools/), and [`docker`](https://www.docker.com/) installed and configured on your dev machine. We will automatically manage other dependencies via Go, including [`kind`](https://kind.sigs.k8s.io/).
+1. Make sure you have [Go](https://go.dev/doc/install), [`kubectl`](https://kubernetes.io/docs/tasks/tools/), and [`docker`](https://www.docker.com/) installed and configured on your dev machine. Your Docker installation must also include the [Buildx](https://docs.docker.com/reference/cli/docker/buildx/) CLI plugin, which `deploy ate-system` uses to build the envoy-dataplane image from source — verify with `docker buildx version`. Docker Desktop and the packages from docker.com ship it; some distribution packages (for example Debian/Ubuntu's `docker.io`) do not, and install it separately as `docker-buildx-plugin`. We will automatically manage other dependencies via Go, including [`kind`](https://kind.sigs.k8s.io/).
    A Linux host that will run more than about a thousand sandboxes also needs a larger kernel neighbor table (`net.ipv4.neigh.default.gc_thresh1/2/3` = 4096/16384/32768); `hack/create-kind-cluster.sh` warns when the host is at the default of 1024.
 
 2. Run the following steps:
