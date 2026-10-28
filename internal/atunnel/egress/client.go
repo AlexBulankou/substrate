@@ -33,6 +33,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.ate.dev/substrate/internal/credbundle"
 )
 
 // TODO(liorlieberman): support/use CONNECT on Ingress as well.
@@ -86,8 +88,13 @@ func withDialer(dial dialFunc) clientOption {
 // Client opens actor egress streams through an mTLS-authenticated gateway.
 type Client struct {
 	gatewayAddress string
-	tlsConfig      *tls.Config
-	dialContext    dialFunc
+	// tlsConfig holds an empty RootCAs pool, not a nil one. runDial replaces
+	// it per gateway dial from loadRoots; a nil pool would mean "verify
+	// against the system trust store", so a reload bug would silently widen
+	// what the client trusts. An empty pool trusts nothing.
+	tlsConfig   *tls.Config
+	loadRoots   func() (*x509.CertPool, error)
+	dialContext dialFunc
 
 	mu      sync.Mutex
 	closed  bool
@@ -112,21 +119,22 @@ func NewClient(cfg ClientConfig, opts ...clientOption) (*Client, error) {
 	if cfg.TrustBundlePath == "" {
 		return nil, fmt.Errorf("egress: trust bundle path is required")
 	}
-	trustPEM, err := os.ReadFile(cfg.TrustBundlePath)
-	if err != nil {
+	// Read the bundle once here so a misprojected volume is reported as a
+	// startup failure. Loading it only per dial would let such a client
+	// construct successfully and fail when an actor first tries to reach the
+	// internet, which reports the misconfiguration as an egress outage.
+	loadRoots := credbundle.PoolLoader(cfg.TrustBundlePath)
+	if _, err := loadRoots(); err != nil {
 		return nil, fmt.Errorf("egress: reading trust bundle: %w", err)
-	}
-	rootCAs := x509.NewCertPool()
-	if !rootCAs.AppendCertsFromPEM(trustPEM) {
-		return nil, fmt.Errorf("egress: trust bundle %q contains no certificates", cfg.TrustBundlePath)
 	}
 
 	client := &Client{
 		gatewayAddress: cfg.GatewayAddress,
 		dialContext:    (&net.Dialer{}).DialContext,
+		loadRoots:      loadRoots,
 		tlsConfig: &tls.Config{
 			MinVersion:           tls.VersionTLS12,
-			RootCAs:              rootCAs,
+			RootCAs:              x509.NewCertPool(),
 			ServerName:           cfg.ServerName,
 			GetClientCertificate: cfg.GetClientCertificate,
 			NextProtos:           []string{"h2", "http/1.1"},
@@ -346,15 +354,30 @@ func (c *Client) runDial(dialCtx context.Context, call *dialCall) {
 	defer call.cancel()
 
 	var (
-		h2Conn *h2ClientConn
-		h1Conn *tls.Conn
-		err    error
+		h2Conn  *h2ClientConn
+		h1Conn  *tls.Conn
+		err     error
+		rawConn net.Conn
+		dialErr error
 	)
-	rawConn, dialErr := c.dialContext(dialCtx, "tcp", c.gatewayAddress)
-	if dialErr != nil {
+	// Supply the trust anchors per gateway dial rather than freezing them into
+	// tlsConfig: a tls.Config's RootCAs is immutable once the config is in
+	// use, so a client built before a CA rotation would refuse the gateway
+	// until its pod restarted -- with the actor's own certificate already
+	// renewed under the new CA, which is the state kubelet leaves it in. The
+	// parsed pool is cached, so an unrotated bundle costs one stat.
+	//
+	// Reloading before the dial, rather than between the dial and the
+	// handshake, means a bundle that has gone away never leaves a connected
+	// socket with no owner.
+	rootCAs, rootsErr := c.loadRoots()
+	if rootsErr != nil {
+		err = fmt.Errorf("egress: reloading trust bundle: %w", rootsErr)
+	} else if rawConn, dialErr = c.dialContext(dialCtx, "tcp", c.gatewayAddress); dialErr != nil {
 		err = fmt.Errorf("egress: connecting to egress gateway: %w", dialErr)
 	} else {
 		tlsConfig := c.tlsConfig.Clone()
+		tlsConfig.RootCAs = rootCAs
 		var presented *tls.Certificate
 		tlsConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			cert, err := c.tlsConfig.GetClientCertificate(info)
