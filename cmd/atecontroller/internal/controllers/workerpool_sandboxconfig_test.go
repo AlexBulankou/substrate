@@ -2312,6 +2312,20 @@ func TestSyncStatus(t *testing.T) {
 			want: atev1.WorkerPoolStatus{
 				Replicas: 5, ReadyReplicas: 4, Selector: "app=new",
 				SandboxClasses: classes("new"),
+				Conditions: []metav1.Condition{
+					{
+						Type:    workerPoolConditionProgressing,
+						Status:  metav1.ConditionTrue,
+						Reason:  "ScalingReplicas",
+						Message: "4/1 worker pods ready",
+					},
+					{
+						Type:    workerPoolConditionReady,
+						Status:  metav1.ConditionFalse,
+						Reason:  "ScalingReplicas",
+						Message: "4/1 worker pods ready",
+					},
+				},
 			},
 			wantWrite: true,
 		},
@@ -2342,6 +2356,11 @@ func TestSyncStatus(t *testing.T) {
 			got := &atev1.WorkerPool{}
 			if err := c.Get(t.Context(), client.ObjectKeyFromObject(wp), got); err != nil {
 				t.Fatalf("get WorkerPool: %v", err)
+			}
+			if len(tc.want.Conditions) == len(got.Status.Conditions) {
+				for i := range tc.want.Conditions {
+					tc.want.Conditions[i].LastTransitionTime = got.Status.Conditions[i].LastTransitionTime
+				}
 			}
 			if !equality.Semantic.DeepEqual(got.Status, tc.want) {
 				t.Errorf("status = %+v, want %+v", got.Status, tc.want)
