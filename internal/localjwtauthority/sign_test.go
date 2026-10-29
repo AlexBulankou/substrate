@@ -42,7 +42,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/agent-substrate/substrate/internal/actoridjwt"
+	"go.ate.dev/substrate/internal/actoridjwt"
 )
 
 // testRSAKey is generated once: a 2048-bit RSA keygen costs more than every
@@ -59,6 +59,7 @@ var testRSAKey = func() *rsa.PrivateKey {
 func testClaims() *actoridjwt.Claims {
 	now := time.Now().Truncate(time.Second)
 	return &actoridjwt.Claims{
+		Kind:       actoridjwt.KindActor,
 		Issuer:     "https://ate.example",
 		Subject:    "actor:default:example",
 		Audiences:  []string{"ateapi"},
