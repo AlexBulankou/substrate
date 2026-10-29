@@ -325,7 +325,9 @@ ate-api-server stores every actor and tag snapshot under a cluster-wide
 `--snapshot-location`, an object-storage URI such as `gs://BUCKET/PREFIX/`.
 Set it with `SNAPSHOT_LOCATION` (or ate-setup's `--snapshot-location`). It has
 no default, and ate-setup fails before deploying without it unless the
-`PerTemplateSnapshotLocation` preview gate is enabled. If you deploy ate-api-server
+`PerTemplateSnapshotLocation` preview gate is enabled. Even with the gate, the
+demos and benchmarks need it, since they do not set
+`snapshotConfig.storageLocation`. So do e2e runs, which deploy the demos. If you deploy ate-api-server
 some other way, pass the flag yourself; without the gate, the server refuses to
 start without it.
 
@@ -363,7 +365,7 @@ With the `PerTemplateSnapshotLocation` preview gate, an ActorTemplate may set
 that leave it empty use `--snapshot-location`. Grant ate-api-server's identity
 and the snapshot transfer service account object admin and bucket viewer on
 any other bucket a template names, as setup-gcp does on the snapshot bucket. Without the gate,
-ate-api-server ignores `snapshotConfig.storageLocation`. See
+ate-api-server rejects templates that set `snapshotConfig.storageLocation`. See
 [Snapshot Storage Layout](api-guide.md#snapshot-storage-layout).
 
 ## Ingress to actors

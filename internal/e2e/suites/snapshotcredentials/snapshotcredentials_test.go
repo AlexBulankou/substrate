@@ -278,16 +278,12 @@ func suspendSync(t *testing.T, ctx context.Context, clients *e2e.Clients, atespa
 // their own snapshots, it reads its own and not the sibling's. Tokens the
 // exchange must refuse are checked alongside.
 func TestExchangeScopesTheTokenToTheActor(t *testing.T) {
-	env, err := e2e.CheckEnv("BUCKET_NAME")
-	if err != nil {
-		t.Fatalf("CheckEnv failed: %v", err)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	clients := e2e.GetClients()
 	requireGCS(t, ctx, clients)
 
-	atespace, _ := e2e.DeployProbe(t, env["BUCKET_NAME"], "snapcreds")
+	atespace, _ := e2e.DeployProbe(t, "snapcreds")
 	sign := newSigner(t, ctx, clients)
 	xchg := dialExchange(t, ctx, clients)
 	stamp := time.Now().UTC().Format("20060102T150405Z")
@@ -415,14 +411,14 @@ func TestRepointMovesTheGrant(t *testing.T) {
 	clients := e2e.GetClients()
 	requireGCS(t, ctx, clients)
 
-	atespace, probe := e2e.DeployProbe(t, env["BUCKET_NAME"], "snapcreds-repoint")
+	atespace, probe := e2e.DeployProbe(t, "snapcreds-repoint")
 	sign := newSigner(t, ctx, clients)
 	xchg := dialExchange(t, ctx, clients)
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 
-	// Template B is the probe template under another location in the same
-	// bucket. Its golden is not what the actor resumes from, but the actor's
-	// next snapshot goes under B's location.
+	// Template B is the probe template under another location in
+	// $BUCKET_NAME. B's golden is not what the actor resumes from, but the
+	// actor's next snapshot goes under B's location.
 	const nameB = "probe-repoint"
 	locationB := "gs://" + env["BUCKET_NAME"] + "/ate-e2e-repoint-" + stamp + "/"
 	templateB := proto.Clone(probe).(*ateapi.ActorTemplate)

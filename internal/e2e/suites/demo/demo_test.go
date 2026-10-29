@@ -1338,11 +1338,6 @@ func deletePausedActor(ctx context.Context, t *testing.T, clients *e2e.Clients, 
 }
 
 func createActorTemplateInternal(ctx context.Context, t *testing.T, clients *e2e.Clients, nsObj *e2e.Namespace, base string, fidelity ateapi.SnapshotFidelity, modifyTemplate func(*ateapi.ActorTemplate)) (*ateapi.ActorTemplate, error) {
-	env, err := e2e.CheckEnv("BUCKET_NAME")
-	if err != nil {
-		t.Fatalf("CheckEnv failed: %v", err)
-	}
-
 	// The whole suite shares demoAtespace, so the per-test suffix keeps
 	// template names unique.
 	name := base + "-" + nsObj.Name
@@ -1351,15 +1346,22 @@ func createActorTemplateInternal(ctx context.Context, t *testing.T, clients *e2e
 		Name:     name,
 		PoolName: base,
 		// One actor at a time, plus a spare for the worker-deletion tests.
-		PoolReplicas: 2,
-		Labels:       map[string]string{"demo": nsObj.Name},
-		SnapshotConfig: &ateapi.SnapshotConfig{
-			StorageLocation:   "gs://" + env["BUCKET_NAME"] + "/ate-demo-" + name,
-			PreferredFidelity: fidelity,
-		},
-		Modify: modifyTemplate,
+		PoolReplicas:   2,
+		Labels:         map[string]string{"demo": nsObj.Name},
+		SnapshotConfig: templateSnapshotConfig(t, fidelity, "ate-demo-"+name),
+		Modify:         modifyTemplate,
 	})
 	return at, nil
+}
+
+// templateSnapshotConfig returns a SnapshotConfig that captures at fidelity,
+// stored under e2e.SnapshotLocation(prefix).
+func templateSnapshotConfig(t *testing.T, fidelity ateapi.SnapshotFidelity, prefix string) *ateapi.SnapshotConfig {
+	t.Helper()
+	return &ateapi.SnapshotConfig{
+		PreferredFidelity: fidelity,
+		StorageLocation:   e2e.SnapshotLocation(t, prefix),
+	}
 }
 
 func createActorTemplate(ctx context.Context, t *testing.T, clients *e2e.Clients, nsObj *e2e.Namespace, fidelity ateapi.SnapshotFidelity) (*ateapi.ActorTemplate, error) {
