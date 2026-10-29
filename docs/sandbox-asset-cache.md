@@ -28,6 +28,7 @@ cannot cross mounts.
 | `workers/<pod uid>/default-runtime/<hash>/` | The worker's default runtimes, one directory per default its file advertises, by bundle hash, one per sandbox class, linked in from the cache by the prewarmer. These links are what keeps a default runtime cached while no actor runs it; the syncer removes a directory when the file stops naming its runtime, and they all go with the worker's directory when the pod does. |
 | `sandbox-asset-scratch/` | Short-lived destinations for fetches that have no actor and no worker directory to link into: the assets the worker sandbox syncer stages when checking a version (and probes `runsc` for CPU features). Wiped at startup. |
 | `sandbox-runtime-index.json` | The runtime index serialized: every runtime a worker on this node has advertised, by hash, with the asset record the hash was computed from. |
+| `cache-boot-id` | The node's boot ID when `atelet` last started. A different ID at startup means the node rebooted, so `atelet` empties the cache first. |
 
 A cache entry is keyed by the asset's sha256, so the same binaries under
 another name or from another bucket are one entry. The store never
@@ -129,6 +130,9 @@ which directories exist. Nothing counts references and nothing prunes.
   restart the directories of pods still on the node keep protecting their
   defaults with no wait on the syncer, and the startup sweep removes the
   directories of pods that are gone.
+- Cache writes aren't synced, so after a node reboot atelet empties the cache
+  and removes every worker's `default-runtime/` directory at startup. The
+  syncer and the prewarmer then rebuild them as on a new node.
 
 The old default's directory is removed as soon as the file names the new
 default: by then the worker has registered the new default (and unless an
