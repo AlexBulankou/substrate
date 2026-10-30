@@ -369,6 +369,22 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1.WorkerP
 		want.Replicas = dep.Status.Replicas
 		want.ReadyReplicas = dep.Status.ReadyReplicas
 		want.Selector = selector.String()
+
+		// ObservedGeneration is stamped only on this branch, which is reached
+		// only when the Deployment already exists -- and reconcileWorkerPool
+		// applies the spec at the current generation before that, returning
+		// early if the apply fails. So the stamp means "the spec at this
+		// generation has been applied", not "the controller saw it".
+		//
+		// A pool whose Deployment does not exist yet reaches syncStatus with
+		// dep nil, BEFORE the apply at the end of reconcileWorkerPool -- and
+		// that apply does not happen at all while a sandbox class is still
+		// missing its config. Stamping there would advertise an unapplied
+		// generation as observed, so this leaves the field at its prior value
+		// (DeepCopy carries it over): the status keeps describing the earlier
+		// spec, which is the honest reading. The reconcile that follows the
+		// Deployment's creation stamps it.
+		want.ObservedGeneration = wp.Generation
 	}
 	want.SandboxClasses = classes
 	if equality.Semantic.DeepEqual(wp.Status, *want) {
