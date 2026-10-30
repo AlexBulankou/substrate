@@ -51,6 +51,16 @@ const (
 	// eventActionResolveSandboxConfig is the action of every event the pool
 	// emits while resolving its SandboxConfigs.
 	eventActionResolveSandboxConfig = "ResolveSandboxConfig"
+	// eventReasonApplyFailed is the reason of the Warning event a pool emits
+	// when the apply of its managed Deployment fails.
+	eventReasonApplyFailed = "ApplyFailed"
+	// eventActionApplyDeployment is the action of every event the pool emits
+	// while reconciling its managed Deployment.
+	//
+	// Reasons and actions are stable identifiers operators filter on
+	// (`--field-selector reason=...`), so treat them as part of the surface:
+	// rename with the same care as a status field.
+	eventActionApplyDeployment = "ApplyDeployment"
 )
 
 type WorkerPoolReconciler struct {
@@ -342,6 +352,12 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1.Wo
 		MetricsExporter:      r.OTelMetricsExporter,
 	}, r.SystemNamespace, r.AteletServiceAccount, r.RouterServiceAccount, r.DNSEgressPolicy)
 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
+		// The failure path is the one an operator most needs a breadcrumb for:
+		// without it, a Deployment that never appears is only visible in the
+		// controller's own logs, which assumes cluster-log access. Emitted
+		// here rather than at the call sites so both of them are covered.
+		r.Recorder.Eventf(wp, nil, corev1.EventTypeWarning, eventReasonApplyFailed, eventActionApplyDeployment,
+			"failed to apply Deployment %s: %v", wp.Name, err)
 		return fmt.Errorf("failed to apply Deployment: %w", err)
 	}
 	return nil
@@ -456,6 +472,13 @@ func (r *WorkerPoolReconciler) InitMetrics(meter metric.Meter) error {
 // WorkerPool is reconciled when it changes, when its Deployment changes, and
 // when a SandboxConfig that can change its resolution changes.
 func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Refuse to start rather than run with events silently disabled. A nil
+	// Recorder is the exact failure this instrumentation exists to fix -- a
+	// controller that reconciles fine and emits nothing -- so it fails closed
+	// at startup instead of being discovered from an empty `kubectl describe`.
+	if r.Recorder == nil {
+		return fmt.Errorf("WorkerPoolReconciler: Recorder must be set")
+	}
 	if err := r.InitMetrics(otel.Meter("atecontroller")); err != nil {
 		return fmt.Errorf("failed to initialize workerpool metrics: %w", err)
 	}

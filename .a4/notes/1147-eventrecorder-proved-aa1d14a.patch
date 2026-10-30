@@ -1,0 +1,471 @@
+diff --git a/cmd/atecontroller/internal/controllers/actortemplate_controller.go b/cmd/atecontroller/internal/controllers/actortemplate_controller.go
+index eacd453..0b9e56a 100644
+--- a/cmd/atecontroller/internal/controllers/actortemplate_controller.go
++++ b/cmd/atecontroller/internal/controllers/actortemplate_controller.go
+@@ -25,10 +25,12 @@ import (
+ 	"github.com/google/uuid"
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/status"
++	corev1 "k8s.io/api/core/v1"
+ 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/tools/record"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ )
+@@ -47,7 +49,8 @@ const (
+ 
+ type ActorTemplateReconciler struct {
+ 	client.Client
+-	Scheme *runtime.Scheme
++	Scheme   *runtime.Scheme
++	Recorder record.EventRecorder
+ 
+ 	AteClient ateapipb.ControlClient
+ }
+@@ -106,6 +109,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		}
+ 		_, err = r.AteClient.CreateActor(ctx, createReq)
+ 		if err != nil {
++			r.eventf(at, corev1.EventTypeWarning, "CreateGoldenActorFailed", "%v", err)
+ 			return ctrl.Result{}, fmt.Errorf("while creating golden actor: %w", err)
+ 		}
+ 
+@@ -114,6 +118,8 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
++		r.eventf(at, corev1.EventTypeNormal, "GoldenActorCreated",
++			"created golden actor %s", actorID)
+ 		return ctrl.Result{}, nil
+ 
+ 	case atev1alpha1.PhaseResumeGoldenActor:
+@@ -133,6 +139,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		}
+ 		_, err := r.AteClient.ResumeActor(ctx, resumeReq)
+ 		if err != nil {
++			r.eventf(at, corev1.EventTypeWarning, "ResumeGoldenActorFailed", "%v", err)
+ 			return ctrl.Result{}, fmt.Errorf("while resuming golden actor: %w", err)
+ 		}
+ 
+@@ -141,6 +148,8 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
++		r.eventf(at, corev1.EventTypeNormal, "GoldenActorResumed",
++			"resumed golden actor %s; snapshot scheduled", at.Status.GoldenActorID)
+ 		return ctrl.Result{}, nil
+ 
+ 	case atev1alpha1.PhaseWaitGoldenActor:
+@@ -159,6 +168,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		}
+ 		resp, err := r.AteClient.SuspendActor(ctx, req)
+ 		if err != nil {
++			r.eventf(at, corev1.EventTypeWarning, "GoldenSnapshotFailed", "%v", err)
+ 			return ctrl.Result{}, fmt.Errorf("while suspending golden actor: %w", err)
+ 		}
+ 
+@@ -178,6 +188,8 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
++		r.eventf(at, corev1.EventTypeNormal, "Ready",
++			"golden snapshot %s captured; actor template ready", at.Status.GoldenSnapshot)
+ 
+ 		return ctrl.Result{}, nil
+ 	case atev1alpha1.PhaseReady:
+@@ -187,8 +199,21 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 	}
+ }
+ 
++// eventf records an Event on obj when a Recorder is wired. It is nil-safe so
++// reconcilers constructed without a Recorder (e.g. in narrow unit tests) do not
++// panic.
++func (r *ActorTemplateReconciler) eventf(obj runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
++	if r.Recorder == nil {
++		return
++	}
++	r.Recorder.Eventf(obj, eventtype, reason, messageFmt, args...)
++}
++
+ // SetupWithManager sets up the controller with the Manager.
+ func (r *ActorTemplateReconciler) SetupWithManager(mgr ctrl.Manager) error {
++	if r.Recorder == nil {
++		r.Recorder = mgr.GetEventRecorderFor("actortemplate-controller")
++	}
+ 	return ctrl.NewControllerManagedBy(mgr).For(&atev1alpha1.ActorTemplate{}).Complete(r)
+ }
+ 
+diff --git a/cmd/atecontroller/internal/controllers/actortemplate_events_test.go b/cmd/atecontroller/internal/controllers/actortemplate_events_test.go
+new file mode 100644
+index 0000000..165d7f1
+--- /dev/null
++++ b/cmd/atecontroller/internal/controllers/actortemplate_events_test.go
+@@ -0,0 +1,264 @@
++// Copyright 2026 Google LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//	http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package controllers
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
++	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
++	"google.golang.org/grpc"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
++	"k8s.io/client-go/tools/record"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/client/fake"
++)
++
++// fakeAteClient is a narrow ateapipb.ControlClient stub: it embeds the
++// interface (so unimplemented methods panic if hit, surfacing accidental use)
++// and overrides only the RPCs the ActorTemplate reconciler drives.
++type fakeAteClient struct {
++	ateapipb.ControlClient
++
++	createErr  error
++	resumeErr  error
++	suspendErr error
++	snapshot   string
++}
++
++func (f *fakeAteClient) CreateAtespace(ctx context.Context, in *ateapipb.CreateAtespaceRequest, opts ...grpc.CallOption) (*ateapipb.Atespace, error) {
++	return &ateapipb.Atespace{}, nil
++}
++
++func (f *fakeAteClient) CreateActor(ctx context.Context, in *ateapipb.CreateActorRequest, opts ...grpc.CallOption) (*ateapipb.Actor, error) {
++	if f.createErr != nil {
++		return nil, f.createErr
++	}
++	return &ateapipb.Actor{}, nil
++}
++
++func (f *fakeAteClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
++	if f.resumeErr != nil {
++		return nil, f.resumeErr
++	}
++	return &ateapipb.ResumeActorResponse{}, nil
++}
++
++func (f *fakeAteClient) SuspendActor(ctx context.Context, in *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
++	if f.suspendErr != nil {
++		return nil, f.suspendErr
++	}
++	return &ateapipb.SuspendActorResponse{
++		Actor: &ateapipb.Actor{
++			LatestSnapshotInfo: &ateapipb.SnapshotInfo{
++				Data: &ateapipb.SnapshotInfo_External{
++					External: &ateapipb.ExternalSnapshotInfo{SnapshotUriPrefix: f.snapshot},
++				},
++			},
++		},
++	}, nil
++}
++
++func atScheme(t *testing.T) *runtime.Scheme {
++	t.Helper()
++	s := runtime.NewScheme()
++	if err := clientgoscheme.AddToScheme(s); err != nil {
++		t.Fatalf("add clientgo scheme: %v", err)
++	}
++	if err := atev1alpha1.AddToScheme(s); err != nil {
++		t.Fatalf("add ate scheme: %v", err)
++	}
++	return s
++}
++
++func newActorTemplate(name string) *atev1alpha1.ActorTemplate {
++	return &atev1alpha1.ActorTemplate{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
++	}
++}
++
++// drainEvents collects all currently-buffered events from a FakeRecorder
++// without blocking once the channel is empty.
++func drainEvents(rec *record.FakeRecorder) []string {
++	var got []string
++	for {
++		select {
++		case e := <-rec.Events:
++			got = append(got, e)
++		default:
++			return got
++		}
++	}
++}
++
++func containsEvent(events []string, substr string) bool {
++	for _, e := range events {
++		if strings.Contains(e, substr) {
++			return true
++		}
++	}
++	return false
++}
++
++// TestActorTemplateEmitsPhaseEvents drives the ActorTemplate reconciler through
++// its full happy-path phase machine (Initial -> ResumeGoldenActor ->
++// WaitGoldenActor -> Ready) and asserts a Normal Event is recorded at each
++// transition. This proves the #1147 EventRecorder wiring: each Status().Update
++// is now paired with an object Event, so `kubectl describe actortemplate/...`
++// surfaces the lifecycle that previously lived only in controller logs.
++func TestActorTemplateEmitsPhaseEvents(t *testing.T) {
++	at := newActorTemplate("test-events")
++	scheme := atScheme(t)
++	c := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(at).
++		WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
++		Build()
++	rec := record.NewFakeRecorder(16)
++	r := &ActorTemplateReconciler{
++		Client:    c,
++		Scheme:    scheme,
++		Recorder:  rec,
++		AteClient: &fakeAteClient{snapshot: "snap-golden"},
++	}
++	ctx := context.Background()
++	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: at.Name, Namespace: at.Namespace}}
++
++	// Phase Initial -> ResumeGoldenActor: expect GoldenActorCreated.
++	if _, err := r.Reconcile(ctx, req); err != nil {
++		t.Fatalf("reconcile (initial): %v", err)
++	}
++	if ev := drainEvents(rec); !containsEvent(ev, "GoldenActorCreated") || !containsEvent(ev, "Normal") {
++		t.Fatalf("expected Normal GoldenActorCreated event, got %v", ev)
++	}
++	assertPhase(t, ctx, c, at, atev1alpha1.PhaseResumeGoldenActor)
++
++	// Phase ResumeGoldenActor -> WaitGoldenActor: expect GoldenActorResumed.
++	if _, err := r.Reconcile(ctx, req); err != nil {
++		t.Fatalf("reconcile (resume): %v", err)
++	}
++	if ev := drainEvents(rec); !containsEvent(ev, "GoldenActorResumed") {
++		t.Fatalf("expected GoldenActorResumed event, got %v", ev)
++	}
++	assertPhase(t, ctx, c, at, atev1alpha1.PhaseWaitGoldenActor)
++
++	// The wait phase requeues until TakeGoldenSnapshotAt elapses; fast-forward
++	// by stamping it into the past, then reconcile.
++	cur := &atev1alpha1.ActorTemplate{}
++	if err := c.Get(ctx, req.NamespacedName, cur); err != nil {
++		t.Fatalf("get for fast-forward: %v", err)
++	}
++	cur.Status.TakeGoldenSnapshotAt = metav1.NewTime(time.Now().Add(-time.Second))
++	if err := c.Status().Update(ctx, cur); err != nil {
++		t.Fatalf("fast-forward status update: %v", err)
++	}
++
++	// Phase WaitGoldenActor -> Ready: expect Ready event + persisted snapshot.
++	if _, err := r.Reconcile(ctx, req); err != nil {
++		t.Fatalf("reconcile (wait->ready): %v", err)
++	}
++	if ev := drainEvents(rec); !containsEvent(ev, "Ready") {
++		t.Fatalf("expected Ready event, got %v", ev)
++	}
++	final := &atev1alpha1.ActorTemplate{}
++	if err := c.Get(ctx, req.NamespacedName, final); err != nil {
++		t.Fatalf("get final: %v", err)
++	}
++	if final.Status.Phase != atev1alpha1.PhaseReady {
++		t.Fatalf("expected phase Ready, got %q", final.Status.Phase)
++	}
++	if final.Status.GoldenSnapshot != "snap-golden" {
++		t.Fatalf("expected golden snapshot persisted, got %q", final.Status.GoldenSnapshot)
++	}
++
++	// Phase Ready is terminal and emits no further events.
++	if _, err := r.Reconcile(ctx, req); err != nil {
++		t.Fatalf("reconcile (ready): %v", err)
++	}
++	if ev := drainEvents(rec); len(ev) != 0 {
++		t.Fatalf("expected no events in terminal Ready phase, got %v", ev)
++	}
++}
++
++// TestActorTemplateEmitsWarningOnCreateFailure proves the Warning path: when the
++// upstream CreateActor RPC fails, the reconciler records a Warning Event so the
++// failure is visible on the object, not just in the controller log.
++func TestActorTemplateEmitsWarningOnCreateFailure(t *testing.T) {
++	at := newActorTemplate("test-create-fail")
++	scheme := atScheme(t)
++	c := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(at).
++		WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
++		Build()
++	rec := record.NewFakeRecorder(16)
++	r := &ActorTemplateReconciler{
++		Client:    c,
++		Scheme:    scheme,
++		Recorder:  rec,
++		AteClient: &fakeAteClient{createErr: errors.New("ate unavailable")},
++	}
++	ctx := context.Background()
++	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: at.Name, Namespace: at.Namespace}}
++
++	if _, err := r.Reconcile(ctx, req); err == nil {
++		t.Fatal("expected reconcile error on CreateActor failure, got nil")
++	}
++	ev := drainEvents(rec)
++	if !containsEvent(ev, "Warning") || !containsEvent(ev, "CreateGoldenActorFailed") {
++		t.Fatalf("expected Warning CreateGoldenActorFailed event, got %v", ev)
++	}
++}
++
++// TestActorTemplateNilRecorderNoPanic proves the eventf nil-guard: a reconciler
++// constructed without a Recorder must not panic when it reaches an emit site.
++func TestActorTemplateNilRecorderNoPanic(t *testing.T) {
++	at := newActorTemplate("test-nil-rec")
++	scheme := atScheme(t)
++	c := fake.NewClientBuilder().
++		WithScheme(scheme).
++		WithObjects(at).
++		WithStatusSubresource(&atev1alpha1.ActorTemplate{}).
++		Build()
++	r := &ActorTemplateReconciler{
++		Client:    c,
++		Scheme:    scheme,
++		AteClient: &fakeAteClient{snapshot: "snap"},
++	}
++	ctx := context.Background()
++	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: at.Name, Namespace: at.Namespace}}
++	if _, err := r.Reconcile(ctx, req); err != nil {
++		t.Fatalf("reconcile with nil Recorder: %v", err)
++	}
++}
++
++func assertPhase(t *testing.T, ctx context.Context, c client.Client, at *atev1alpha1.ActorTemplate, want atev1alpha1.PhaseType) {
++	t.Helper()
++	cur := &atev1alpha1.ActorTemplate{}
++	if err := c.Get(ctx, types.NamespacedName{Name: at.Name, Namespace: at.Namespace}, cur); err != nil {
++		t.Fatalf("get for phase assert: %v", err)
++	}
++	if cur.Status.Phase != want {
++		t.Fatalf("expected phase %q, got %q", want, cur.Status.Phase)
++	}
++}
+diff --git a/cmd/atecontroller/internal/controllers/workerpool_controller.go b/cmd/atecontroller/internal/controllers/workerpool_controller.go
+index c8895ff..316d5d7 100644
+--- a/cmd/atecontroller/internal/controllers/workerpool_controller.go
++++ b/cmd/atecontroller/internal/controllers/workerpool_controller.go
+@@ -19,10 +19,12 @@ import (
+ 	"fmt"
+ 
+ 	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/equality"
+ 	k8errors "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/client-go/tools/record"
+ 	ctrl "sigs.k8s.io/controller-runtime"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/log"
+@@ -34,7 +36,8 @@ const workerPoolFieldOwner = "workerpool-controller"
+ 
+ type WorkerPoolReconciler struct {
+ 	client.Client
+-	Scheme *runtime.Scheme
++	Scheme   *runtime.Scheme
++	Recorder record.EventRecorder
+ }
+ 
+ //+kubebuilder:rbac:groups=ate.dev,resources=workerpools,verbs=get;list;watch;create;update;patch;delete
+@@ -92,8 +95,10 @@ func (r *WorkerPoolReconciler) reconcileWorkerPool(ctx context.Context, wp *atev
+ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alpha1.WorkerPool) error {
+ 	depAC := buildDeploymentApplyConfig(wp)
+ 	if err := r.Apply(ctx, depAC, client.FieldOwner(workerPoolFieldOwner), client.ForceOwnership); err != nil {
++		r.eventf(wp, corev1.EventTypeWarning, "DeploymentApplyFailed", "%v", err)
+ 		return fmt.Errorf("failed to apply Deployment: %w", err)
+ 	}
++	r.eventf(wp, corev1.EventTypeNormal, "DeploymentApplied", "applied Deployment %s/%s", wp.Namespace, wp.Name)
+ 	return nil
+ }
+ 
+@@ -111,8 +116,21 @@ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.W
+ 	return nil
+ }
+ 
++// eventf records an Event on obj when a Recorder is wired. It is nil-safe so
++// reconcilers constructed without a Recorder (e.g. in narrow unit tests) do not
++// panic.
++func (r *WorkerPoolReconciler) eventf(obj runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
++	if r.Recorder == nil {
++		return
++	}
++	r.Recorder.Eventf(obj, eventtype, reason, messageFmt, args...)
++}
++
+ // SetupWithManager sets up the controller with the Manager.
+ func (r *WorkerPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
++	if r.Recorder == nil {
++		r.Recorder = mgr.GetEventRecorderFor("workerpool-controller")
++	}
+ 	return ctrl.NewControllerManagedBy(mgr).
+ 		For(&atev1alpha1.WorkerPool{}).
+ 		Owns(&appsv1.Deployment{}).
+diff --git a/cmd/atecontroller/internal/controllers/workerpool_controller_test.go b/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
+index 5acad67..fad2d8c 100644
+--- a/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
++++ b/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
+@@ -554,6 +554,36 @@ func TestReplicasValidationRejectsNegative(t *testing.T) {
+ 	}
+ }
+ 
++// TestWorkerPoolEmitsDeploymentAppliedEvent proves the #1147 EventRecorder
++// wiring end-to-end through the production path: the manager-built reconciler in
++// TestMain sets its Recorder via SetupWithManager's GetEventRecorderFor, so a
++// successful applyDeployment broadcasts a real corev1.Event to the apiserver.
++// This complements the ActorTemplate FakeRecorder unit tests by proving the
++// actual mgr.GetEventRecorderFor path, not just a stubbed recorder.
++func TestWorkerPoolEmitsDeploymentAppliedEvent(t *testing.T) {
++	wp := makeWorkerPool("test-event", "default", 1, "ateom:v1")
++	if err := k8sClient.Create(testCtx, wp); err != nil {
++		t.Fatalf("create WorkerPool: %v", err)
++	}
++	t.Cleanup(func() { k8sClient.Delete(testCtx, wp) }) //nolint:errcheck
++
++	eventually(t, func(ctx context.Context) (bool, error) {
++		events := &corev1.EventList{}
++		if err := k8sClient.List(ctx, events, client.InNamespace(wp.Namespace)); err != nil {
++			return false, nil
++		}
++		for _, e := range events.Items {
++			if e.InvolvedObject.Kind == "WorkerPool" &&
++				e.InvolvedObject.Name == wp.Name &&
++				e.Reason == "DeploymentApplied" &&
++				e.Type == corev1.EventTypeNormal {
++				return true, nil
++			}
++		}
++		return false, nil
++	})
++}
++
+ // --- helpers ---
+ 
+ func makeWorkerPool(name, ns string, replicas int32, image string) *atev1alpha1.WorkerPool {

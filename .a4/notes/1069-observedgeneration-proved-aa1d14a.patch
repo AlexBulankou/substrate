@@ -1,0 +1,146 @@
+diff --git a/cmd/atecontroller/internal/controllers/actortemplate_controller.go b/cmd/atecontroller/internal/controllers/actortemplate_controller.go
+index eacd453..f3e69a1 100644
+--- a/cmd/atecontroller/internal/controllers/actortemplate_controller.go
++++ b/cmd/atecontroller/internal/controllers/actortemplate_controller.go
+@@ -111,6 +111,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 
+ 		at.Status.Phase = atev1alpha1.PhaseResumeGoldenActor
+ 		at.Status.GoldenActorID = actorID
++		at.Status.ObservedGeneration = at.Generation
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
+@@ -138,6 +139,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 
+ 		at.Status.Phase = atev1alpha1.PhaseWaitGoldenActor
+ 		at.Status.TakeGoldenSnapshotAt = metav1.NewTime(time.Now().Add(goldenSnapshotWarmupFor(at)))
++		at.Status.ObservedGeneration = at.Generation
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
+@@ -175,6 +177,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
+ 			Reason:  "Ready",
+ 			Message: "Actor template is ready for use",
+ 		})
++		at.Status.ObservedGeneration = at.Generation
+ 		if err := r.Status().Update(ctx, at); err != nil {
+ 			return ctrl.Result{}, err
+ 		}
+diff --git a/cmd/atecontroller/internal/controllers/workerpool_controller.go b/cmd/atecontroller/internal/controllers/workerpool_controller.go
+index c8895ff..0faa45e 100644
+--- a/cmd/atecontroller/internal/controllers/workerpool_controller.go
++++ b/cmd/atecontroller/internal/controllers/workerpool_controller.go
+@@ -98,7 +98,10 @@ func (r *WorkerPoolReconciler) applyDeployment(ctx context.Context, wp *atev1alp
+ }
+ 
+ func (r *WorkerPoolReconciler) syncStatus(ctx context.Context, wp *atev1alpha1.WorkerPool, dep *appsv1.Deployment) error {
+-	want := atev1alpha1.WorkerPoolStatus{Replicas: dep.Status.Replicas}
++	want := atev1alpha1.WorkerPoolStatus{
++		Replicas:           dep.Status.Replicas,
++		ObservedGeneration: wp.Generation,
++	}
+ 	if equality.Semantic.DeepEqual(wp.Status, want) {
+ 		return nil
+ 	}
+diff --git a/cmd/atecontroller/internal/controllers/workerpool_controller_test.go b/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
+index 5acad67..0bae56f 100644
+--- a/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
++++ b/cmd/atecontroller/internal/controllers/workerpool_controller_test.go
+@@ -324,6 +324,35 @@ func TestStatusReplicasPropagation(t *testing.T) {
+ 	})
+ }
+ 
++// TestStatusObservedGeneration verifies the controller stamps
++// status.observedGeneration with the WorkerPool's metadata.generation when it
++// writes status, so consumers can tell whether a status reflects the current spec.
++func TestStatusObservedGeneration(t *testing.T) {
++	wp := makeWorkerPool("test-observedgen", "default", 2, "ateom:v1")
++	if err := k8sClient.Create(testCtx, wp); err != nil {
++		t.Fatalf("create WorkerPool: %v", err)
++	}
++	t.Cleanup(func() { k8sClient.Delete(testCtx, wp) }) //nolint:errcheck
++
++	eventually(t, func(ctx context.Context) (bool, error) {
++		_, err := getDeployment(ctx, wp)
++		return err == nil, nil
++	})
++
++	// Drive a status write by simulating the deployment controller reporting pods.
++	updateDeploymentStatus(t, wp, "patch Deployment status", func(dep *appsv1.Deployment) {
++		dep.Status.Replicas = 2
++	})
++
++	eventually(t, func(ctx context.Context) (bool, error) {
++		current := &atev1alpha1.WorkerPool{}
++		if err := k8sClient.Get(ctx, types.NamespacedName{Name: wp.Name, Namespace: wp.Namespace}, current); err != nil {
++			return false, nil
++		}
++		return current.Status.ObservedGeneration == current.Generation && current.Generation > 0, nil
++	})
++}
++
+ func sampleWorkerPoolPodTemplate() *atev1alpha1.WorkerPoolPodTemplate {
+ 	return &atev1alpha1.WorkerPoolPodTemplate{
+ 		NodeSelector: map[string]string{
+diff --git a/manifests/ate-install/generated/ate.dev_actortemplates.yaml b/manifests/ate-install/generated/ate.dev_actortemplates.yaml
+index 4fa151c..a16af6a 100644
+--- a/manifests/ate-install/generated/ate.dev_actortemplates.yaml
++++ b/manifests/ate-install/generated/ate.dev_actortemplates.yaml
+@@ -500,6 +500,11 @@ spec:
+                 type: string
+               goldenSnapshot:
+                 type: string
++              observedGeneration:
++                description: observedGeneration is the most recent generation observed
++                  for this ActorTemplate by the controller.
++                format: int64
++                type: integer
+               phase:
+                 description: Phase of the actor template.
+                 type: string
+diff --git a/manifests/ate-install/generated/ate.dev_workerpools.yaml b/manifests/ate-install/generated/ate.dev_workerpools.yaml
+index 35dee75..6bc4bac 100644
+--- a/manifests/ate-install/generated/ate.dev_workerpools.yaml
++++ b/manifests/ate-install/generated/ate.dev_workerpools.yaml
+@@ -419,6 +419,11 @@ spec:
+           status:
+             description: status is the observed state of WorkerPool
+             properties:
++              observedGeneration:
++                description: observedGeneration is the most recent generation observed
++                  for this WorkerPool by the controller.
++                format: int64
++                type: integer
+               replicas:
+                 description: Replicas is the total number of worker pods.
+                 format: int32
+diff --git a/pkg/api/v1alpha1/actortemplate_types.go b/pkg/api/v1alpha1/actortemplate_types.go
+index 4835afb..389b908 100644
+--- a/pkg/api/v1alpha1/actortemplate_types.go
++++ b/pkg/api/v1alpha1/actortemplate_types.go
+@@ -370,6 +370,10 @@ type ActorTemplateStatus struct {
+ 	// conditions defines the status conditions array
+ 	// +optional
+ 	Conditions []metav1.Condition `json:"conditions,omitempty"`
++
++	// observedGeneration is the most recent generation observed for this ActorTemplate by the controller.
++	// +optional
++	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+ }
+ 
+ // +genclient
+diff --git a/pkg/api/v1alpha1/workerpool_types.go b/pkg/api/v1alpha1/workerpool_types.go
+index 64a62e9..99f9c1c 100644
+--- a/pkg/api/v1alpha1/workerpool_types.go
++++ b/pkg/api/v1alpha1/workerpool_types.go
+@@ -93,6 +93,10 @@ type WorkerPoolStatus struct {
+ 	// +kubebuilder:validation:Minimum=0
+ 	// +optional
+ 	Replicas int32 `json:"replicas"`
++
++	// observedGeneration is the most recent generation observed for this WorkerPool by the controller.
++	// +optional
++	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+ }
+ 
+ // WorkerPool is the Schema for the workerpools API
