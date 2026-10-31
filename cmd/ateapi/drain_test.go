@@ -24,7 +24,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	"github.com/agent-substrate/substrate/internal/serverboot"
+	"go.ate.dev/substrate/internal/serverboot"
 )
 
 // withDrainTimings sets the drain flags for the duration of a test. They are
