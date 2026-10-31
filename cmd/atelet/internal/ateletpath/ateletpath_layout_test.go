@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/internal/nodepath"
+	"go.ate.dev/substrate/internal/nodepath"
 )
 
 // This file is the on-disk path contract for the surface atelet owns. It used
@@ -51,6 +51,8 @@ func TestLayoutIsStable(t *testing.T) {
 	const (
 		actor  = "/var/lib/ate/actors/" + testActorUID
 		bundle = actor + "/bundles/main"
+		// Snapshot state lives on its own root, not inside the actor tree.
+		snapshots = "/var/lib/ate/snapshots/" + testActorUID
 	)
 	tests := []struct {
 		name string
@@ -59,48 +61,27 @@ func TestLayoutIsStable(t *testing.T) {
 	}{
 		{"ImageCacheDir", ImageCacheDir, "/var/lib/ate/image-cache"},
 
-		{"RunSCBinaryPath", RunSCBinaryPath("deadbeef"), "/var/lib/ate/static-files/runsc-deadbeef"},
-		{"GVisorReleaseDir", GVisorReleaseDir("deadbeef"), "/var/lib/ate/static-files/gvisor-deadbeef"},
-
 		{"ActorPath", ActorPath(testActorUID), actor},
 		{"ActorSandboxAssetsFile", ActorSandboxAssetsFile(testActorUID), actor + "/sandbox-assets.json"},
 		{"OCIBundleDir", OCIBundleDir(testActorUID), actor + "/bundles"},
 		{"OCIBundlePath", OCIBundlePath(testActorUID, "main"), bundle},
-		{"CheckpointStateDir", CheckpointStateDir(testActorUID), actor + "/checkpoint-state"},
-		{"LocalCheckpointsDir", LocalCheckpointsDir(testActorUID), actor + "/local-checkpoint"},
-		{"LocalSnapshotDir", LocalSnapshotDir(testActorUID, "snap"), actor + "/local-checkpoint/snap"},
+		{"ActorSnapshotPath", ActorSnapshotPath(testActorUID), snapshots},
+		{"ActorSnapshotStateFile", ActorSnapshotStateFile(testActorUID), actor + "/snapshot-state.json"},
+		{"CheckpointStateDir", CheckpointStateDir(testActorUID), snapshots + "/checkpoint-state"},
+		{"LocalCheckpointsDir", LocalCheckpointsDir(testActorUID), snapshots + "/local-checkpoint"},
+		{"LocalSnapshotDir", LocalSnapshotDir(testActorUID, "snap"), snapshots + "/local-checkpoint/snap"},
 		{"DurableDirVolumeMountsDir", DurableDirVolumeMountsDir(testActorUID), actor + "/durable-dir"},
 		{"DurableDirVolumeMountPoint", DurableDirVolumeMountPoint(testActorUID, "vol"), actor + "/durable-dir/vol"},
 		{"SystemInfoVolumeRootsDir", SystemInfoVolumeRootsDir(testActorUID), actor + "/system-info"},
 		{"SystemInfoVolumeRoot", SystemInfoVolumeRoot(testActorUID, "vol"), actor + "/system-info/vol"},
-		{"RestoreStateDir", RestoreStateDir(testActorUID), actor + "/restore-state"},
-		{"VolumesDir", VolumesDir(testActorUID), actor + "/volumes"},
-		{"VolumeHostPath", VolumeHostPath(testActorUID, "vol"), actor + "/volumes/vol"},
+		{"RestoreStateDir", RestoreStateDir(testActorUID), snapshots + "/restore-state"},
+		{"ExternalVolumeMountsDir", ExternalVolumeMountsDir(testActorUID), actor + "/volumes"},
+		{"ExternalVolumeHostPath", ExternalVolumeHostPath(testActorUID, "vol"), actor + "/volumes/vol"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
 			t.Errorf("%s = %q, want %q", tt.name, tt.got, tt.want)
 		}
-	}
-}
-
-// TestContentAddressedPathsSeparateTheirKinds checks that a runsc binary and a
-// gVisor release directory sharing one sha256 do not land on the same path:
-// both are content-addressed into nodepath.StaticFilesDir, and the prefixes are
-// the only thing keeping them apart.
-func TestContentAddressedPathsSeparateTheirKinds(t *testing.T) {
-	const sha = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
-	bin, release := RunSCBinaryPath(sha), GVisorReleaseDir(sha)
-	if bin == release {
-		t.Fatalf("RunSCBinaryPath and GVisorReleaseDir both resolve to %q for sha %s", bin, sha)
-	}
-	for name, got := range map[string]string{"RunSCBinaryPath": bin, "GVisorReleaseDir": release} {
-		if !isUnderDir(got, nodepath.StaticFilesDir) {
-			t.Errorf("%s(%q) = %q, want a path under nodepath.StaticFilesDir %q", name, sha, got, nodepath.StaticFilesDir)
-		}
-	}
-	if RunSCBinaryPath(sha) == RunSCBinaryPath(strings.Repeat("f", 64)) {
-		t.Error("RunSCBinaryPath is not content-addressed: two shas share a path")
 	}
 }
 
@@ -127,7 +108,11 @@ func TestSystemInfoRootsAreOutsideDurableDirMounts(t *testing.T) {
 // invariants below cover each of them.
 func actorScopedPaths(uid string) map[string]string {
 	return map[string]string{
+		"ActorSnapshotPath":          ActorSnapshotPath(uid),
+		"ActorSnapshotStateFile":     ActorSnapshotStateFile(uid),
 		"ActorSandboxAssetsFile":     ActorSandboxAssetsFile(uid),
+		"SandboxAssetsDir":           SandboxAssetsDir(uid),
+		"SandboxAssetsStagingDir":    SandboxAssetsStagingDir(uid),
 		"OCIBundleDir":               OCIBundleDir(uid),
 		"OCIBundlePath":              OCIBundlePath(uid, "main"),
 		"CheckpointStateDir":         CheckpointStateDir(uid),
@@ -138,25 +123,48 @@ func actorScopedPaths(uid string) map[string]string {
 		"SystemInfoVolumeRootsDir":   SystemInfoVolumeRootsDir(uid),
 		"SystemInfoVolumeRoot":       SystemInfoVolumeRoot(uid, "vol"),
 		"RestoreStateDir":            RestoreStateDir(uid),
-		"VolumesDir":                 VolumesDir(uid),
-		"VolumeHostPath":             VolumeHostPath(uid, "vol"),
+		"ExternalVolumeMountsDir":    ExternalVolumeMountsDir(uid),
+		"ExternalVolumeHostPath":     ExternalVolumeHostPath(uid, "vol"),
 	}
 }
 
-// TestActorScopedPathsStayUnderActorPath is what makes atelet's removeActorDirs
-// safe: it reclaims an actor by deleting ActorPath(uid) alone, on the stated
+// actorReclaimRoots returns the per-actor roots atelet's reclaim deletes, keyed
+// by constructor name. There are TWO: actordirs removes ActorSnapshotPath(uid)
+// and ActorPath(uid), because snapshot state lives on its own mount under
+// nodepath.SnapshotsDir rather than inside the actor tree.
+//
+// Every entry here is a root the reclaim actually deletes. Adding one that it
+// does not would turn the containment invariant below into a licence to leak.
+func actorReclaimRoots(uid string) map[string]string {
+	return map[string]string{
+		"ActorPath":         ActorPath(uid),
+		"ActorSnapshotPath": ActorSnapshotPath(uid),
+	}
+}
+
+// TestActorScopedPathsStayUnderAReclaimRoot is what makes atelet's reclaim
+// safe: it frees an actor by deleting that actor's roots alone, on the stated
 // grounds that nothing else on the node holds that actor's state. A constructor
 // that joined to nodepath.BasePath instead would leak state past termination
 // without any caller changing.
-func TestActorScopedPathsStayUnderActorPath(t *testing.T) {
-	root := ActorPath(testActorUID)
+//
+// The branch this test was written on asserted a single root, ActorPath. That
+// is no longer the layout: upstream moved snapshot state out to
+// nodepath.SnapshotsDir, so the property is now "under one of the roots the
+// reclaim deletes" -- which is the invariant the test always meant, and the
+// one that keeps holding as the layout splits again.
+func TestActorScopedPathsStayUnderAReclaimRoot(t *testing.T) {
+	roots := actorReclaimRoots(testActorUID)
 	for name, got := range actorScopedPaths(testActorUID) {
-		if !isUnderDir(got, root) {
-			t.Errorf("%s = %q, want a path under ActorPath = %q", name, got, root)
+		if !isReclaimedBy(got, roots) {
+			t.Errorf("%s = %q, want a path at or under one of the reclaim roots %v", name, got, roots)
 		}
 	}
-	if !isUnderDir(root, nodepath.ActorsDir) {
-		t.Errorf("ActorPath = %q, want a path under nodepath.ActorsDir = %q", root, nodepath.ActorsDir)
+	for name, root := range roots {
+		if !isUnderDir(root, nodepath.ActorsDir) && !isUnderDir(root, nodepath.SnapshotsDir) {
+			t.Errorf("%s = %q, want a path under nodepath.ActorsDir %q or nodepath.SnapshotsDir %q",
+				name, root, nodepath.ActorsDir, nodepath.SnapshotsDir)
+		}
 	}
 }
 
@@ -165,9 +173,12 @@ func TestActorScopedPathsStayUnderActorPath(t *testing.T) {
 // into it, and the damage only shows up as one subsystem's files vanishing when
 // the other resets its own directory.
 func TestActorScopedPathsDoNotCollide(t *testing.T) {
-	seen := map[string]string{ActorPath(testActorUID): "ActorPath"}
+	seen := map[string]string{}
+	for name, root := range actorReclaimRoots(testActorUID) {
+		seen[root] = name
+	}
 	for name, got := range actorScopedPaths(testActorUID) {
-		if prev, dup := seen[got]; dup {
+		if prev, dup := seen[got]; dup && prev != name {
 			t.Errorf("%s and %s both resolve to %q", prev, name, got)
 			continue
 		}
@@ -179,12 +190,26 @@ func TestActorScopedPathsDoNotCollide(t *testing.T) {
 // state must never sit inside another's tree, or terminating actor A would
 // delete live state belonging to actor B.
 func TestActorScopedPathsDoNotCrossActors(t *testing.T) {
-	otherRoot := ActorPath(otherActorUID)
-	for name, got := range actorScopedPaths(testActorUID) {
-		if isUnderDir(got, otherRoot) || got == otherRoot {
-			t.Errorf("%s for actor %s = %q, which lies inside actor %s's tree %q", name, testActorUID, got, otherActorUID, otherRoot)
+	for rootName, otherRoot := range actorReclaimRoots(otherActorUID) {
+		for name, got := range actorScopedPaths(testActorUID) {
+			if isUnderDir(got, otherRoot) || got == otherRoot {
+				t.Errorf("%s for actor %s = %q, which lies inside actor %s's %s %q", name, testActorUID, got, otherActorUID, rootName, otherRoot)
+			}
 		}
 	}
+}
+
+// isReclaimedBy reports whether deleting the given roots also removes path --
+// i.e. path is one of the roots, or lies strictly inside one. A root counts as
+// reclaimed by itself: ActorSnapshotPath is both a reclaim root and a
+// registered actor-scoped constructor.
+func isReclaimedBy(path string, roots map[string]string) bool {
+	for _, root := range roots {
+		if path == root || isUnderDir(path, root) {
+			return true
+		}
+	}
+	return false
 }
 
 // isUnderDir reports whether path lies strictly inside dir.
@@ -228,14 +253,18 @@ func TestContainmentHoldsForEveryValidIdentifier(t *testing.T) {
 		strings.Repeat("a", 63), // the label length limit
 	}
 	for _, uid := range uids {
-		root := ActorPath(uid)
-		if !isUnderDir(root, nodepath.ActorsDir) {
-			t.Errorf("ActorPath(%q) = %q escaped nodepath.ActorsDir %q", uid, root, nodepath.ActorsDir)
+		roots := actorReclaimRoots(uid)
+		if !isUnderDir(roots["ActorPath"], nodepath.ActorsDir) {
+			t.Errorf("ActorPath(%q) = %q escaped nodepath.ActorsDir %q", uid, roots["ActorPath"], nodepath.ActorsDir)
+			continue
+		}
+		if !isUnderDir(roots["ActorSnapshotPath"], nodepath.SnapshotsDir) {
+			t.Errorf("ActorSnapshotPath(%q) = %q escaped nodepath.SnapshotsDir %q", uid, roots["ActorSnapshotPath"], nodepath.SnapshotsDir)
 			continue
 		}
 		for name, got := range actorScopedPaths(uid) {
-			if !isUnderDir(got, root) {
-				t.Errorf("%s(%q) = %q, want a path under %q", name, uid, got, root)
+			if !isReclaimedBy(got, roots) {
+				t.Errorf("%s(%q) = %q, want a path at or under one of %v", name, uid, got, roots)
 			}
 		}
 	}
@@ -272,7 +301,7 @@ func TestSocketPathsFitTheUnixLimit(t *testing.T) {
 	// sun_path is 108 bytes including the NUL terminator.
 	const maxUnixSocketLen = 107
 	for name, got := range map[string]string{
-		"AteomSupportSocket": nodepath.AteomSupportSocket,
+		"WorkerSupportSocket": nodepath.WorkerSupportSocket,
 	} {
 		if len(got) > maxUnixSocketLen {
 			t.Errorf("%s = %q is %d bytes, over the %d-byte unix socket limit", name, got, len(got), maxUnixSocketLen)
