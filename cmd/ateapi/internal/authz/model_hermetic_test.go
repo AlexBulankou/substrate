@@ -101,6 +101,11 @@ func TestEmbeddedModelRelationsAreNamedByConvention(t *testing.T) {
 	m := embeddedModel(t)
 
 	// Nouns the model uses as graph edges rather than as permission checks.
+	// This list is deliberately explicit and deliberately grows with the
+	// model: a new non-can_ relation should cost one reviewed line here,
+	// which is the moment someone decides whether it is a role or a
+	// misspelled permission. Deriving it from the model would accept
+	// "get: [user]" as readily as "owner: [user]" and assert nothing.
 	edges := map[string]bool{
 		"owner":            true,
 		"editor":           true,
@@ -109,6 +114,16 @@ func TestEmbeddedModelRelationsAreNamedByConvention(t *testing.T) {
 		"parent_atespace":  true,
 		"host_node":        true,
 		"scheduled_worker": true,
+
+		// Machine-principal roles. Each is a SPIFFE workload identity
+		// granted like any other role -- "can_get: viewer from
+		// parent_global or controller from parent_global" reads the same
+		// way for both -- so they are nouns under this rule, not checks.
+		"controller":         true,
+		"egress_gateway":     true,
+		"ingress_router":     true,
+		"atelet":             true,
+		"api_server_sidecar": true,
 	}
 
 	for _, td := range m.GetTypeDefinitions() {
