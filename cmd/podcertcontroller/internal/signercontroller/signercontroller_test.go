@@ -30,11 +30,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/rendezvous"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 )
@@ -376,6 +377,26 @@ func TestHandlePCRSkipsRendezvousForOtherSigners(t *testing.T) {
 	}
 }
 
+// deferRecordingQueue records AddAfter without forwarding it. The
+// not-assigned path deliberately bypasses the failure rate limiter --
+// assignments change only when a replica joins or a lease expires, so
+// retrying on error backoff would be both wrong and slower -- which means
+// NumRequeues cannot tell "rescheduled after the lease" apart from
+// "forgotten". The AddAfter call is the only thing that can. Not forwarding
+// keeps a single pass observable: a real AddAfter puts the key back a lease
+// later, and the test does not run that long.
+type deferRecordingQueue struct {
+	workqueue.TypedRateLimitingInterface[string]
+	deferred map[string]time.Duration
+}
+
+func (q *deferRecordingQueue) AddAfter(key string, after time.Duration) {
+	if q.deferred == nil {
+		q.deferred = map[string]time.Duration{}
+	}
+	q.deferred[key] = after
+}
+
 func TestProcessNextWorkItem(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -387,6 +408,9 @@ func TestProcessNextWorkItem(t *testing.T) {
 
 		wantMadeCert bool
 		wantRequeued bool
+		// wantDeferred expects a re-examination scheduled a lease out,
+		// which is a different retry from wantRequeued's rate-limited one.
+		wantDeferred bool
 	}{
 		{
 			name:         "signs a cached request and forgets it",
@@ -406,11 +430,14 @@ func TestProcessNextWorkItem(t *testing.T) {
 			key:  "a/b/c",
 		},
 		{
-			name:         "requeues a request owned by another replica",
+			// Not dropped, but not rate-limited either: the key comes back
+			// after the lease, because that is the soonest the assignment
+			// it lost could have changed.
+			name:         "re-examines a request owned by another replica after the lease",
 			key:          "ns/pcr",
 			cached:       true,
 			assigned:     map[string]bool{},
-			wantRequeued: true,
+			wantDeferred: true,
 		},
 		{
 			name:         "requeues a request whose signing failed",
@@ -430,6 +457,8 @@ func TestProcessNextWorkItem(t *testing.T) {
 				seed = append(seed, pcrWithConditions("ns", "pcr", testSignerName))
 			}
 			c, _ := newTestController(t, signer, hasher, seed...)
+			queue := &deferRecordingQueue{TypedRateLimitingInterface: c.pcrQueue}
+			c.pcrQueue = queue
 
 			c.pcrQueue.Add(tc.key)
 			if !c.processNextWorkItem(t.Context()) {
@@ -445,6 +474,14 @@ func TestProcessNextWorkItem(t *testing.T) {
 			// distinguishes "requeued" from "forgotten".
 			if requeued := c.pcrQueue.NumRequeues(tc.key) > 0; requeued != tc.wantRequeued {
 				t.Errorf("requeued = %v, want %v", requeued, tc.wantRequeued)
+			}
+
+			after, deferred := queue.deferred[tc.key]
+			if deferred != tc.wantDeferred {
+				t.Errorf("re-examination scheduled = %v, want %v", deferred, tc.wantDeferred)
+			}
+			if deferred && after != rendezvous.LeaseDuration {
+				t.Errorf("re-examined after %v, want the lease duration %v", after, rendezvous.LeaseDuration)
 			}
 		})
 	}
