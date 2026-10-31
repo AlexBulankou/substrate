@@ -41,7 +41,15 @@ const (
 	// eventReasonNetworkPolicyConflict is the reason of the Warning event a
 	// pool emits when checkNetworkPolicyOwner refuses its NetworkPolicy.
 	eventReasonNetworkPolicyConflict = "NetworkPolicyConflict"
-	// eventActionApplyNetworkPolicy is the action of that event.
+	// eventReasonNetworkPolicyApplyFailed marks a failed apply of the
+	// generated ingress policy. It is deliberately not the WorkerPool
+	// reconciler's bare ApplyFailed: both reconcilers publish onto the same
+	// WorkerPool, so a shared reason would make
+	// `--field-selector reason=ApplyFailed` ambiguous about which derived
+	// object failed.
+	eventReasonNetworkPolicyApplyFailed = "NetworkPolicyApplyFailed"
+	// eventActionApplyNetworkPolicy is the action of every event this
+	// reconciler emits.
 	eventActionApplyNetworkPolicy = "ApplyNetworkPolicy"
 )
 
@@ -108,8 +116,18 @@ func (r *NetworkPolicyReconciler) reconcileImpl(ctx context.Context, wp *atev1.W
 	}
 
 	if err := r.Apply(ctx, npAC, client.FieldOwner(networkPolicyFieldOwner), client.ForceOwnership); err != nil {
+		// A pool whose ingress policy never applies is reachable from anywhere
+		// the cluster's default posture allows, which is the opposite of what
+		// this controller exists to guarantee -- so the failure is worth a
+		// Warning on the pool rather than only a line in the controller's log.
+		r.Recorder.Eventf(wp, nil, corev1.EventTypeWarning, eventReasonNetworkPolicyApplyFailed, eventActionApplyNetworkPolicy,
+			"failed to apply NetworkPolicy %s: %v", *npAC.Name, err)
 		return fmt.Errorf("failed to apply NetworkPolicy %s:%s: %w", *npAC.Namespace, *npAC.Name, err)
 	}
+	// No Normal counterpart here. Unlike the WorkerPool reconciler, this one
+	// has no change guard -- server-side apply is issued on every reconcile,
+	// including resyncs that change nothing -- so a success event would fire
+	// on a timer and bury the Warning above rather than report a transition.
 	log.Info("reconcileImpl done",
 		"namespace", *npAC.Namespace,
 		"name", *npAC.Name)
@@ -175,6 +193,12 @@ func (r *NetworkPolicyReconciler) buildNetworkPolicyApplyConfig(wp *atev1.Worker
 }
 
 func (r *NetworkPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Fail closed rather than start with events silently disabled: a nil
+	// Recorder reconciles perfectly and reports nothing, which is exactly the
+	// condition this instrumentation exists to end.
+	if r.Recorder == nil {
+		return fmt.Errorf("NetworkPolicyReconciler: Recorder must be set")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("networkpolicy").
 		For(&atev1.WorkerPool{}).

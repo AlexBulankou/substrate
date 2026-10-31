@@ -31,6 +31,7 @@ import (
 	certsv1ac "k8s.io/client-go/applyconfigurations/certificates/v1"
 	certsv1beta1ac "k8s.io/client-go/applyconfigurations/certificates/v1beta1"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,7 +49,27 @@ type EgressMITMTrustReconciler struct {
 	// SystemNamespace is the namespace holding the egress MITM CA pool Secret.
 	SystemNamespace string
 	bundleV1        bool
+
+	// Recorder publishes onto the CA pool Secret -- the object an operator
+	// edits when they rotate the pool, and so the one they look at when the
+	// rotation does not take. The derived ClusterTrustBundle is cluster-scoped
+	// and would file its events under the default namespace, away from the
+	// input that caused them.
+	Recorder events.EventRecorder
 }
+
+// Event reasons emitted on the CA pool Secret.
+const (
+	// eventReasonTrustBundleInvalid marks a pool the bundle cannot be derived
+	// from.
+	eventReasonTrustBundleInvalid = "TrustBundleInvalid"
+	// eventReasonTrustBundleApplyFailed marks a failed apply of the derived
+	// bundle.
+	eventReasonTrustBundleApplyFailed = "TrustBundleApplyFailed"
+	// eventActionDeriveTrustBundle is the action of every event this
+	// reconciler emits.
+	eventActionDeriveTrustBundle = "DeriveTrustBundle"
+)
 
 // EgressMITMCAPoolRef names the Secret holding the CA pool the egress gateway
 // signs per-SNI leaves with.
@@ -87,6 +108,12 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	trustBundle, err := egressMITMTrustBundlePEM(secret)
 	if err != nil {
+		// A malformed pool is an operator-authored condition -- a bad key, an
+		// empty pool, a CA with no root -- and the operator is editing this
+		// Secret, not reading the controller's log. Without the event the
+		// rotation simply appears to do nothing.
+		r.Recorder.Eventf(secret, nil, corev1.EventTypeWarning, eventReasonTrustBundleInvalid, eventActionDeriveTrustBundle,
+			"failed to derive the egress MITM trust bundle: %v", err)
 		return ctrl.Result{}, fmt.Errorf("failed to derive the egress MITM trust bundle from %q: %w", req.NamespacedName, err)
 	}
 
@@ -103,6 +130,11 @@ func (r *EgressMITMTrustReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	// without clobbering anything a different manager legitimately set.
 	const egressMITMTrustFieldOwner = "ate-egress-mitm-trust"
 	if err := r.Apply(ctx, applyConfig, client.FieldOwner(egressMITMTrustFieldOwner), client.ForceOwnership); err != nil {
+		// Warning only, with no Normal counterpart: the apply is unguarded and
+		// runs on every resync, so a success event would fire on a timer and
+		// bury this one.
+		r.Recorder.Eventf(secret, nil, corev1.EventTypeWarning, eventReasonTrustBundleApplyFailed, eventActionDeriveTrustBundle,
+			"failed to apply ClusterTrustBundle %s: %v", *ctbAC.Name, err)
 		return ctrl.Result{}, fmt.Errorf("failed to apply ClusterTrustBundle %q: %w", *ctbAC.Name, err)
 	}
 	log.Info("reconciled the egress MITM trust bundle",
@@ -195,6 +227,12 @@ func (r *EgressMITMTrustReconciler) bundleObject() client.Object {
 }
 
 func (r *EgressMITMTrustReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Fail closed rather than start with events silently disabled: a nil
+	// Recorder reconciles perfectly and reports nothing, which is exactly the
+	// condition this instrumentation exists to end.
+	if r.Recorder == nil {
+		return fmt.Errorf("EgressMITMTrustReconciler: Recorder must be set")
+	}
 	disco, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
 	if err != nil {
 		return err
