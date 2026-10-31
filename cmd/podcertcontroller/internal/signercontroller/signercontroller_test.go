@@ -30,11 +30,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/podcertificate"
-	"github.com/agent-substrate/substrate/cmd/podcertcontroller/internal/rendezvous"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/podcertificate"
+	"go.ate.dev/substrate/cmd/podcertcontroller/internal/rendezvous"
 	"k8s.io/apimachinery/pkg/runtime"
 	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
 )
@@ -376,6 +377,67 @@ func TestHandlePCRSkipsRendezvousForOtherSigners(t *testing.T) {
 	}
 }
 
+// requeueRecorder wraps the controller's own queue and records the delayed
+// re-adds, which NumRequeues cannot see: AddAfter does not touch the failure
+// rate limiter, so a lease-duration re-examine and a dropped key look
+// identical through NumRequeues alone.
+type requeueRecorder struct {
+	workqueue.TypedRateLimitingInterface[string]
+
+	mu     sync.Mutex
+	after  []time.Duration
+	forgot []string
+}
+
+func (q *requeueRecorder) AddAfter(key string, d time.Duration) {
+	q.mu.Lock()
+	q.after = append(q.after, d)
+	q.mu.Unlock()
+	q.TypedRateLimitingInterface.AddAfter(key, d)
+}
+
+func (q *requeueRecorder) Forget(key string) {
+	q.mu.Lock()
+	q.forgot = append(q.forgot, key)
+	q.mu.Unlock()
+	q.TypedRateLimitingInterface.Forget(key)
+}
+
+func (q *requeueRecorder) delays() []time.Duration {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]time.Duration(nil), q.after...)
+}
+
+func (q *requeueRecorder) forgets() []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return append([]string(nil), q.forgot...)
+}
+
+// disposition is what processNextWorkItem did with the key. The three are
+// mutually exclusive and a bool cannot tell them apart -- which is exactly
+// how the old assertion came to read a lease-duration re-examine as a
+// dropped key.
+type disposition int
+
+const (
+	// dispForget: the key is done and its backoff is reset.
+	dispForget disposition = iota
+	// dispRateLimited: a real failure; retry with escalating backoff.
+	dispRateLimited
+	// dispLeaseDelay: not ours to sign. Re-examine when assignments can
+	// next have changed, WITHOUT consuming the failure rate limiter.
+	dispLeaseDelay
+	// dispDrop: the key is abandoned without being forgotten, so its
+	// rate-limiter entry is never reset. Harmless only because an
+	// unparseable key cannot be produced by MetaNamespaceKeyFunc and so
+	// never comes back -- but it is what the code does, and a test that
+	// said "forget" here would be asserting a tidier controller than the
+	// one that ships.
+	dispDrop
+)
+
 func TestProcessNextWorkItem(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -386,39 +448,46 @@ func TestProcessNextWorkItem(t *testing.T) {
 		makeCertErr error
 
 		wantMadeCert bool
-		wantRequeued bool
+		want         disposition
 	}{
 		{
 			name:         "signs a cached request and forgets it",
 			key:          "ns/pcr",
 			cached:       true,
 			wantMadeCert: true,
+			want:         dispForget,
 		},
 		{
 			// The PCR was deleted between enqueue and dequeue. Requeueing
 			// would retry an object that is never coming back.
 			name: "forgets a key whose object is gone",
 			key:  "ns/pcr",
+			want: dispForget,
 		},
 		{
 			// A malformed key cannot be repaired by retrying it.
 			name: "drops an unparseable key",
 			key:  "a/b/c",
+			want: dispDrop,
 		},
 		{
-			name:         "requeues a request owned by another replica",
-			key:          "ns/pcr",
-			cached:       true,
-			assigned:     map[string]bool{},
-			wantRequeued: true,
+			// Upstream deliberately stopped rate-limiting this path:
+			// assignments only change when a replica joins or a lease
+			// expires, so the retry is scheduled for the lease duration
+			// and the failure backoff is left alone.
+			name:     "re-examines a request owned by another replica after the lease",
+			key:      "ns/pcr",
+			cached:   true,
+			assigned: map[string]bool{},
+			want:     dispLeaseDelay,
 		},
 		{
-			name:         "requeues a request whose signing failed",
+			name:         "rate-limits a request whose signing failed",
 			key:          "ns/pcr",
 			cached:       true,
 			makeCertErr:  errors.New("transient signing failure"),
 			wantMadeCert: true,
-			wantRequeued: true,
+			want:         dispRateLimited,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -430,6 +499,8 @@ func TestProcessNextWorkItem(t *testing.T) {
 				seed = append(seed, pcrWithConditions("ns", "pcr", testSignerName))
 			}
 			c, _ := newTestController(t, signer, hasher, seed...)
+			q := &requeueRecorder{TypedRateLimitingInterface: c.pcrQueue}
+			c.pcrQueue = q
 
 			c.pcrQueue.Add(tc.key)
 			if !c.processNextWorkItem(t.Context()) {
@@ -440,11 +511,34 @@ func TestProcessNextWorkItem(t *testing.T) {
 				t.Errorf("MakeCert called = %v, want %v", made, tc.wantMadeCert)
 			}
 
-			// A rate-limited requeue is delayed, so the item is not back in
-			// Len() synchronously; the rate-limiter's own count is what
-			// distinguishes "requeued" from "forgotten".
-			if requeued := c.pcrQueue.NumRequeues(tc.key) > 0; requeued != tc.wantRequeued {
-				t.Errorf("requeued = %v, want %v", requeued, tc.wantRequeued)
+			// All three dispositions are asserted positively AND
+			// negatively: a rate-limited retry and a lease re-examine are
+			// both "requeued", and only the negative half keeps them from
+			// standing in for each other.
+			rateLimited := c.pcrQueue.NumRequeues(tc.key) > 0
+			delays := q.delays()
+			forgot := len(q.forgets()) > 0
+			switch tc.want {
+			case dispForget:
+				if !forgot || rateLimited || len(delays) != 0 {
+					t.Errorf("disposition = forgot:%v ratelimited:%v delays:%v, want forget only",
+						forgot, rateLimited, delays)
+				}
+			case dispRateLimited:
+				if !rateLimited || forgot || len(delays) != 0 {
+					t.Errorf("disposition = forgot:%v ratelimited:%v delays:%v, want rate-limited only",
+						forgot, rateLimited, delays)
+				}
+			case dispLeaseDelay:
+				if rateLimited || forgot || len(delays) != 1 || delays[0] != rendezvous.LeaseDuration {
+					t.Errorf("disposition = forgot:%v ratelimited:%v delays:%v, want one %v delay and no rate-limit",
+						forgot, rateLimited, delays, rendezvous.LeaseDuration)
+				}
+			case dispDrop:
+				if forgot || rateLimited || len(delays) != 0 {
+					t.Errorf("disposition = forgot:%v ratelimited:%v delays:%v, want none of the three",
+						forgot, rateLimited, delays)
+				}
 			}
 		})
 	}
