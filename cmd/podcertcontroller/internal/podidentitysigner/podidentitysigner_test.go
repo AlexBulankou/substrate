@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -288,14 +289,28 @@ func TestMakeCertErrors(t *testing.T) {
 		name       string
 		omitKey    bool
 		failUpdate bool
+		// wantErr is the cause the error must name. Asserting only that
+		// MakeCert failed lets a mutant through: with the public-key error
+		// swallowed, the nil key fails later inside x509.CreateCertificate,
+		// so the call still fails -- as an opaque signing failure rather
+		// than the missing-key error it was. It fails closed either way,
+		// which is the property that matters most, but an operator reading
+		// the wrong cause pays a real cost, and the weak assertion is what
+		// hid it.
+		wantErr string
+		// notWantErr is the cause that mutant would report instead.
+		notWantErr string
 	}{
 		{
-			name:    "no key material in PCR",
-			omitKey: true,
+			name:       "no key material in PCR",
+			omitKey:    true,
+			wantErr:    "does not contain a public key",
+			notWantErr: "unsupported public key",
 		},
 		{
 			name:       "status update fails",
 			failUpdate: true,
+			wantErr:    "injected update failure",
 		},
 	}
 
@@ -324,8 +339,16 @@ func TestMakeCertErrors(t *testing.T) {
 			}
 			impl := NewImpl(caPool, betaClient(t, kc))
 
-			if err := impl.MakeCert(context.Background(), pcr); err == nil {
-				t.Fatalf("MakeCert: got nil error, want error")
+			err = impl.MakeCert(context.Background(), pcr)
+			if err == nil {
+				t.Fatalf("MakeCert: got nil error, want error naming %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("MakeCert error = %v, want it to name %q", err, tc.wantErr)
+			}
+			if tc.notWantErr != "" && strings.Contains(err.Error(), tc.notWantErr) {
+				t.Errorf("MakeCert error = %v, which names %q -- the cause was "+
+					"swallowed and reported as the later failure", err, tc.notWantErr)
 			}
 
 			gotPCR, err := kc.CertificatesV1beta1().PodCertificateRequests("ate-system").Get(context.Background(), "req-1", metav1.GetOptions{})
