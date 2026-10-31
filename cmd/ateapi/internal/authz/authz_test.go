@@ -18,9 +18,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -38,40 +35,23 @@ import (
 	"go.ate.dev/substrate/internal/principal"
 )
 
-func configureDockerEnv(ctx context.Context) error {
-	if os.Getenv("DOCKER_HOST") != "" {
-		return nil
+// unavailable reports a missing container the way the rest of the module's
+// container-backed tests do: a skip locally, a failure wherever dockerenv says
+// a container is required, so losing Docker in CI cannot quietly turn this
+// package green.
+func unavailable(t *testing.T, err error) {
+	t.Helper()
+	if dockerenv.Required() {
+		t.Fatalf("postgres testcontainer unavailable and required (CI or REQUIRE_DOCKER is set): %v", err)
 	}
-	output, err := exec.CommandContext(ctx, "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}").Output()
-	if err != nil {
-		return err
-	}
-	host := strings.TrimSpace(string(output))
-	if host == "" {
-		return nil
-	}
-	_ = os.Setenv("DOCKER_HOST", host)
-	if os.Getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE") == "" {
-		socket := host
-		if runtime.GOOS == "darwin" {
-			socket = "/var/run/docker.sock"
-		}
-		_ = os.Setenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE", socket)
-	}
-	return nil
+	t.Skipf("skipping test; postgres testcontainer unavailable (requires Docker): %v", err)
 }
 
 func startPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
-	// Without Docker the tests skip locally, but must fail in CI, where a
-	// skip would pass the package without running it.
-	unavailable := t.Skipf
-	if dockerenv.Required() {
-		unavailable = t.Fatalf
-	}
-	if err := configureDockerEnv(ctx); err != nil {
-		unavailable("docker is unavailable: %v", err)
+	if err := dockerenv.Configure(ctx); err != nil {
+		unavailable(t, err)
 	}
 
 	pgContainer, err := postgres.Run(ctx,
@@ -82,7 +62,7 @@ func startPostgres(t *testing.T) *pgxpool.Pool {
 		postgres.BasicWaitStrategies(),
 	)
 	if err != nil {
-		unavailable("failed to start postgres container: %v", err)
+		unavailable(t, err)
 	}
 	t.Cleanup(func() {
 		_ = testcontainers.TerminateContainer(pgContainer)
