@@ -1383,3 +1383,109 @@ func TestIngressReincarnationSurvivesStaleDeactivate(t *testing.T) {
 		t.Error("Deactivate left the actor active")
 	}
 }
+
+// newTrustRotationServer builds a server whose client trust bundle is a file
+// the caller can then rewrite or remove, which is what the reload tests below
+// act on.
+func newTrustRotationServer(t *testing.T, ca *testCA) (*Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "server.pem")
+	trustPath := filepath.Join(dir, "trust.pem")
+	writeCredentialBundle(t, bundlePath, ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := url.Parse("http://actor.internal:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewServer(Config{
+		CredentialBundlePath: bundlePath,
+		TrustBundlePath:      trustPath,
+		AllowedClientID:      "spiffe://cluster.local/ns/ate-system/sa/atenet-router",
+		Upstream:             upstream,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, trustPath
+}
+
+func clientConfigPresenting(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // Only the server's client authentication is under test.
+		Certificates:       []tls.Certificate{cert},
+	}
+}
+
+// TestServeFailsClosedOnAnUnreadableClientTrustBundle is the other half of
+// TestMutualTLSClientAuthenticationReloadsTrustBundle: reloading per
+// connection means a bundle that stops being readable has to refuse the
+// connection, not fall back to the pool the last successful read produced.
+func TestServeFailsClosedOnAnUnreadableClientTrustBundle(t *testing.T) {
+	ca := newTestCA(t)
+	s, trustPath := newTrustRotationServer(t, ca)
+	client := ca.issue(t, "spiffe://cluster.local/ns/ate-system/sa/atenet-router", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	if serverErr, clientErr := tlsHandshake(s.tlsConfig, clientConfigPresenting(client)); serverErr != nil || clientErr != nil {
+		t.Fatalf("server error = %v, client error = %v, want the client accepted before the bundle disappears", serverErr, clientErr)
+	}
+
+	if err := os.Remove(trustPath); err != nil {
+		t.Fatal(err)
+	}
+
+	serverErr, _ := tlsHandshake(s.tlsConfig, clientConfigPresenting(client))
+	if serverErr == nil {
+		t.Fatal("server error = nil after the trust bundle disappeared, want a refusal")
+	}
+	// Asserting the reason, not just the refusal: a reload error that is
+	// discarded leaves no pool, and the connection would still be refused --
+	// but as an unverifiable chain, which is indistinguishable from a genuinely
+	// untrusted client in the logs. "trust bundle" is credbundle.PoolLoader's
+	// own wording and appears on no chain-verification failure.
+	if !strings.Contains(serverErr.Error(), "trust bundle") {
+		t.Errorf("server error = %q, want the trust-bundle reload failure", serverErr)
+	}
+}
+
+// TestServeRefusesAClientWithNoCertificate covers a client that presents
+// nothing at all, which two independent guards refuse: ClientAuth is
+// RequireAndVerifyClientCert, and VerifyConnection re-checks that a chain
+// arrived. Either alone still refuses this handshake, so no single-guard
+// mutant can be caught here -- the pair is redundant on purpose, because
+// dropping both is what turns the router's front door into an open one.
+func TestServeRefusesAClientWithNoCertificate(t *testing.T) {
+	s, _ := newTrustRotationServer(t, newTestCA(t))
+	serverErr, clientErr := tlsHandshake(s.tlsConfig, &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // Only the server's client authentication is under test.
+	})
+	if serverErr == nil && clientErr == nil {
+		t.Fatal("a client presenting no certificate was accepted, want a refusal")
+	}
+}
+
+// TestNewServerRejectsAnUnreadableTrustBundle pins the startup read: without
+// it, a router with a misprojected trust volume serves happily and refuses
+// every worker at handshake time, which reads as a fleet-wide client-identity
+// failure rather than as this router's own misconfiguration.
+func TestNewServerRejectsAnUnreadableTrustBundle(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	bundlePath := filepath.Join(dir, "server.pem")
+	writeCredentialBundle(t, bundlePath, ca.issue(t, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+	upstream, err := url.Parse("http://actor.internal:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewServer(Config{
+		CredentialBundlePath: bundlePath,
+		TrustBundlePath:      filepath.Join(dir, "absent.pem"),
+		AllowedClientID:      "spiffe://cluster.local/ns/ate-system/sa/atenet-router",
+		Upstream:             upstream,
+	}); err == nil {
+		t.Fatal("NewServer() error = nil for a trust bundle that does not exist, want a refusal")
+	}
+}
