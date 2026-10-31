@@ -21,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/dockerenv"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"

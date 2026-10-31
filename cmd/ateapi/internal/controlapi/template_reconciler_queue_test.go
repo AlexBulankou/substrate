@@ -34,9 +34,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/api/ateapi/v1"
 )
 
 // enqueuedReconciler returns a reconciler whose queue already holds
@@ -159,7 +159,7 @@ func TestProcessNextWorkItemRevisitsATemplateAfterTheDelayItAskedFor(t *testing.
 		withSnapshotDeadline(time.Now().Add(50*time.Millisecond))))
 	r := newTestTemplateReconciler(persistence, &fakeGoldenControl{
 		exists:      true,
-		goldenState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		goldenState: ateapi.ActorState_ACTOR_STATE_RUNNING,
 	})
 	r.queue.Add(testTemplateRef)
 

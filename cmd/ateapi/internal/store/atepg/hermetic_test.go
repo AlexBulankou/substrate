@@ -41,8 +41,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/api/ateapi/v1"
 )
 
 // --- outbox wire format ---------------------------------------------------
@@ -80,8 +80,8 @@ func TestMarshalWorkerEventRoundTrips(t *testing.T) {
 		store.WorkerEventUpdated,
 		store.WorkerEventDeleted,
 	} {
-		worker := &ateapipb.Worker{
-			Metadata: &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "worker-1", Uid: "uid-1", Version: 3},
+		worker := &ateapi.Worker{
+			Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "worker-1", Uid: "uid-1", Version: 3},
 		}
 
 		payload, err := marshalWorkerEvent(eventType, worker)
@@ -364,7 +364,7 @@ func TestMapDeleteErrorPropagatesAnUnexpectedReadFailure(t *testing.T) {
 // --- resource metadata ----------------------------------------------------
 
 func TestSetCreateMetadata(t *testing.T) {
-	metadata := &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "actor-1"}
+	metadata := &ateapi.ResourceMetadata{Atespace: "space-1", Name: "actor-1"}
 
 	setCreateMetadata(metadata)
 
@@ -383,8 +383,8 @@ func TestSetCreateMetadata(t *testing.T) {
 }
 
 func TestSetCreateMetadataIssuesADistinctUIDEachTime(t *testing.T) {
-	first := &ateapipb.ResourceMetadata{}
-	second := &ateapipb.ResourceMetadata{}
+	first := &ateapi.ResourceMetadata{}
+	second := &ateapi.ResourceMetadata{}
 
 	setCreateMetadata(first)
 	setCreateMetadata(second)
@@ -400,7 +400,7 @@ func TestSetCreateMetadataIssuesADistinctUIDEachTime(t *testing.T) {
 // forward on every write.
 func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 	createTime := timestamppb.New(timestamppb.Now().AsTime().Add(-time.Hour))
-	oldMeta := &ateapipb.ResourceMetadata{
+	oldMeta := &ateapi.ResourceMetadata{
 		Atespace:   "space-1",
 		Name:       "actor-1",
 		Uid:        "uid-1",
@@ -408,7 +408,7 @@ func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 		CreateTime: createTime,
 		UpdateTime: createTime,
 	}
-	newMeta := &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "actor-1"}
+	newMeta := &ateapi.ResourceMetadata{Atespace: "space-1", Name: "actor-1"}
 
 	setUpdateMetadata(newMeta, oldMeta)
 
@@ -437,9 +437,9 @@ func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 // mean a caller that edits newMeta.CreateTime in place would be seen through
 // oldMeta.  Every caller today replaces the field rather than editing it.
 func TestSetUpdateMetadataLeavesOldMetaAlone(t *testing.T) {
-	oldMeta := &ateapipb.ResourceMetadata{Uid: "uid-1", Version: 4, CreateTime: timestamppb.Now()}
-	before := proto.Clone(oldMeta).(*ateapipb.ResourceMetadata)
-	newMeta := &ateapipb.ResourceMetadata{}
+	oldMeta := &ateapi.ResourceMetadata{Uid: "uid-1", Version: 4, CreateTime: timestamppb.Now()}
+	before := proto.Clone(oldMeta).(*ateapi.ResourceMetadata)
+	newMeta := &ateapi.ResourceMetadata{}
 
 	setUpdateMetadata(newMeta, oldMeta)
 
@@ -456,7 +456,7 @@ func TestSetUpdateMetadataLeavesOldMetaAlone(t *testing.T) {
 // written together and can only disagree if something wrote one without the
 // other, so a mismatch means the row is corrupt and must not be served.
 func TestValidateProtoMetadataMatchesColumns(t *testing.T) {
-	metadata := &ateapipb.ResourceMetadata{Uid: "uid-1", Version: 4}
+	metadata := &ateapi.ResourceMetadata{Uid: "uid-1", Version: 4}
 
 	if err := validateProtoMetadataMatchesColumns("actor", metadata, "uid-1", 4); err != nil {
 		t.Errorf("validateProtoMetadataMatchesColumns = %v for a consistent row, want nil", err)
@@ -477,32 +477,32 @@ func TestValidateProtoMetadataMatchesColumns(t *testing.T) {
 // addressed by the original name, leaving the stored name and the indexed name
 // permanently disagreeing.
 func TestValidateUpdateActorTemplateMutation(t *testing.T) {
-	stored := &ateapipb.ActorTemplate{
-		Metadata: &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "template-1"},
+	stored := &ateapi.ActorTemplate{
+		Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-1"},
 	}
 
 	for _, tc := range []struct {
 		name    string
-		mutated *ateapipb.ActorTemplate
+		mutated *ateapi.ActorTemplate
 		wantErr bool
 	}{
 		{
 			name:    "untouched identity",
-			mutated: &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "template-1"}},
+			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-1"}},
 		},
 		{
 			name:    "atespace changed",
-			mutated: &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Atespace: "space-2", Name: "template-1"}},
+			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-2", Name: "template-1"}},
 			wantErr: true,
 		},
 		{
 			name:    "name changed",
-			mutated: &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Atespace: "space-1", Name: "template-2"}},
+			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-2"}},
 			wantErr: true,
 		},
 		{
 			name:    "metadata dropped entirely",
-			mutated: &ateapipb.ActorTemplate{},
+			mutated: &ateapi.ActorTemplate{},
 			wantErr: true,
 		},
 	} {
