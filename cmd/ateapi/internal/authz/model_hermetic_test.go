@@ -31,6 +31,7 @@
 package authz
 
 import (
+	"strings"
 	"testing"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -90,34 +91,85 @@ func TestEmbeddedModelDefinesTheTypesTheServerGrantsOn(t *testing.T) {
 	}
 }
 
+// referencedRelations returns every relation name the model mentions from
+// inside some other relation's definition -- the computed usersets, both
+// halves of each tuple-to-userset hop, and the same for every branch of a
+// union, intersection or difference.  A name in this set is one the evaluator
+// traverses through on its way to an answer.
+func referencedRelations(m *openfgav1.AuthorizationModel) map[string]bool {
+	seen := map[string]bool{}
+	var walk func(u *openfgav1.Userset)
+	walk = func(u *openfgav1.Userset) {
+		if u == nil {
+			return
+		}
+		if cu := u.GetComputedUserset(); cu != nil {
+			seen[cu.GetRelation()] = true
+		}
+		if ttu := u.GetTupleToUserset(); ttu != nil {
+			seen[ttu.GetTupleset().GetRelation()] = true
+			seen[ttu.GetComputedUserset().GetRelation()] = true
+		}
+		for _, child := range u.GetUnion().GetChild() {
+			walk(child)
+		}
+		for _, child := range u.GetIntersection().GetChild() {
+			walk(child)
+		}
+		if d := u.GetDifference(); d != nil {
+			walk(d.GetBase())
+			walk(d.GetSubtract())
+		}
+	}
+	for _, td := range m.GetTypeDefinitions() {
+		for _, u := range td.GetRelations() {
+			walk(u)
+		}
+	}
+	delete(seen, "")
+	return seen
+}
+
 // TestEmbeddedModelRelationsAreNamedByConvention enforces the naming rule the
-// model file states in its own header comment: a relation that is evaluated as
-// a runtime permission check starts with can_, and everything else is a noun
+// model file states in its own header comment: a relation evaluated as a
+// runtime permission check starts with can_, and everything else is a noun
 // describing a graph edge.  The rule is load-bearing rather than cosmetic ---
 // callers pick the relation to Check by that prefix --- and nothing else
 // enforces it, so a relation added as "get" instead of "can_get" would be
 // unreachable from the call site that expects the prefix.
+//
+// The partition is DERIVED from the model, not listed here.  A permission is a
+// leaf: it is the answer a Check asks for, so nothing else in the model routes
+// through it.  An edge is the opposite -- it exists precisely to be traversed,
+// so something references it.  That holds in both directions on the shipped
+// model, which makes it a real structural invariant rather than a restatement
+// of today's relation set.  The earlier version of this test hard-coded the
+// noun list and broke the moment upstream added five service-identity edges
+// that satisfied the convention perfectly: a gate that fails while its
+// invariant holds is not a gate.
+//
+// Known looseness, stated rather than hidden: referenced-ness is global, not
+// per type.  global.ingress_router is reached as "ingress_router from
+// parent_global" on atespace, a cross-type hop, so scoping the set per type
+// would reject the model's own inheritance idiom.  The cost is that an
+// unreferenced noun on one type is excused by a same-named edge on another.
 func TestEmbeddedModelRelationsAreNamedByConvention(t *testing.T) {
 	m := embeddedModel(t)
-
-	// Nouns the model uses as graph edges rather than as permission checks.
-	edges := map[string]bool{
-		"owner":            true,
-		"editor":           true,
-		"viewer":           true,
-		"parent_global":    true,
-		"parent_atespace":  true,
-		"host_node":        true,
-		"scheduled_worker": true,
-	}
+	referenced := referencedRelations(m)
 
 	for _, td := range m.GetTypeDefinitions() {
 		for relation := range td.GetRelations() {
-			if edges[relation] {
-				continue
-			}
-			if len(relation) < 4 || relation[:4] != "can_" {
-				t.Errorf("type %q relation %q is neither a known graph edge nor can_-prefixed", td.GetType(), relation)
+			isPermission := strings.HasPrefix(relation, "can_")
+			switch {
+			case isPermission && referenced[relation]:
+				t.Errorf("type %q relation %q is can_-prefixed but the model traverses through it; "+
+					"a permission is a leaf, and routing an edge through one means a Check "+
+					"answer is being used as a graph hop", td.GetType(), relation)
+			case !isPermission && !referenced[relation]:
+				t.Errorf("type %q relation %q is a noun that nothing in the model references, "+
+					"so it can only be a permission check reachable by name --- it needs the "+
+					"can_ prefix or it is unreachable from the call sites that expect one",
+					td.GetType(), relation)
 			}
 		}
 	}
