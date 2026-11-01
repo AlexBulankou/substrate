@@ -18,11 +18,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/internal/clustertrustbundle"
@@ -280,9 +282,120 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext, tokenFile 
 	}, nil
 }
 
+const (
+	// trustPoolTTL bounds how long after a servicedns CA rotation this client
+	// can still be dialing with the pre-rotation anchor set.
+	//
+	// It is deliberately short, so that the correctness argument does not
+	// depend on the overlap the signer happens to maintain between publishing
+	// a new CA and serving leaves from it. The cost is one LIST per minute
+	// from a long-lived process, and — because the TTL is only consulted on a
+	// handshake — exactly zero extra calls from a one-shot invocation that
+	// dials once and exits.
+	trustPoolTTL = time.Minute
+
+	// trustPoolListTimeout bounds a refresh LIST. The reload runs inside a TLS
+	// handshake, which carries no context, so without this an unresponsive API
+	// server would hang the handshake rather than fail it.
+	trustPoolListTimeout = 10 * time.Second
+)
+
+// trustPoolCache serves the live servicedns trust anchors, re-reading them
+// from the API server at most once per ttl.
+//
+// A LIST on every handshake is not acceptable and a pool fixed at dial time is
+// the defect; the TTL is the middle. A failed refresh is NOT papered over with
+// the last good pool: serving a known-stale anchor set indefinitely is the
+// frozen-pool defect on a slower clock, so it fails the handshake and gRPC
+// reconnects.
+type trustPoolCache struct {
+	load func(context.Context) (*x509.CertPool, error)
+	ttl  time.Duration
+
+	// mu is held across the reload so that concurrent handshakes past the TTL
+	// produce one LIST between them, not one each.
+	mu       sync.Mutex
+	pool     *x509.CertPool
+	loadedAt time.Time
+}
+
+// trustPoolNow is the cache's clock, a variable so a test can age the cache
+// out without sleeping for the TTL.
+var trustPoolNow = time.Now
+
+// roots returns the cached anchors, refreshing them if they have aged out.
+func (c *trustPoolCache) roots() (*x509.CertPool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.pool != nil && trustPoolNow().Sub(c.loadedAt) < c.ttl {
+		return c.pool, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), trustPoolListTimeout)
+	defer cancel()
+	pool, err := c.load(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refreshing the servicedns trust anchors: %w", err)
+	}
+	c.pool, c.loadedAt = pool, trustPoolNow()
+	return pool, nil
+}
+
 // serverTLSConfig verifies a Service's servicedns serving certificate for
 // serverName.
+//
+// The anchors are re-read per handshake rather than pinned at dial time, so a
+// servicedns CA rotation applies without restarting the process. They come
+// from the API server rather than a projected file, so the loader is a
+// TTL-cached LIST rather than credbundle.PoolLoader's stat check; the
+// verification shape is the one internal/ateapiauth/client.go already uses.
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, serverName string) (*tls.Config, error) {
+	cache := &trustPoolCache{
+		load: func(ctx context.Context) (*x509.CertPool, error) {
+			return serverTrustPool(ctx, clientset)
+		},
+		ttl: trustPoolTTL,
+	}
+	// Read once here so that an unreachable API server or a missing bundle is
+	// reported by the caller that built the client, as it was before, rather
+	// than by the first RPC.
+	pool, err := cache.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cache.pool, cache.loadedAt = pool, trustPoolNow()
+
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		// Chain verification happens in VerifyConnection against the
+		// reloadable pool, so a CA rotation applies without a redial.
+		InsecureSkipVerify: true, //nolint:gosec
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			roots, err := cache.roots()
+			if err != nil {
+				return err
+			}
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("server presented no certificate")
+			}
+			inter := x509.NewCertPool()
+			for _, c := range cs.PeerCertificates[1:] {
+				inter.AddCert(c)
+			}
+			_, err = cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+				Roots:         roots,
+				Intermediates: inter,
+				DNSName:       serverName,
+			})
+			return err
+		},
+	}, nil
+}
+
+// serverTrustPool reads the live servicedns trust anchors from the API server.
+func serverTrustPool(ctx context.Context, clientset kubernetes.Interface) (*x509.CertPool, error) {
 	bundles, err := clustertrustbundle.NewClient(clientset, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover ClusterTrustBundle API: %w", err)
@@ -309,11 +422,7 @@ func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, server
 		return nil, fmt.Errorf("no live ClusterTrustBundle found for signer %q", serviceDNSSignerName)
 	}
 
-	return &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		RootCAs:    pool,
-		ServerName: serverName,
-	}, nil
+	return pool, nil
 }
 
 // bearerTokenDialOption attaches the configured token, or mints an ate-client
