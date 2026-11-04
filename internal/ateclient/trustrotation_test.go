@@ -292,10 +292,17 @@ func TestServerCredentialsHandshakeFollowsARotation(t *testing.T) {
 // The rotation test above exercises a construction that does not exist on the
 // pre-fix tree, so it cannot be run against that tree to demonstrate the bug.
 // This one builds credentials the way the dial path built them before -- one
-// pool read, handed to credentials.NewTLS -- and shows that neither elapsed
-// time nor a rotation published to the API server ever reaches them. It is a
-// characterization test, not a guard: delete it if the frozen construction
-// stops being reachable at all.
+// pool read, assigned to RootCAs, handed to credentials.NewTLS -- and shows
+// that neither elapsed time nor a rotation published to the API server ever
+// reaches them. It is a characterization test, not a guard.
+//
+// It used to build that comparison by CALLING serverTLSConfig, which was the
+// frozen-pool path at the time. #14357 moved serverTLSConfig onto the cache,
+// so the frozen construction is no longer reachable through any production
+// function and is spelled out inline here instead. Keeping it is what makes
+// the claim "RootCAs is read once and never again" executable rather than
+// asserted in a comment -- if a future Go release ever made RootCAs reload,
+// this test, not a review, is what would notice.
 func TestFrozenPoolCredentialsDoNotFollowARotation(t *testing.T) {
 	before := testca.New(t, "servicedns-ca-before")
 	after := testca.New(t, "servicedns-ca-after")
@@ -304,13 +311,12 @@ func TestFrozenPoolCredentialsDoNotFollowARotation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// serverTLSConfig is the frozen-pool path NewRouterDialer still takes, so
-	// building the comparison through it keeps this test honest about what
-	// that path does rather than re-deriving it here.
-	cfg, err := serverTLSConfig(ctx, clientset, apiServerName())
+	pool, err := serverTrustPool(ctx, clientset)
 	if err != nil {
-		t.Fatalf("serverTLSConfig(): %v", err)
+		t.Fatalf("serverTrustPool(): %v", err)
 	}
+	cfg := serverTLSTemplate(apiServerName())
+	cfg.RootCAs = pool
 	frozen := credentials.NewTLS(cfg)
 
 	// The server re-keys and the API server publishes the new anchors, which
@@ -320,6 +326,68 @@ func TestFrozenPoolCredentialsDoNotFollowARotation(t *testing.T) {
 
 	if code := healthCode(ctx, t, addr, frozen); code == codes.OK {
 		t.Fatal("the pre-fix construction followed the rotation, so this test no longer pins the defect it names")
+	}
+}
+
+// TestTLSConfigHandshakeFollowsARotation is the credentials test above for the
+// other half of the dial surface: NewRouterDialer needs a *tls.Config it can
+// hang GetClientCertificate off, so it cannot go through rotatingtls, and
+// #14357 was that config freezing RootCAs while the client cert kept rotating.
+func TestTLSConfigHandshakeFollowsARotation(t *testing.T) {
+	before := testca.New(t, "servicedns-ca-before")
+	after := testca.New(t, "servicedns-ca-after")
+	clientset := fakeClientset(liveServiceDNSBundle(before))
+	clk := &fakeClock{t: time.Now()}
+	cache := cacheFor(t, clientset, clk, time.Minute)
+	creds := credentials.NewTLS(cache.tlsConfig(apiServerName()))
+
+	addr := serveHealth(t, after)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Within the TTL the client still trusts only the pre-rotation anchors.
+	// This half is also what shows InsecureSkipVerify did not become a bypass:
+	// the chain is checked, just by VerifyConnection rather than by the stdlib.
+	if code := healthCode(ctx, t, addr, creds); code == codes.OK {
+		t.Fatal("handshake succeeded against the post-rotation CA before the TTL expired, want a failure")
+	}
+
+	rotateTo(t, clientset, after)
+	clk.add(trustPoolTTL + time.Second)
+	if code := healthCode(ctx, t, addr, creds); code != codes.OK {
+		t.Errorf("handshake code = %v after the rotation was picked up, want %v", code, codes.OK)
+	}
+}
+
+// TestTLSConfigRejectsAnUnexpectedServerName pins the one property that moving
+// the chain check into VerifyConnection could silently drop: with
+// InsecureSkipVerify set, the stdlib no longer checks the name, so the
+// hostname match holds only because VerifyOptions.DNSName re-states it. A
+// trusted leaf for the wrong name must still be refused.
+func TestTLSConfigRejectsAnUnexpectedServerName(t *testing.T) {
+	ca := testca.New(t, "servicedns-ca")
+	clientset := fakeClientset(liveServiceDNSBundle(ca))
+	clk := &fakeClock{t: time.Now()}
+	cache := cacheFor(t, clientset, clk, time.Minute)
+	// The anchors are the right ones; only the expected name differs.
+	creds := credentials.NewTLS(cache.tlsConfig("ateapi.wrong-namespace.svc.cluster.local"))
+
+	addr := serveHealth(t, ca)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if code := healthCode(ctx, t, addr, creds); code == codes.OK {
+		t.Error("handshake succeeded against a leaf issued for a different name, want a failure")
+	}
+}
+
+// TestServerTLSConfigWarmFailsAtConstruction keeps the fail-fast NewRouterDialer
+// had before: a missing bundle is reported by the constructor, not by the first
+// dial.
+func TestServerTLSConfigWarmFailsAtConstruction(t *testing.T) {
+	if _, err := serverTLSConfig(context.Background(), fakeClientset(), apiServerName()); err == nil {
+		t.Error("serverTLSConfig() error = nil, want a failure with no live bundle present")
 	}
 }
 

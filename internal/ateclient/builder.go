@@ -291,23 +291,60 @@ func serverTLSTemplate(serverName string) *tls.Config {
 	}
 }
 
-// serverTLSConfig verifies a Service's servicedns serving certificate for
-// serverName, against the trust anchors as they stand when it is called.
+// serverTLSConfig returns a *tls.Config that verifies a Service's servicedns
+// serving certificate for serverName against the trust anchors as they stand
+// at each handshake, so a long-lived caller follows a CA rotation (#14357).
 //
-// The pool it returns is FIXED at construction. That is the frozen-pool shape
-// this file otherwise moves away from -- see serverCredentials, which follows a
-// rotation instead -- and it survives here only because NewRouterDialer needs a
-// *tls.Config it can hang a GetClientCertificate callback off, not gRPC
-// transport credentials. A long-lived RouterDialer therefore still stops
-// verifying once the servicedns CA rotates out from under it.
+// The caller needs a *tls.Config it can hang a GetClientCertificate callback
+// off, not gRPC transport credentials, so this cannot go through
+// rotatingtls.NewCredentials the way serverCredentials does. tls.Config.RootCAs
+// is read once when the config is built and never again, so the rotation is
+// followed the way internal/volume/csi does it: InsecureSkipVerify disables
+// only the BUILT-IN chain check, and VerifyConnection below performs the same
+// check explicitly against a pool re-read from the cache per handshake.
+//
+// The pool is read once here so that an unreachable API server or a missing
+// bundle fails at construction, as it did before, rather than at the first dial.
 func serverTLSConfig(ctx context.Context, clientset kubernetes.Interface, serverName string) (*tls.Config, error) {
-	pool, err := serverTrustPool(ctx, clientset)
-	if err != nil {
+	cache := newTrustPoolCache(clientset)
+	if err := cache.warm(ctx); err != nil {
 		return nil, err
 	}
+	return cache.tlsConfig(serverName), nil
+}
+
+// tlsConfig returns a TLS client config that takes its trust anchors from this
+// cache at every handshake, rather than freezing them when the config is built.
+func (c *trustPoolCache) tlsConfig(serverName string) *tls.Config {
 	cfg := serverTLSTemplate(serverName)
-	cfg.RootCAs = pool
-	return cfg, nil
+	// Not a verification bypass: the chain check moves from the stdlib into
+	// VerifyConnection so it can name a freshly-loaded pool. Every property
+	// the built-in check enforces is re-stated below.
+	cfg.InsecureSkipVerify = true
+	cfg.VerifyConnection = func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return fmt.Errorf("the server presented no certificate")
+		}
+		roots, err := c.roots()
+		if err != nil {
+			return err
+		}
+		intermediates := x509.NewCertPool()
+		for _, cert := range state.PeerCertificates[1:] {
+			intermediates.AddCert(cert)
+		}
+		_, err = state.PeerCertificates[0].Verify(x509.VerifyOptions{
+			DNSName:       serverName,
+			Roots:         roots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+		if err != nil {
+			return fmt.Errorf("verifying the server certificate for %q against the servicedns anchors: %w", serverName, err)
+		}
+		return nil
+	}
+	return cfg
 }
 
 // serverTrustPool reads the live servicedns trust anchors from the API server.
