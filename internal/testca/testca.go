@@ -88,6 +88,13 @@ func (c *CA) Pool() *x509.CertPool {
 	return pool
 }
 
+// LoadRoots is Pool behind the func() (*x509.CertPool, error) seam that
+// rotation-aware consumers take instead of a fixed pool, so a test can hand
+// one this CA directly and a rotation test can swap the func it hands over.
+func (c *CA) LoadRoots() (*x509.CertPool, error) {
+	return c.Pool(), nil
+}
+
 // Opts selects the SANs a leaf certificate carries. A leaf is usable for both
 // server and client authentication regardless.
 type Opts struct {
@@ -98,6 +105,10 @@ type Opts struct {
 	// the address it connected to.
 	IPs  []string
 	URIs []string
+	// Mutate edits the leaf template just before signing, so a test can break
+	// exactly one property of an otherwise-valid certificate. It runs last and
+	// can override anything above it.
+	Mutate func(*x509.Certificate)
 }
 
 // Issued is a leaf certificate and its private key.
@@ -134,15 +145,20 @@ func (c *CA) Issue(t *testing.T, opts Opts) Issued {
 		commonName = "leaf"
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject:      pkix.Name{CommonName: commonName},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:     opts.DNSNames,
-		IPAddresses:  ips,
-		URIs:         uris,
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		DNSNames:              opts.DNSNames,
+		IPAddresses:           ips,
+		URIs:                  uris,
+	}
+	if opts.Mutate != nil {
+		opts.Mutate(tmpl)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.key)
 	if err != nil {
