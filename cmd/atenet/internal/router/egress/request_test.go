@@ -28,6 +28,7 @@ import (
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/testca"
 )
 
 // testActorSPIFFEID is the identity filter state the CONNECT chain shares.
@@ -430,8 +431,8 @@ func TestRequestLegPolicyLookup(t *testing.T) {
 // The CONNECT leg refuses to open a tunnel for an actor with nothing that
 // could be allowed through it, and warms the cache for the requests inside.
 func TestConnectLegRequiresAPolicy(t *testing.T) {
-	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/default/my-actor", actorCertOptions{})
+	ca := testca.New(t, "actor-identity-ca")
+	leaf := issueActorCert(t, ca, "spiffe://substrate-actor.local/worker-for-actor/default/my-actor", actorCertOptions{})
 
 	tests := []struct {
 		name   string
@@ -446,7 +447,7 @@ func TestConnectLegRequiresAPolicy(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h := New(tc.client, ca.loadRoots, DefaultPolicyCacheTTL, nil)
+			h := New(tc.client, ca.LoadRoots, DefaultPolicyCacheTTL, nil)
 			res, err := h.HandleRequestHeaders(context.Background(), egressMetadata(xfccHeader(leaf)))
 			if tc.want == 0 {
 				wantAllowed(t, res, err)
