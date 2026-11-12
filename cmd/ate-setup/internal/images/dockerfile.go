@@ -76,6 +76,57 @@ func dockerBuildArgs(platforms string, extraFlags []string, tag, metadataFile, c
 	return append(args, "-t", tag, contextPath)
 }
 
+// errNoBuildx is returned when the docker CLI has no buildx plugin. Buildx is
+// a CLI plugin rather than part of the engine: it ships with Docker Desktop
+// and with docker.com's docker-ce packages, but not with the distribution
+// docker package (Debian/Ubuntu's docker.io, for example), which is what
+// "install docker" gets on a plain Linux host. Without this check the only
+// thing the user sees is docker exiting 125 and printing its top-level usage
+// text, which names neither buildx nor the step that needed it.
+var errNoBuildx = errors.New("the docker CLI has no buildx plugin, which is required to build the Dockerfile-based images; " +
+	"verify with `docker buildx version`. Docker Desktop and the packages from docker.com ship it; " +
+	"some distribution packages do not, and install it separately as docker-buildx-plugin")
+
+// pushDriverHint reports what to do about a failed push when the output of
+// `docker buildx inspect` shows the active builder uses the default "docker"
+// driver, which refuses --push unless the containerd image store is enabled.
+// It returns "" for any other driver, so a user with a docker-container
+// builder is never told to fix something that is not broken -- the reason this
+// is a hint on an already-failed build rather than a precondition: the docker
+// driver CAN push once the containerd store is on, and nothing in the inspect
+// output says whether it is.
+func pushDriverHint(inspectOutput string) string {
+	for _, line := range strings.Split(inspectOutput, "\n") {
+		name, value, found := strings.Cut(line, ":")
+		if !found || !strings.EqualFold(strings.TrimSpace(name), "driver") {
+			continue
+		}
+		if strings.TrimSpace(value) != "docker" {
+			return ""
+		}
+		return "hint: the active buildx builder uses the default \"docker\" driver, which refuses --push " +
+			"unless the containerd image store is enabled. Either enable it, or create a builder that can push: " +
+			"`docker buildx create --use --driver docker-container`"
+	}
+	return ""
+}
+
+// haveBuildx reports whether `docker buildx` can run at all.
+func haveBuildx(ctx context.Context) bool {
+	return exec.CommandContext(ctx, "docker", "buildx", "version").Run() == nil
+}
+
+// activeBuilderDriver returns the output of `docker buildx inspect`, or "" if
+// it cannot be read. A failure here is never itself an error: this only ever
+// decorates a message about a failure that already happened.
+func activeBuilderDriver(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "docker", "buildx", "inspect").Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
 // pushedDigest returns the digest buildx pushed, from the file written by
 // --metadata-file.
 func pushedDigest(metadata []byte) (string, error) {
@@ -108,6 +159,12 @@ func PublishDockerfileImage(ctx context.Context, rootDir, dockerRepo, imageName,
 	repo := strings.TrimSuffix(dockerRepo, "/") + "/" + imageName
 	stageTag := repo + ":" + tag
 
+	// Checked before the build rather than diagnosed after it, so a missing
+	// plugin is named instead of surfacing as docker's usage text.
+	if !haveBuildx(ctx) {
+		return "", fmt.Errorf("while preparing to build the %s image: %w", imageName, errNoBuildx)
+	}
+
 	platforms, err := dockerfilePlatforms(rootDir, koDefaultPlatforms)
 	if err != nil {
 		return "", err
@@ -130,6 +187,9 @@ func PublishDockerfileImage(ctx context.Context, rootDir, dockerRepo, imageName,
 	build.Stdout = os.Stderr
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
+		if hint := pushDriverHint(activeBuilderDriver(ctx)); hint != "" {
+			return "", fmt.Errorf("while building the %s image: %w\n%s", imageName, err, hint)
+		}
 		return "", fmt.Errorf("while building the %s image: %w", imageName, err)
 	}
 

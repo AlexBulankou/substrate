@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -105,5 +106,44 @@ func TestDockerfilePlatforms(t *testing.T) {
 				t.Errorf("dockerfilePlatforms() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// The hint exists to tell a user who HAS buildx why --push still failed, so it
+// must fire only for the one driver that refuses --push by default. Firing on
+// a docker-container builder would send a working setup chasing a non-problem.
+func TestPushDriverHint(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		inspect string
+		want    bool
+	}{
+		{name: "default docker driver", inspect: "Name:   default\nDriver: docker\n", want: true},
+		{name: "indented and lowercased", inspect: "  driver:  docker  \n", want: true},
+		{name: "docker-container can push", inspect: "Name:   mybuilder\nDriver: docker-container\n", want: false},
+		{name: "remote driver can push", inspect: "Driver: remote\n", want: false},
+		{name: "no inspect output at all", inspect: "", want: false},
+		{name: "no driver line", inspect: "Name: default\nStatus: running\n", want: false},
+		// "Driver" must be matched as a field name, not as a substring: a
+		// builder whose NAME contains the word would otherwise decide this.
+		{name: "name mentioning a driver is not the driver", inspect: "Name: docker-driver-test\nDriver: docker-container\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pushDriverHint(tc.inspect) != ""
+			if got != tc.want {
+				t.Errorf("pushDriverHint(%q) fired = %v, want %v", tc.inspect, got, tc.want)
+			}
+		})
+	}
+}
+
+// A missing plugin must be named. The whole point of the precondition is that
+// docker's exit status 125 and its top-level usage text name neither buildx
+// nor the step that needed it.
+func TestErrNoBuildxNamesTheFix(t *testing.T) {
+	for _, want := range []string{"buildx", "docker-buildx-plugin", "docker buildx version"} {
+		if !strings.Contains(errNoBuildx.Error(), want) {
+			t.Errorf("errNoBuildx does not mention %q: %v", want, errNoBuildx)
+		}
 	}
 }
