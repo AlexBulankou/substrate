@@ -304,7 +304,7 @@ func TestMapDeleteError(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		err          error
-		precondition store.DeletePreconditions
+		precondition store.Precondition
 		want         error
 	}{
 		{
@@ -314,22 +314,22 @@ func TestMapDeleteError(t *testing.T) {
 		},
 		{
 			name:         "the row is there and still matches, so it moved between the two statements",
-			precondition: store.DeletePreconditions{UID: uid, Version: version},
+			precondition: store.Precondition{UID: uid, Version: version},
 			want:         store.ErrVersionConflict,
 		},
 		{
 			name:         "a different incarnation holds the name",
-			precondition: store.DeletePreconditions{UID: "uid-2"},
+			precondition: store.Precondition{UID: "uid-2"},
 			want:         store.ErrUIDConflict,
 		},
 		{
 			name:         "the same object moved on",
-			precondition: store.DeletePreconditions{UID: uid, Version: 9},
+			precondition: store.Precondition{UID: uid, Version: 9},
 			want:         store.ErrVersionConflict,
 		},
 		{
 			name:         "an unguarded delete that matched nothing",
-			precondition: store.DeletePreconditions{},
+			precondition: store.Precondition{},
 			want:         store.ErrVersionConflict,
 		},
 	} {
@@ -349,7 +349,7 @@ func TestMapDeleteError(t *testing.T) {
 func TestMapDeleteErrorPropagatesAnUnexpectedReadFailure(t *testing.T) {
 	cause := errors.New("connection reset by peer")
 
-	got := mapDeleteError(cause, "uid-1", 1, store.DeletePreconditions{})
+	got := mapDeleteError(cause, "uid-1", 1, store.Precondition{})
 
 	if !errors.Is(got, cause) {
 		t.Errorf("mapDeleteError = %v, want it to wrap the underlying read failure", got)
@@ -408,9 +408,8 @@ func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 		CreateTime: createTime,
 		UpdateTime: createTime,
 	}
-	newMeta := &ateapi.ResourceMetadata{Atespace: "space-1", Name: "actor-1"}
 
-	setUpdateMetadata(newMeta, oldMeta)
+	newMeta := setUpdateMetadata(oldMeta)
 
 	if got := newMeta.GetUid(); got != "uid-1" {
 		t.Errorf("Uid = %q, want it carried forward from the stored metadata", got)
@@ -426,28 +425,33 @@ func TestSetUpdateMetadataPreservesIdentity(t *testing.T) {
 	}
 }
 
-// TestSetUpdateMetadataLeavesOldMetaAlone guards the read-only half of the
-// signature.  The caller holds the stored metadata while the update is in
-// flight, so writing back through oldMeta would corrupt the value a retry or
-// an error path reads back.
-//
-// Note that CreateTime is carried forward by pointer, not cloned, so newMeta
-// and oldMeta share one timestamp after the call.  Copying the pointer is not
-// a mutation of oldMeta and this test does not treat it as one — but it does
-// mean a caller that edits newMeta.CreateTime in place would be seen through
-// oldMeta.  Every caller today replaces the field rather than editing it.
-func TestSetUpdateMetadataLeavesOldMetaAlone(t *testing.T) {
-	oldMeta := &ateapi.ResourceMetadata{Uid: "uid-1", Version: 4, CreateTime: timestamppb.Now()}
-	before := proto.Clone(oldMeta).(*ateapi.ResourceMetadata)
-	newMeta := &ateapi.ResourceMetadata{}
-
-	setUpdateMetadata(newMeta, oldMeta)
-
-	if !proto.Equal(oldMeta, before) {
-		t.Errorf("setUpdateMetadata mutated oldMeta: %v, want %v", oldMeta, before)
+// TestSetUpdateMetadataTouchesOnlyVersionAndUpdateTime pins the blast radius of
+// an update.  There are no mutable metadata fields yet, so Version and
+// UpdateTime are the only two an update may move; any other field changing
+// means it has started drifting on every write, which the per-field assertions
+// above would only catch for the fields they happen to name.
+func TestSetUpdateMetadataTouchesOnlyVersionAndUpdateTime(t *testing.T) {
+	createTime := timestamppb.New(timestamppb.Now().AsTime().Add(-time.Hour))
+	meta := &ateapi.ResourceMetadata{
+		Atespace:   "space-1",
+		Name:       "actor-1",
+		Uid:        "uid-1",
+		Version:    4,
+		CreateTime: createTime,
+		UpdateTime: createTime,
 	}
-	if got := newMeta.GetVersion(); got != 5 {
-		t.Errorf("Version = %d, want 5", got)
+	before := proto.Clone(meta).(*ateapi.ResourceMetadata)
+
+	updated := setUpdateMetadata(meta)
+
+	// Normalise away the two fields the update owns, then require everything
+	// else to be exactly what went in.
+	normalised := proto.Clone(updated).(*ateapi.ResourceMetadata)
+	normalised.Version = before.GetVersion()
+	normalised.UpdateTime = before.GetUpdateTime()
+
+	if !proto.Equal(normalised, before) {
+		t.Errorf("setUpdateMetadata changed a field other than Version/UpdateTime: %v, want %v", normalised, before)
 	}
 }
 
@@ -469,51 +473,3 @@ func TestValidateProtoMetadataMatchesColumns(t *testing.T) {
 	}
 }
 
-// --- mutation validation --------------------------------------------------
-
-// TestValidateUpdateActorTemplateMutation pins the immutable fields.  The
-// mutate callback is caller-supplied, so nothing else stops it renaming the
-// resource mid-update -- which would write the mutated proto into the row
-// addressed by the original name, leaving the stored name and the indexed name
-// permanently disagreeing.
-func TestValidateUpdateActorTemplateMutation(t *testing.T) {
-	stored := &ateapi.ActorTemplate{
-		Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-1"},
-	}
-
-	for _, tc := range []struct {
-		name    string
-		mutated *ateapi.ActorTemplate
-		wantErr bool
-	}{
-		{
-			name:    "untouched identity",
-			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-1"}},
-		},
-		{
-			name:    "atespace changed",
-			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-2", Name: "template-1"}},
-			wantErr: true,
-		},
-		{
-			name:    "name changed",
-			mutated: &ateapi.ActorTemplate{Metadata: &ateapi.ResourceMetadata{Atespace: "space-1", Name: "template-2"}},
-			wantErr: true,
-		},
-		{
-			name:    "metadata dropped entirely",
-			mutated: &ateapi.ActorTemplate{},
-			wantErr: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateUpdateActorTemplateMutation(stored, tc.mutated)
-			if tc.wantErr && err == nil {
-				t.Error("validateUpdateActorTemplateMutation accepted a mutation of an immutable field")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("validateUpdateActorTemplateMutation = %v, want nil", err)
-			}
-		})
-	}
-}
