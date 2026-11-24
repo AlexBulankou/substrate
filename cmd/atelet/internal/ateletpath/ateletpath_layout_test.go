@@ -110,6 +110,7 @@ func actorScopedPaths(uid string) map[string]string {
 	return map[string]string{
 		"ActorSnapshotPath":          ActorSnapshotPath(uid),
 		"ActorSnapshotStateFile":     ActorSnapshotStateFile(uid),
+		"NextSnapshotStateFile":      NextSnapshotStateFile(uid),
 		"ActorSandboxAssetsFile":     ActorSandboxAssetsFile(uid),
 		"SandboxAssetsDir":           SandboxAssetsDir(uid),
 		"SandboxAssetsStagingDir":    SandboxAssetsStagingDir(uid),
